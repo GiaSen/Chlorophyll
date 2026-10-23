@@ -1120,11 +1120,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
                             "one plane of one image", layers, depth);
          return NULL;
       }
-      if (import->row_bytes == 0) {
-         say(why, why_size, "an IOSurface with no bytes a row: the import takes the pitch "
-                            "from the caller and cannot guess it");
-         return NULL;
-      }
+      /* Bergamota: a pitch of 0 means "ask the kernel" (SURFACE_BO, below), which is what a CAMetalLayer drawable does */
    }
 
    enum pipe_texture_target target;

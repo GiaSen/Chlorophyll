@@ -33,7 +33,7 @@ main(int argc, char **argv)
       id<CAMetalDrawable> drawable = [layer nextDrawable];
       printf("nextDrawable: %s, texture %s, iosurface id %u\n", drawable ? "yes" : "nil", [drawable texture] ? class_getName([[drawable texture] class]) : "nil",
              [[drawable texture] iosurface] ? IOSurfaceGetID((IOSurfaceRef)[[drawable texture] iosurface]) : 0);
-      if (!drawable) return 3;
+      if (!drawable || ![drawable texture]) { printf("no drawable texture: stopping\n"); return 3; }
       MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
       pd.vertexFunction = [lib newFunctionWithName:@"bg_vs"];
       pd.fragmentFunction = [lib newFunctionWithName:@"bg_fs_color"];

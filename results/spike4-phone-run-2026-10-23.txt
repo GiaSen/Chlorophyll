@@ -1,0 +1,15 @@
+Phone run (RAM boot sbo-alias 186cf7b, GPU ABI minor 2), test processes only, state=on and hangs=0 before and after every step.
+1. bgair_vertex_test: QuartzCore std_vert0_lpf + own fragment on the Adreno 630: 3664 of 3664 checked pixels correct.
+2. bgmtl_layer_probe: layer.device = BGMTLDevice; [layer nextDrawable] -> BGMTLTexture over IOSurface (CoreAnimation sent newTextureWithDescriptor:iosurface:plane:);
+   render pass + presentDrawable: -> command buffer status 4; the IOSurface read back by the CPU: 3664 of 3664 correct. (First two runs failed for
+   two reasons fixed in the tree: pitch 0 refused before the kernel was asked; CA's descriptor lacked RenderTarget usage.)
+3. five outstanding shader comparisons (RGBA32Float, first pixel), Adreno vs softpipe on the Mac:
+   axial_shading_frag_lpf    gpu 0,0.00147,0.00294,0.2627      soft 0.1324,0.1338,0.2588,0.3559
+   downsample_blur_4_frag_lpf gpu 1.371,1.382,1.717,0.1294      soft 1.569,1.580,2.1,0.0596
+   image_rect_blit_frag_lpf  gpu -0,-5.2e-05,0.00124,-0.01386  soft -0.0651,-0.0047,0.1092,-0.01877
+   stroke_arc_frag_lpf       gpu 0.1875x3,0.5                  soft 0.375x3,1.0   (uses ddx/ddy of constant varyings: exactly a factor 2)
+   brim_jump_lpf             gpu 1.4e-45,2.8e-45,2.236,0       soft 1.4e-45,2.8e-45,0,0
+   They are genuine disagreements and NOT explained: four sample a texture with implicit LOD at coordinates that are constant over the quad
+   (degenerate derivatives), stroke_arc takes derivatives of constants. Own shaders with varying coordinates agree on both (P1-P8).
+4. bgmtl_adddev: MTLAddDevice(BGMTLDevice) in a test process on iOS 18.7.8 (featureProfile 1): returns, no assertion; MTLCopyAllDevices 0 -> 1;
+   MTLCreateSystemDefaultDevice returns it; supportsFamily Apple2 yes, Apple4 no, Common1 yes; newCommandQueue gives BGMTLCommandQueue.

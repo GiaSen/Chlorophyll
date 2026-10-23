@@ -758,6 +758,7 @@ ensure_protocol(Class cls, const char *proto)
    _shape.usage = (unsigned)[d usage];
    char why[512] = { 0 };
    if (surface) {
+      _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
       _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
       _surface = CFRetain(surface);
