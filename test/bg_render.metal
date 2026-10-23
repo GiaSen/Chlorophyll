@@ -41,3 +41,7 @@ fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]],
 {
    return t.sample(s, in.uv, level(0));
 }
+
+// a fragment stage with the varyings of CoreAnimation's std_vert0_*: color (float4) and texcoord0_0 (float2)
+struct CAV { float4 pos [[position]]; float4 color; float2 texcoord0_0; };
+fragment float4 bg_fs_ca_color(CAV in [[stage_in]]) { return in.color; }
