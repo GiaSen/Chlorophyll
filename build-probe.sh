@@ -36,4 +36,8 @@ $CC -O1 -g -Wall -I"$HERE/air" "$HERE/test/bgair_test.c" -o "$OUT/bgair_test" "$
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/mtl_gap.m" -o "$OUT/mtl_gap.o"
 $CC -o "$OUT/mtl_gap" "$OUT/bgmtl.o" "$OUT/mtl_gap.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@executable_path
 $CC -O1 -g -o "$OUT/bootinfo" "$HERE/test/bootinfo.c" -framework IOKit -framework CoreFoundation
+# the injection dylib (Mercury only, inert unless armed; see inject/bgmtl_inject.m)
+$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/inject/bgmtl_inject.m" -o "$OUT/bgmtl_inject.o"
+$CC -dynamiclib -o "$OUT/bgmtl-inject.dylib" "$OUT/bgmtl.o" "$OUT/bgmtl_inject.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" \
+    -framework Foundation -framework Metal -framework IOSurface -install_name /usr/local/lib/bgmtl/bgmtl-inject.dylib -Wl,-rpath,@loader_path
 ls -l "$OUT"

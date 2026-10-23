@@ -69,6 +69,9 @@ bg_log(const char *fmt, ...)
 
 #define BG_MAX_BINDINGS 16
 
+// provided by the injection dylib (gpu/metal/inject), absent in the test tools
+__attribute__((weak)) void bgmtl_note_failure(const char *why) { (void)why; }   // overridden by the injection dylib
+
 @class BGMTLDevice;
 @class BGMTLComputePipeline;
 
@@ -545,6 +548,7 @@ ensure_protocol(Class cls, const char *proto)
 - (void)bgFailWith:(NSString *)why code:(NSInteger)code
 {
    BG_LOG("command buffer failed: %s\n", [why UTF8String]);
+   bgmtl_note_failure([why UTF8String]);   // the injection dylib counts these (its dead-man)
    _error = [[NSError errorWithDomain:@"BGMTL" code:code userInfo:@{ NSLocalizedDescriptionKey : why }] retain];
    _status = 5;   // MTLCommandBufferStatusError
 }
@@ -963,7 +967,13 @@ bgmtl_create_device(void)
    int st = getenv("RWA_SOFTWARE") ? 1 : bgmtl_gpu_state(&minor);
    if (st == 2) { BG_LOG("the kernel reports the GPU LOST: no device is made\n"); return nil; }
    if (st == 1 && !getenv("RWA_SOFTWARE")) BG_LOG("GPU ready (kernel ABI minor %u)\n", minor);
-   return [[BGMTLDevice alloc] initWithAcceleratorPort:0];
+   BGMTLDevice *d = [[BGMTLDevice alloc] initWithAcceleratorPort:0];
+   if (d && !getenv("RWA_SOFTWARE") && ![d rwa]) {   // a device that cannot reach the GPU (sandbox, no service) is not a device
+      BG_LOG("no GPU behind the device: none is made\n");
+      [d release];
+      return nil;
+   }
+   return d;
 }
 
 // for tests: what the library made of a render pipeline
