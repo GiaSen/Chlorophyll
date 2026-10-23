@@ -48,6 +48,12 @@
 @interface _MTLComputePipelineState : NSObject
 - (instancetype)initWithDevice:(id)device pipelineStateDescriptor:(id)descriptor;
 @end
+@interface _MTLRenderPipelineState : NSObject
+- (instancetype)initWithDevice:(id)device pipelineStateDescriptor:(id)descriptor;
+@end
+@interface _MTLSamplerState : NSObject
+- (instancetype)initWithDevice:(id)device samplerDescriptor:(id)descriptor;
+@end
 
 #define BG_LOG(...) bg_log(__VA_ARGS__)
 static void
@@ -66,7 +72,8 @@ bg_log(const char *fmt, ...)
 @class BGMTLComputePipeline;
 
 // ---- recorded work ---------------------------------------------------------------------------------------------------
-enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL };
+enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
+#define BG_MAX_TEX 16
 @interface BGWork : NSObject {
  @public
    int kind;
@@ -78,6 +85,24 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL };
    id src, dst;                    // blit
    NSUInteger src_off, dst_off, size;
    uint8_t fill;
+   // textures and samplers of a dispatch, and of a draw's fragment stage
+   id textures[BG_MAX_TEX];
+   id samplers[BG_MAX_TEX];
+   unsigned texture_count, sampler_count;
+   // a draw
+   id render;                      // BGMTLRenderPipeline
+   id vbuffers[BG_MAX_BINDINGS];   // vertex stage buffers (streams and arguments share Metal's one table)
+   NSUInteger voffsets[BG_MAX_BINDINGS];
+   unsigned vcount;
+   id color[8];
+   unsigned color_count;
+   BOOL clear;
+   float clear_color[4];
+   NSUInteger primitive, vstart, vcount_verts;
+   NSUInteger instances, base_instance;
+   id index_buffer;
+   NSUInteger index_type, index_offset;
+   NSInteger base_vertex;
 }
 @end
 @implementation BGWork
@@ -85,7 +110,10 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL };
 {
    [pipeline release];
    for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) [buffers[i] release];
-   [src release]; [dst release];
+   [src release]; [dst release]; [render release]; [index_buffer release];
+   for (unsigned i = 0; i < BG_MAX_TEX; i++) { [textures[i] release]; [samplers[i] release]; }
+   for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) [vbuffers[i] release];
+   for (unsigned i = 0; i < 8; i++) [color[i] release];
    [super dealloc];
 }
 @end
@@ -144,6 +172,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL };
    NSUInteger _offsets[BG_MAX_BINDINGS];
    NSMutableArray *_scratch;       // setBytes copies, kept alive until commit
    unsigned _highest;
+   id _textures[BG_MAX_TEX], _samplers[BG_MAX_TEX];
+   unsigned _thigh, _shigh;
 }
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb;
 @end
@@ -152,6 +182,48 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL };
    BGMTLCommandBuffer *_cb;
 }
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb;
+@end
+
+@interface BGMTLTexture : _MTLResource {
+   BGMTLDevice *_owner;
+   struct rwa_texture *_tex;
+   struct rwa_texture_shape _shape;
+}
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
+- (struct rwa_texture *)rwaTexture;
+@end
+
+@interface BGMTLSampler : _MTLSamplerState {
+   BGMTLDevice *_owner;
+   struct rwa_sampler *_smp;
+}
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLSamplerDescriptor *)d;
+- (struct rwa_sampler *)rwaSampler;
+@end
+
+@interface BGMTLRenderPipeline : _MTLRenderPipelineState {
+ @public
+   BGMTLDevice *_owner;
+   struct rwa_render *_render;
+   struct rwa_render_info _info;
+}
+@end
+
+@interface BGMTLRenderEncoder : _MTLCommandEncoder {
+   BGMTLCommandBuffer *_cb;
+   BGMTLRenderPipeline *_pipeline;
+   id _vbuf[BG_MAX_BINDINGS], _fbuf[BG_MAX_BINDINGS];
+   NSUInteger _voff[BG_MAX_BINDINGS], _foff[BG_MAX_BINDINGS];
+   unsigned _vhigh, _fhigh;
+   id _tex[BG_MAX_TEX], _smp[BG_MAX_TEX];
+   unsigned _thigh, _shigh;
+   id _color[8];
+   unsigned _ncolor;
+   BOOL _clear_pending;
+   float _clear[4];
+   NSMutableArray *_scratch;
+}
+- (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d;
 @end
 
 static void
@@ -235,6 +307,78 @@ ensure_protocol(Class cls, const char *proto)
    BGMTLBuffer *b = [self newBufferWithLength:length options:options];
    if (b && bytes && [b contents]) memcpy([b contents], bytes, length);
    return b;
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d
+{
+   return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d];
+}
+
+- (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
+{
+   return [[BGMTLSampler alloc] initWithBGDevice:self descriptor:d];
+}
+
+- (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
+{
+   static SEL bitcode;
+   if (!bitcode) bitcode = sel_getUid("bitcodeData");
+   if (!_rwa) return [self bgFail:error with:[NSString stringWithFormat:@"no GPU: %s", _why]];
+   id vertex = [descriptor vertexFunction], fragment = [descriptor fragmentFunction];
+   if (!fragment || !vertex) return [self bgFail:error with:@"a render pipeline needs a vertex and a fragment function"];
+   NSData *vair = ((NSData * (*)(id, SEL))objc_msgSend)(vertex, bitcode);
+   NSData *fair = ((NSData * (*)(id, SEL))objc_msgSend)(fragment, bitcode);
+   if (!vair.length || !fair.length) return [self bgFail:error with:@"a function has no bitcode"];
+   struct rwa_render_shape shape;
+   memset(&shape, 0, sizeof(shape));
+   shape.sample_count = (unsigned)[descriptor sampleCount];
+   for (unsigned i = 0; i < 8; i++) {
+      MTLRenderPipelineColorAttachmentDescriptor *a = [[descriptor colorAttachments] objectAtIndexedSubscript:i];
+      shape.color_format[i] = a ? (unsigned)[a pixelFormat] : 0;
+      if (shape.color_format[i]) shape.color_count = i + 1;
+      if (!a) { shape.color_blend[i].write_mask = 0xf; continue; }
+      shape.color_blend[i].blending_enabled = [a isBlendingEnabled];
+      shape.color_blend[i].rgb_blend_operation = (unsigned)[a rgbBlendOperation];
+      shape.color_blend[i].alpha_blend_operation = (unsigned)[a alphaBlendOperation];
+      shape.color_blend[i].source_rgb_blend_factor = (unsigned)[a sourceRGBBlendFactor];
+      shape.color_blend[i].destination_rgb_blend_factor = (unsigned)[a destinationRGBBlendFactor];
+      shape.color_blend[i].source_alpha_blend_factor = (unsigned)[a sourceAlphaBlendFactor];
+      shape.color_blend[i].destination_alpha_blend_factor = (unsigned)[a destinationAlphaBlendFactor];
+      shape.color_blend[i].write_mask = (unsigned)[a writeMask];
+   }
+   shape.color_blend_count = 8;
+   shape.depth_format = (unsigned)[descriptor depthAttachmentPixelFormat];
+   shape.stencil_format = (unsigned)[descriptor stencilAttachmentPixelFormat];
+   MTLVertexDescriptor *vd = [descriptor vertexDescriptor];
+   if (vd) {
+      for (unsigned i = 0; i < RWA_MAX_VERTEX_ATTRIBUTES; i++) {
+         MTLVertexAttributeDescriptor *a = [[vd attributes] objectAtIndexedSubscript:i];
+         if (!a || ![a format]) continue;
+         shape.vertex_attribute[i].format = (unsigned)[a format];
+         shape.vertex_attribute[i].offset = (unsigned)[a offset];
+         shape.vertex_attribute[i].buffer_index = (unsigned)[a bufferIndex];
+      }
+      for (unsigned k = 0; k < RWA_MAX_VERTEX_BUFFERS; k++) {
+         MTLVertexBufferLayoutDescriptor *l = [[vd layouts] objectAtIndexedSubscript:k];
+         if (!l) continue;
+         shape.vertex_layout[k].stride = (unsigned)[l stride];
+         shape.vertex_layout[k].step_function = (unsigned)[l stepFunction];
+         shape.vertex_layout[k].step_rate = (unsigned)[l stepRate];
+      }
+   }
+   char why[512] = { 0 };
+   struct rwa_render_info info;
+   memset(&info, 0, sizeof(info));
+   struct rwa_render *r = rwa_render_create(_rwa, vair.bytes, vair.length, [[vertex name] UTF8String], fair.bytes, fair.length,
+                                            [[fragment name] UTF8String], &shape, &info, why, sizeof(why));
+   if (!r) return [self bgFail:error with:[NSString stringWithUTF8String:why]];
+   BGMTLRenderPipeline *p = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
+   if (!p) { rwa_render_destroy(r); return [self bgFail:error with:@"_MTLRenderPipelineState refused to initialise"]; }
+   p->_owner = self; p->_render = r; p->_info = info;
+   BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
+          [[vertex name] UTF8String], [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
+          info.fragment_textures, info.fragment_samplers, info.vertex_streams);
+   return p;
 }
 
 // -- compute pipelines: both of _MTLDevice's entry points go through its (nil) -compiler, so they are ours --
@@ -399,9 +543,51 @@ ensure_protocol(Class cls, const char *proto)
             table[i].buffer = bufs[i];
             table[i].offset = w->offsets[i];
          }
-         struct rwa_bindings b = { .buffers = bufs, .buffer_count = w->count };
+         struct rwa_texture *texs[BG_MAX_TEX] = { NULL };
+         struct rwa_sampler *smps[BG_MAX_TEX] = { NULL };
+         for (unsigned i = 0; i < w->texture_count; i++) texs[i] = [(BGMTLTexture *)w->textures[i] rwaTexture];
+         for (unsigned i = 0; i < w->sampler_count; i++) smps[i] = [(BGMTLSampler *)w->samplers[i] rwaSampler];
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = w->count, .textures = texs, .texture_count = w->texture_count,
+                                   .samplers = smps, .sampler_count = w->sampler_count };
          if (rwa_dispatch_buffers(w->pipeline->_compute, &b, table, w->count, w->groups, w->group_size, why, sizeof(why)) != 0) {
             [self bgFailWith:[NSString stringWithUTF8String:why] code:2];
+            break;
+         }
+      } else if (w->kind == BG_WORK_DRAW) {
+         BGMTLRenderPipeline *rp = (BGMTLRenderPipeline *)w->render;
+         struct rwa_buffer *vb[BG_MAX_BINDINGS] = { NULL }, *fb[BG_MAX_BINDINGS] = { NULL };
+         struct rwa_buffer_bind vt[BG_MAX_BINDINGS] = { { NULL, 0 } }, ft[BG_MAX_BINDINGS] = { { NULL, 0 } };
+         struct rwa_vertex_stream streams[BG_MAX_BINDINGS] = { { NULL, 0 } };
+         for (unsigned i = 0; i < w->vcount; i++) {
+            vb[i] = [(BGMTLBuffer *)w->vbuffers[i] rwaBuffer];
+            vt[i].buffer = vb[i]; vt[i].offset = w->voffsets[i];
+            streams[i].buffer = vb[i]; streams[i].offset = w->voffsets[i];
+         }
+         for (unsigned i = 0; i < w->count; i++) {
+            fb[i] = [(BGMTLBuffer *)w->buffers[i] rwaBuffer];
+            ft[i].buffer = fb[i]; ft[i].offset = w->offsets[i];
+         }
+         struct rwa_texture *texs[BG_MAX_TEX] = { NULL }, *colors[8] = { NULL };
+         struct rwa_sampler *smps[BG_MAX_TEX] = { NULL };
+         for (unsigned i = 0; i < w->texture_count; i++) texs[i] = [(BGMTLTexture *)w->textures[i] rwaTexture];
+         for (unsigned i = 0; i < w->sampler_count; i++) smps[i] = [(BGMTLSampler *)w->samplers[i] rwaSampler];
+         for (unsigned i = 0; i < w->color_count; i++) colors[i] = [(BGMTLTexture *)w->color[i] rwaTexture];
+         struct rwa_draw dr;
+         memset(&dr, 0, sizeof(dr));
+         dr.color = colors; dr.color_count = w->color_count;
+         dr.clear_color = w->clear ? w->clear_color : NULL;
+         dr.vertex = (struct rwa_bindings){ .buffers = vb, .buffer_count = w->vcount };
+         dr.fragment = (struct rwa_bindings){ .buffers = fb, .buffer_count = w->count, .textures = texs, .texture_count = w->texture_count,
+                                              .samplers = smps, .sampler_count = w->sampler_count };
+         dr.primitive = (unsigned)w->primitive; dr.vertex_start = (unsigned)w->vstart; dr.vertex_count = (unsigned)w->vcount_verts;
+         dr.index_buffer = w->index_buffer ? [(BGMTLBuffer *)w->index_buffer rwaBuffer] : NULL;
+         dr.index_type = (unsigned)w->index_type; dr.index_buffer_offset = w->index_offset;
+         dr.base_vertex = (int)w->base_vertex; dr.instance_count = (unsigned)w->instances; dr.base_instance = (unsigned)w->base_instance;
+         dr.vertex_streams = streams; dr.vertex_stream_count = rp->_info.vertex_streams;
+         dr.vertex_buffer_table = vt; dr.vertex_buffer_table_count = w->vcount;
+         dr.fragment_buffer_table = ft; dr.fragment_buffer_table_count = w->count;
+         if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0) {
+            [self bgFailWith:[NSString stringWithUTF8String:why] code:4];
             break;
          }
       } else {
@@ -429,6 +615,8 @@ ensure_protocol(Class cls, const char *proto)
 - (id)computeCommandEncoder { return [[[BGMTLComputeEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
 - (id)computeCommandEncoderWithDescriptor:(id)d { (void)d; return [self computeCommandEncoder]; }
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { (void)t; return [self computeCommandEncoder]; }
+- (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
+{ return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease]; }
 - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
 - (id)blitCommandEncoderWithDescriptor:(id)d { (void)d; return [self blitCommandEncoder]; }
 @end
@@ -452,6 +640,8 @@ ensure_protocol(Class cls, const char *proto)
    _offsets[index] = offset;
    if (index + 1 > _highest) _highest = (unsigned)index + 1;
 }
+- (void)setTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _textures[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
+- (void)setSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _samplers[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:length < 16 ? 16 : length options:0] autorelease];
@@ -467,6 +657,8 @@ ensure_protocol(Class cls, const char *proto)
    w->pipeline = [_pipeline retain];
    w->count = _highest;
    for (unsigned i = 0; i < _highest; i++) { w->buffers[i] = [_buffers[i] retain]; w->offsets[i] = _offsets[i]; }
+   for (unsigned i = 0; i < BG_MAX_TEX; i++) { w->textures[i] = [_textures[i] retain]; w->samplers[i] = [_samplers[i] retain]; }
+   w->texture_count = _thigh; w->sampler_count = _shigh;
    w->groups[0] = (unsigned)groups.width; w->groups[1] = (unsigned)groups.height; w->groups[2] = (unsigned)groups.depth;
    w->group_size[0] = (unsigned)size.width; w->group_size[1] = (unsigned)size.height; w->group_size[2] = (unsigned)size.depth;
    [_cb bgRecord:w];
@@ -501,6 +693,195 @@ ensure_protocol(Class cls, const char *proto)
    w->kind = BG_WORK_FILL; w->dst = [buffer retain]; w->dst_off = range.location; w->size = range.length; w->fill = value;
    [_cb bgRecord:w];
 }
+- (void)endEncoding { [super endEncoding]; }
+@end
+
+
+// ---- texture / sampler / render pipeline ----------------------------------------------------------------------------
+@implementation BGMTLTexture
++ (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
+{
+   self = [super init];
+   if (!self) return nil;
+   if (![device rwa] || !d) { [self release]; return nil; }
+   _shape.pixel_format = (unsigned)[d pixelFormat];
+   _shape.type = (unsigned)[d textureType];
+   _shape.width = (unsigned)[d width];
+   _shape.height = (unsigned)[d height];
+   _shape.depth = (unsigned)[d depth];
+   _shape.array_length = (unsigned)[d arrayLength];
+   _shape.mip_levels = (unsigned)[d mipmapLevelCount];
+   _shape.sample_count = (unsigned)[d sampleCount];
+   _shape.usage = (unsigned)[d usage];
+   char why[512] = { 0 };
+   _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+   if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
+   _owner = device;
+   return self;
+}
+- (void)dealloc { if (_tex) rwa_texture_destroy(_tex); [super dealloc]; }
+- (struct rwa_texture *)rwaTexture { return _tex; }
+- (id)device { return _owner; }
+- (NSUInteger)width { return _shape.width; }
+- (NSUInteger)height { return _shape.height; }
+- (NSUInteger)depth { return _shape.depth; }
+- (NSUInteger)mipmapLevelCount { return _shape.mip_levels; }
+- (NSUInteger)arrayLength { return _shape.array_length; }
+- (NSUInteger)sampleCount { return _shape.sample_count; }
+- (NSUInteger)pixelFormat { return _shape.pixel_format; }
+- (NSUInteger)textureType { return _shape.type; }
+- (NSUInteger)usage { return _shape.usage; }
+- (BOOL)isFramebufferOnly { return NO; }
+- (id)parentTexture { return nil; }
+- (id)buffer { return nil; }
+- (NSUInteger)storageMode { return 0; }
+- (NSUInteger)cpuCacheMode { return 0; }
+- (NSUInteger)resourceOptions { return 0; }
+- (NSUInteger)hazardTrackingMode { return 0; }
+- (NSUInteger)allocatedSize { return 0; }
+- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
+- (id)heap { return nil; }
+- (BOOL)isAliasable { return NO; }
+- (BOOL)isComplete { return YES; }
+- (void)waitUntilComplete {}
+- (NSUInteger)protectionOptions { return 0; }
+- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
+          bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+{
+   (void)bpi;
+   unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
+   unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
+   char why[256] = { 0 };
+   if (rwa_texture_write(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("replaceRegion: %s\n", why);
+}
+- (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr
+{
+   [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
+}
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)r
+     mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
+{
+   (void)bpi;
+   unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
+   unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
+   char why[256] = { 0 };
+   if (rwa_texture_read(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("getBytes: %s\n", why);
+}
+- (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
+{
+   [self getBytes:bytes bytesPerRow:bpr bytesPerImage:0 fromRegion:r mipmapLevel:level slice:0];
+}
+@end
+
+@implementation BGMTLSampler
++ (void)load { ensure_protocol(self, "MTLSamplerState"); }
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLSamplerDescriptor *)d
+{
+   self = [super initWithDevice:device samplerDescriptor:d];
+   if (!self) return nil;
+   struct rwa_sampler_state st;
+   memset(&st, 0, sizeof(st));
+   st.address[0] = (unsigned)[d sAddressMode]; st.address[1] = (unsigned)[d tAddressMode]; st.address[2] = (unsigned)[d rAddressMode];
+   st.min_filter = (unsigned)[d minFilter]; st.mag_filter = (unsigned)[d magFilter]; st.mip_filter = (unsigned)[d mipFilter];
+   st.compare_function = (unsigned)[d compareFunction];
+   st.max_anisotropy = (unsigned)[d maxAnisotropy];
+   st.normalized_coordinates = [d normalizedCoordinates];
+   st.lod_min = [d lodMinClamp]; st.lod_max = [d lodMaxClamp];
+   char why[256] = { 0 };
+   _smp = rwa_sampler_create([device rwa], &st, why, sizeof(why));
+   if (!_smp) { BG_LOG("sampler refused: %s\n", why); [self release]; return nil; }
+   _owner = device;
+   return self;
+}
+- (void)dealloc { if (_smp) rwa_sampler_destroy(_smp); [super dealloc]; }
+- (struct rwa_sampler *)rwaSampler { return _smp; }
+- (id)device { return _owner; }
+@end
+
+@implementation BGMTLRenderPipeline
++ (void)load { ensure_protocol(self, "MTLRenderPipelineState"); }
+- (void)dealloc { if (_render) rwa_render_destroy(_render); [super dealloc]; }
+- (id)device { return _owner; }
+@end
+
+@implementation BGMTLRenderEncoder
+- (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d
+{
+   self = [super initWithCommandBuffer:cb];
+   if (!self) return nil;
+   _cb = cb;
+   _scratch = [[NSMutableArray alloc] init];
+   for (unsigned i = 0; i < 8; i++) {
+      MTLRenderPassColorAttachmentDescriptor *a = [[d colorAttachments] objectAtIndexedSubscript:i];
+      if (!a || ![a texture]) continue;
+      _color[i] = [[a texture] retain];
+      _ncolor = i + 1;
+      if (i == 0 && [a loadAction] == MTLLoadActionClear) {
+         MTLClearColor c = [a clearColor];
+         _clear[0] = (float)c.red; _clear[1] = (float)c.green; _clear[2] = (float)c.blue; _clear[3] = (float)c.alpha;
+         _clear_pending = YES;
+      }
+   }
+   return self;
+}
+- (void)dealloc { for (unsigned i = 0; i < 8; i++) [_color[i] release]; [_scratch release]; [super dealloc]; }
+- (id)device { return [_cb device]; }
+- (void)setRenderPipelineState:(id)s { _pipeline = s; }
+- (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
+{ if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
+- (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
+{ if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
+{
+   id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
+   if (b) { [_scratch addObject:b]; [self setVertexBuffer:b offset:0 atIndex:i]; }
+}
+- (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
+{
+   id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
+   if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
+}
+- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
+- (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
+- (void)setViewport:(MTLViewport)v { (void)v; }
+- (void)setScissorRect:(MTLScissorRect)r { (void)r; }
+- (void)setCullMode:(NSUInteger)m { (void)m; }
+- (void)setFrontFacingWinding:(NSUInteger)w { (void)w; }
+- (void)setTriangleFillMode:(NSUInteger)m { (void)m; }
+
+- (void)bgRecordDraw:(NSUInteger)prim start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)inst
+        indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
+{
+   if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }
+   BGWork *w = [[[BGWork alloc] init] autorelease];
+   w->kind = BG_WORK_DRAW;
+   w->render = [_pipeline retain];
+   w->vcount = _vhigh > _fhigh ? _vhigh : _fhigh;
+   w->count = _fhigh;
+   for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) {
+      w->vbuffers[i] = [_vbuf[i] retain]; w->voffsets[i] = _voff[i];
+      w->buffers[i] = [_fbuf[i] retain]; w->offsets[i] = _foff[i];
+   }
+   w->vcount = _vhigh;
+   for (unsigned i = 0; i < BG_MAX_TEX; i++) { w->textures[i] = [_tex[i] retain]; w->samplers[i] = [_smp[i] retain]; }
+   w->texture_count = _thigh; w->sampler_count = _shigh;
+   w->color_count = _ncolor;
+   for (unsigned i = 0; i < _ncolor; i++) w->color[i] = [_color[i] retain];
+   if (_clear_pending) { w->clear = YES; memcpy(w->clear_color, _clear, sizeof(_clear)); _clear_pending = NO; }
+   w->primitive = prim; w->vstart = start; w->vcount_verts = count; w->instances = inst; w->base_instance = bi;
+   w->index_buffer = [ib retain]; w->index_type = it; w->index_offset = io; w->base_vertex = bv;
+   [_cb bgRecord:w];
+}
+- (void)drawPrimitives:(NSUInteger)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c
+{ [self bgRecordDraw:p start:s count:c instances:1 indexBuffer:nil indexType:0 indexOffset:0 baseVertex:0 baseInstance:0]; }
+- (void)drawPrimitives:(NSUInteger)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c instanceCount:(NSUInteger)n
+{ [self bgRecordDraw:p start:s count:c instances:n indexBuffer:nil indexType:0 indexOffset:0 baseVertex:0 baseInstance:0]; }
+- (void)drawIndexedPrimitives:(NSUInteger)p indexCount:(NSUInteger)c indexType:(NSUInteger)t indexBuffer:(id)b indexBufferOffset:(NSUInteger)o
+{ [self bgRecordDraw:p start:0 count:c instances:1 indexBuffer:b indexType:t indexOffset:o baseVertex:0 baseInstance:0]; }
+- (void)drawIndexedPrimitives:(NSUInteger)p indexCount:(NSUInteger)c indexType:(NSUInteger)t indexBuffer:(id)b indexBufferOffset:(NSUInteger)o
+                instanceCount:(NSUInteger)n
+{ [self bgRecordDraw:p start:0 count:c instances:n indexBuffer:b indexType:t indexOffset:o baseVertex:0 baseInstance:0]; }
 - (void)endEncoding { [super endEncoding]; }
 @end
 

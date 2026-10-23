@@ -33,3 +33,26 @@ kernel void bg_groupsum(device const uint *in [[buffer(0)]], device uint *out [[
       out[tg] = s;
    }
 }
+
+// texture read in a kernel: out[y*w+x] = t.read(gid)
+kernel void bg_tex_read(texture2d<float, access::read> t [[texture(0)]], device float4 *out [[buffer(0)]],
+                        uint2 gid [[thread_position_in_grid]])
+{
+   if (gid.x < t.get_width() && gid.y < t.get_height())
+      out[gid.y * t.get_width() + gid.x] = t.read(gid);
+}
+
+// texture sample through a sampler: nearest, normalised coordinates
+kernel void bg_tex_sample(texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], device float4 *out [[buffer(0)]],
+                          uint2 gid [[thread_position_in_grid]])
+{
+   float2 uv = (float2(gid) + 0.5) / float2(t.get_width(), t.get_height());
+   out[gid.y * t.get_width() + gid.x] = t.sample(s, uv);
+}
+
+// write a texture from a kernel
+kernel void bg_tex_write(texture2d<float, access::write> t [[texture(0)]], uint2 gid [[thread_position_in_grid]])
+{
+   if (gid.x < t.get_width() && gid.y < t.get_height())
+      t.write(float4(float(gid.x) / 16.0, float(gid.y) / 16.0, 0.5, 1.0), gid);
+}
