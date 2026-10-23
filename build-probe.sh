@@ -15,7 +15,7 @@ xcrun strip -x "$OUT/libbgair.dylib"      # 9.4 MB instead of 10 MB: large scp t
 cp -f "$WORK/mesa-air/drm-ios/libdrm.2.arm64e.dylib" "$OUT/libdrm.2.dylib"
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -I"$HERE/air" -c "$HERE/src/bgmtl.m" -o "$OUT/bgmtl.o"
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_probe.m" -o "$OUT/bgmtl_probe.o"
-$CC -o "$OUT/bgmtl_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_probe.o" "$OUT/libbgair.dylib" -framework Foundation -framework Metal \
+$CC -o "$OUT/bgmtl_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_probe.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface \
     -Wl,-rpath,@executable_path
 # the test kernels: AIR compiled on the Mac
 xcrun -sdk iphoneos metal -mios-version-min=18.0 -c "$HERE/test/bg_kernels.metal" -o "$OUT/bg_kernels.air"
@@ -24,11 +24,13 @@ xcrun -sdk iphoneos metal -mios-version-min=18.0 -c "$HERE/test/bg_render.metal"
 xcrun -sdk iphoneos metallib "$OUT/bg_render.air" -o "$OUT/bg_render.metallib"
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_render_probe.m" -o "$OUT/bgmtl_render_probe.o"
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -I"$HERE/air" -c "$HERE/test/bgmtl_ca_probe.m" -o "$OUT/bgmtl_ca_probe.o"
-$CC -o "$OUT/bgmtl_ca_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_ca_probe.o" "$OUT/libbgair.dylib" -framework Foundation -framework Metal -Wl,-rpath,@executable_path
-$CC -o "$OUT/bgmtl_render_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_render_probe.o" "$OUT/libbgair.dylib" -framework Foundation -framework Metal -Wl,-rpath,@executable_path
+$CC -o "$OUT/bgmtl_ca_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_ca_probe.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@executable_path
+$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_layer_probe.m" -o "$OUT/bgmtl_layer_probe.o"
+$CC -o "$OUT/bgmtl_layer_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_layer_probe.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -framework QuartzCore -Wl,-rpath,@executable_path
+$CC -o "$OUT/bgmtl_render_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_render_probe.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@executable_path
 $CC -O1 -g -fno-objc-arc -o "$OUT/mtl_introspect" "$HERE/test/mtl_introspect.m" -framework Foundation
 $CC -O1 -g -Wall -I"$HERE/air" "$HERE/test/bgair_test.c" -o "$OUT/bgair_test" "$OUT/libbgair.dylib" -Wl,-rpath,@executable_path
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/mtl_gap.m" -o "$OUT/mtl_gap.o"
-$CC -o "$OUT/mtl_gap" "$OUT/bgmtl.o" "$OUT/mtl_gap.o" "$OUT/libbgair.dylib" -framework Foundation -framework Metal -Wl,-rpath,@executable_path
+$CC -o "$OUT/mtl_gap" "$OUT/bgmtl.o" "$OUT/mtl_gap.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@executable_path
 $CC -O1 -g -o "$OUT/bootinfo" "$HERE/test/bootinfo.c" -framework IOKit -framework CoreFoundation
 ls -l "$OUT"

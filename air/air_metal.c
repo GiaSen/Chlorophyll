@@ -197,7 +197,21 @@ struct rwa_texture {
     * lenient one.
     */
    bool shader_read, shader_write;
+
+   /* Bergamota: the kernel's BO handle when the memory is an IOSurface (rwa_texture_from_surface), for the clean+invalidate that makes the GPU's
+    * pixels visible to whoever composites the surface (rwa_texture_flush_surface) */
+   unsigned surface_handle;
 };
+
+/* the libdrm stand-in's IOSurface calls (gpu/freedreno-sweet/sweet_drm.c); struct sweet_gpu_surface_bo, first 48 bytes (ABI minor 0 layout,
+ * which every kernel minor accepts: a caller may pass and accept only these) */
+struct rwa_sbo {
+   uint32_t surface_id, handle;
+   uint64_t size, iova;
+   uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
+};
+extern int sweet_drm_surface_bo(int fd, struct rwa_sbo *io);
+extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
  * not kept: a refusal about a sampler happens while it is being created, where the
@@ -1388,13 +1402,41 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
        * surface has no tiling and no UBWC metadata, and fd6_layout_resource_for_modifier
        * on DRM_FORMAT_MOD_LINEAR only notes "not UBWC" and returns success.
        */
+      /* Bergamota: the kernel is asked about the surface (SURFACE_BO, idempotent, minor 0 and 1 alike) and answers handle, size, offset, pitch;
+       * the pitch and the offset come from that answer and not from the caller. The resource is made from a KMS handle with its size, as
+       * the OSMesa path of gpu-eagl does (fd_screen_bo_from_handle passes the size to fd_bo_from_handle). */
+      struct rwa_sbo sb;
+      memset(&sb, 0, sizeof(sb));
+      sb.surface_id = (uint32_t)import->id;
+      if (device->software) {
+         say(why, why_size, "%s imports no memory: a texture over an IOSurface is the GPU's own import path, and a rasterizer in plain C "
+                            "has nowhere to put somebody else's pages", rwa_device_name(device));
+         free(texture);
+         return NULL;
+      }
+      int sr = sweet_drm_surface_bo(-1, &sb);
+      if (sr != 0 || sb.planes > 1 || sb.bytes_per_row == 0) {
+         say(why, why_size, "the kernel would not describe IOSurface %d (error %d, planes %u, %u bytes a row): it knows nothing of an ID that "
+                            "was never made shareable", import->id, sr, sb.planes, sb.bytes_per_row);
+         free(texture);
+         return NULL;
+      }
+      if (sb.width < width || sb.height < height) {
+         say(why, why_size, "IOSurface %d is %ux%u and the texture asks for %ux%u", import->id, sb.width, sb.height, width, height);
+         free(texture);
+         return NULL;
+      }
       struct winsys_handle whandle = {
-         .type = WINSYS_HANDLE_TYPE_FD,
-         .handle = (unsigned) import->id,
-         .stride = import->row_bytes,
-         .offset = import->offset,
+         .type = WINSYS_HANDLE_TYPE_KMS,
+         .handle = sb.handle,
+         .stride = sb.bytes_per_row,
+         .offset = sb.offset,
+         .size = sb.size,
          .modifier = DRM_FORMAT_MOD_LINEAR,
       };
+      texture->surface_handle = sb.handle;
+      struct rwa_surface_import real = { .id = import->id, .offset = sb.offset, .row_bytes = sb.bytes_per_row };
+      import = &real;
 
       /*
        * freedreno's own two conditions, checked here so that a failure names the number
@@ -1447,6 +1489,8 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
 
       texture->res = device->screen->resource_from_handle(device->screen, &templ, &whandle,
                                                           PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+      if (texture->res)
+         sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);   /* clean the CPU's dirty lines before the GPU first writes */
       if (!texture->res) {
          /*
           * Everything this side could check has been checked, so no reason is invented
@@ -1507,6 +1551,16 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
       .id = surface_id, .offset = offset, .row_bytes = row_bytes };
 
    return texture_of_shape(device, shape, &import, why, why_size);
+}
+
+/* Make what the GPU wrote into an IOSurface-backed texture visible to the CPU and to the compositor (clean+invalidate of the kernel alias).
+ * Call after the work that wrote it has completed (rwa_finish). A texture that is not over a surface: nothing to do. */
+int
+rwa_texture_flush_surface(struct rwa_texture *texture)
+{
+   if (!texture || !texture->surface_handle)
+      return 0;
+   return sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);
 }
 
 void

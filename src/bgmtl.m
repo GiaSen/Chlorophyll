@@ -18,6 +18,7 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -159,7 +160,7 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
    NSMutableArray *_work;
    NSError *_error;
    NSInteger _status;
-   NSMutableArray *_completed;
+   NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgRecord:(BGWork *)work;
@@ -188,8 +189,11 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
    BGMTLDevice *_owner;
    struct rwa_texture *_tex;
    struct rwa_texture_shape _shape;
+   CFTypeRef _surface;   // retained IOSurface, when the memory is one
+   NSUInteger _plane;
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
 - (struct rwa_texture *)rwaTexture;
 @end
 
@@ -312,6 +316,11 @@ ensure_protocol(Class cls, const char *proto)
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d
 {
    return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d];
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane
+{
+   return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d iosurface:surface plane:plane];
 }
 
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
@@ -503,12 +512,14 @@ ensure_protocol(Class cls, const char *proto)
    _queue = [queue retain];
    _work = [[NSMutableArray alloc] init];
    _completed = [[NSMutableArray alloc] init];
+   _scheduled = [[NSMutableArray alloc] init];
+   _presents = [[NSMutableArray alloc] init];
    _status = 1;   // MTLCommandBufferStatusEnqueued
    return self;
 }
 - (void)dealloc
 {
-   [_queue release]; [_work release]; [_error release]; [_completed release];
+   [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
    [super dealloc];
 }
 - (id)device { return [_queue device]; }
@@ -516,7 +527,14 @@ ensure_protocol(Class cls, const char *proto)
 - (NSInteger)status { return _status; }
 - (NSError *)error { return _error; }
 - (void)enqueue {}
-- (void)addScheduledHandler:(void (^)(id))block { if (block) block(self); }
+- (void)addScheduledHandler:(void (^)(id))block
+{
+   if (!block) return;
+   if (_status >= 3) block(self); else [_scheduled addObject:[[block copy] autorelease]];   // delivered when the work has been submitted, not before
+}
+- (void)presentDrawable:(id)drawable { if (drawable) [_presents addObject:@[ drawable, @0.0, @0.0 ]]; }
+- (void)presentDrawable:(id)drawable atTime:(CFTimeInterval)t { if (drawable) [_presents addObject:@[ drawable, @(t), @0.0 ]]; }
+- (void)presentDrawable:(id)drawable afterMinimumDuration:(CFTimeInterval)d { if (drawable) [_presents addObject:@[ drawable, @0.0, @(d) ]]; }
 - (void)addCompletedHandler:(void (^)(id))block
 {
    if (!block) return;
@@ -608,6 +626,24 @@ ensure_protocol(Class cls, const char *proto)
       [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
    else if (_status != 5)
       _status = 4;   // Completed: the fence has been paid
+   // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
+   if (_status == 4)
+      for (BGWork *w in _work)
+         if (w->kind == BG_WORK_DRAW)
+            for (unsigned i = 0; i < w->color_count; i++)
+               rwa_texture_flush_surface([(BGMTLTexture *)w->color[i] rwaTexture]);
+   for (void (^h)(id) in _scheduled) h(self);
+   [_scheduled removeAllObjects];
+   if (_status == 4) {
+      for (NSArray *p in _presents) {
+         id dr = p[0];
+         double at = [p[1] doubleValue], after = [p[2] doubleValue];
+         if (at > 0 && [dr respondsToSelector:@selector(presentAtTime:)]) [dr presentAtTime:at];
+         else if (after > 0 && [dr respondsToSelector:@selector(presentAfterMinimumDuration:)]) [dr presentAfterMinimumDuration:after];
+         else [dr present];
+      }
+   }
+   [_presents removeAllObjects];
    for (void (^h)(id) in _completed) h(self);
    [_completed removeAllObjects];
 }
@@ -704,6 +740,10 @@ ensure_protocol(Class cls, const char *proto)
 + (void)load { ensure_protocol(self, "MTLTexture"); ensure_protocol(self, "MTLTextureImplementation"); }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d
 {
+   return [self initWithBGDevice:device descriptor:d iosurface:NULL plane:0];
+}
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane
+{
    self = [super init];
    if (!self) return nil;
    if (![device rwa] || !d) { [self release]; return nil; }
@@ -717,12 +757,22 @@ ensure_protocol(Class cls, const char *proto)
    _shape.sample_count = (unsigned)[d sampleCount];
    _shape.usage = (unsigned)[d usage];
    char why[512] = { 0 };
-   _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+   if (surface) {
+      /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
+      _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
+      _surface = CFRetain(surface);
+      _plane = plane;
+   } else {
+      _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+   }
    if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
    _owner = device;
    return self;
 }
-- (void)dealloc { if (_tex) rwa_texture_destroy(_tex); [super dealloc]; }
+- (void)dealloc { if (_tex) rwa_texture_destroy(_tex); if (_surface) CFRelease(_surface); [super dealloc]; }
+- (void *)iosurface { return (void *)_surface; }
+- (NSUInteger)iosurfacePlane { return _plane; }
+- (BOOL)isDrawable { return _surface != NULL; }
 - (struct rwa_texture *)rwaTexture { return _tex; }
 - (id)device { return _owner; }
 - (NSUInteger)width { return _shape.width; }
@@ -887,10 +937,31 @@ ensure_protocol(Class cls, const char *proto)
 - (void)endEncoding { [super endEncoding]; }
 @end
 
+// ---- GPU state, as the kernel reports it (SWEET_GPU_SEL_INFO). ABI minor 1 and 2 are both served: only flags & 3 is read (bit0 ready,
+// bit1 lost); abi_minor is informational and every field beyond the first 40 bytes is ignored. -1: no answer, 0: not ready, 1: ready, 2: LOST.
+struct bg_gpu_info { uint32_t abi_version, flags, gpu_id, chip_id; uint64_t va_start, va_size; uint32_t last_fence, abi_minor; };
+extern int sweet_drm_info(int fd, struct bg_gpu_info *out);
+
+int
+bgmtl_gpu_state(unsigned *abi_minor)
+{
+   struct bg_gpu_info in;
+   memset(&in, 0, sizeof(in));
+   if (sweet_drm_info(-1, &in) != 0)
+      return -1;
+   if (abi_minor) *abi_minor = in.abi_minor;
+   uint32_t f = in.flags & 3;
+   return (f & 2) ? 2 : (f & 1) ? 1 : 0;
+}
+
 // ---- entry point for test processes ----------------------------------------------------------------------------------
 id
 bgmtl_create_device(void)
 {
+   unsigned minor = 0;
+   int st = getenv("RWA_SOFTWARE") ? 1 : bgmtl_gpu_state(&minor);
+   if (st == 2) { BG_LOG("the kernel reports the GPU LOST: no device is made\n"); return nil; }
+   if (st == 1 && !getenv("RWA_SOFTWARE")) BG_LOG("GPU ready (kernel ABI minor %u)\n", minor);
    return [[BGMTLDevice alloc] initWithAcceleratorPort:0];
 }
 

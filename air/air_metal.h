@@ -139,6 +139,8 @@ struct rwa_texture *rwa_texture_create(struct rwa_device *device,
 				       const struct rwa_texture_shape *shape,
 				       char *why, size_t why_size);
 void rwa_texture_destroy(struct rwa_texture *texture);
+/* Bergamota: after the GPU work that wrote an IOSurface-backed texture has finished, make its pixels visible to the compositor. */
+int rwa_texture_flush_surface(struct rwa_texture *texture);
 
 /*
  * The same texture, over memory somebody else allocated: an IOSurface of CoreAnimation's.
