@@ -1,0 +1,56 @@
+Metal.framework dlopen: ok
+_MTLDevice                         super=NSObject                 inst_methods=598 ivars=50 size=600 protocols=
+_MTLObjectWithLabel                super=NSObject                 inst_methods=5 ivars=2 size=24 protocols=
+_MTLResource                       super=_MTLAllocation           inst_methods=6 ivars=0 size=32 protocols=
+_MTLCommandQueue                   super=_MTLObjectWithLabel      inst_methods=61 ivars=34 size=384 protocols=
+_MTLCommandBuffer                  super=_MTLObjectWithLabel      inst_methods=96 ivars=61 size=576 protocols=
+_MTLCommandEncoder                 super=_MTLObjectWithLabel      inst_methods=74 ivars=9 size=88 protocols=
+_MTLComputeCommandEncoder          MISSING
+_MTLComputePipelineState           super=NSObject                 inst_methods=27 ivars=7 size=64 protocols=MTLComputePipelineState
+_MTLRenderPipelineState            super=NSObject                 inst_methods=67 ivars=19 size=144 protocols=MTLRenderPipelineState
+_MTLFunction                       super=_MTLObjectWithLabel      inst_methods=36 ivars=20 size=208 protocols=MTLFunctionSPI
+_MTLLibrary                        super=_MTLObjectWithLabel      inst_methods=49 ivars=5 size=64 protocols=MTLLibrarySPI
+_MTLBuffer                         MISSING
+_MTLTexture                        MISSING
+_MTLSamplerState                   super=NSObject                 inst_methods=12 ivars=5 size=48 protocols=MTLSamplerStateSPI
+_MTLDepthStencilState              super=NSObject                 inst_methods=10 ivars=2 size=24 protocols=MTLDepthStencilStateSPI
+_MTLHeap                           super=_MTLAllocation           inst_methods=25 ivars=3 size=56 protocols=
+_MTLEvent                          MISSING
+_MTLFence                          super=_MTLObjectWithLabel      inst_methods=0 ivars=0 size=24 protocols=
+MTLIOAccelDevice                   super=_MTLDevice               inst_methods=66 ivars=25 size=54176 protocols=
+MTLIOAccelCommandQueue             super=_MTLCommandQueue         inst_methods=13 ivars=4 size=416 protocols=
+MTLIOAccelCommandBuffer            super=_MTLCommandBuffer        inst_methods=44 ivars=8 size=640 protocols=
+MTLIOAccelBuffer                   super=MTLIOAccelResource       inst_methods=19 ivars=8 size=360 protocols=
+MTLIOAccelCommandEncoder           super=_MTLCommandEncoder       inst_methods=6 ivars=0 size=88 protocols=
+MTLIOAccelComputeCommandEncoder    super=MTLIOAccelCommandEncoder inst_methods=22 ivars=0 size=88 protocols=
+IOGPUMetalDevice                   MISSING
+IOGPUMetalCommandQueue             MISSING
+IOGPUMetalBuffer                   MISSING
+MTLComputePipelineDescriptorInternal super=MTLComputePipelineDescriptor inst_methods=77 ivars=1 size=208 protocols=
+MTLCompilerService                 MISSING
+_MTLCompiler                       MISSING
+MTLCompiler                        super=NSObject                 inst_methods=87 ivars=7 size=72 protocols=
+MTLCommandQueueDescriptor          super=NSObject                 inst_methods=6 ivars=2 size=24 protocols=NSCopying
+MTLLibrarySPI                      MISSING
+protocol MTLDevice                      required_inst=109 optional_inst=2
+protocol MTLDeviceSPI                   required_inst=376 optional_inst=72
+protocol MTLCommandQueue                MISSING
+protocol MTLCommandBuffer               required_inst=39 optional_inst=0
+protocol MTLCommandBufferSPI            MISSING
+protocol MTLComputeCommandEncoder       MISSING
+protocol MTLBuffer                      required_inst=7 optional_inst=0
+protocol MTLResource                    required_inst=14 optional_inst=0
+protocol MTLComputePipelineState        required_inst=13 optional_inst=0
+protocol MTLComputePipelineStateSPI     MISSING
+protocol MTLLibrary                     required_inst=13 optional_inst=0
+protocol MTLFunction                    required_inst=13 optional_inst=0
+protocol MTLFunctionSPI                 required_inst=23 optional_inst=0
+protocol MTLBlitCommandEncoder          MISSING
+_MTLDevice init-family: initWorkarounds initGPUFamilySupport initSerializationPaths initFeatureQueries init initWithAcceleratorPort: initLimits initDefaultLogState initProgressTracking
+_MTLCommandQueue init-family: initWithDevice: initWithDevice:maxCommandBufferCount: initWithDevice:descriptor:
+_MTLCommandBuffer init-family: initWithQueue:retainedReferences: initWithQueue:retainedReferences:synchronousDebugMode: initProgressTracking
+_MTLCommandEncoder init-family: initWithCommandBuffer:
+_MTLComputePipelineState init-family: initWithDevice:pipelineStateDescriptor: initWithParent:
+_MTLResource init-family: init
+_MTLObjectWithLabel init-family: init
+MTLCreateSystemDefaultDevice symbol: 0x18fa88590, MTLCopyAllDevices: 0x18fba4da4, MTLAddDevice: 0x18fa909d0 (not called)

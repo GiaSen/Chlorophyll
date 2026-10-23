@@ -11,6 +11,7 @@ CC="xcrun --sdk iphoneos clang -arch arm64e -miphoneos-version-min=18.0 -isysroo
 BG="$WORK/mesa-air/build-ios/src/gallium/drivers/freedreno/libbgair.dylib"
 mkdir -p "$OUT"
 cp -f "$BG" "$OUT/libbgair.dylib"
+xcrun strip -x "$OUT/libbgair.dylib"      # 9.4 MB instead of 10 MB: large scp transfers over the USB link have dropped
 cp -f "$WORK/mesa-air/drm-ios/libdrm.2.arm64e.dylib" "$OUT/libdrm.2.dylib"
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -I"$HERE/air" -c "$HERE/src/bgmtl.m" -o "$OUT/bgmtl.o"
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_probe.m" -o "$OUT/bgmtl_probe.o"
@@ -20,4 +21,8 @@ $CC -o "$OUT/bgmtl_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_probe.o" "$OUT/libbgair.dyl
 xcrun -sdk iphoneos metal -mios-version-min=18.0 -c "$HERE/test/bg_kernels.metal" -o "$OUT/bg_kernels.air"
 xcrun -sdk iphoneos metallib "$OUT/bg_kernels.air" -o "$OUT/bg_kernels.metallib"
 $CC -O1 -g -fno-objc-arc -o "$OUT/mtl_introspect" "$HERE/test/mtl_introspect.m" -framework Foundation
+$CC -O1 -g -Wall -I"$HERE/air" "$HERE/test/bgair_test.c" -o "$OUT/bgair_test" "$OUT/libbgair.dylib" -Wl,-rpath,@executable_path
+$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/mtl_gap.m" -o "$OUT/mtl_gap.o"
+$CC -o "$OUT/mtl_gap" "$OUT/bgmtl.o" "$OUT/mtl_gap.o" "$OUT/libbgair.dylib" -framework Foundation -framework Metal -Wl,-rpath,@executable_path
+$CC -O1 -g -o "$OUT/bootinfo" "$HERE/test/bootinfo.c" -framework IOKit -framework CoreFoundation
 ls -l "$OUT"

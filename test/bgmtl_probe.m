@@ -234,6 +234,47 @@ main(int argc, char **argv)
          }
       }
 
+      // ---- T4: 64K elements, 20 submissions in a row (still small: one dispatch of 1024 groups each) ----
+      printf("== T4 bg_add x20, 65536 elements\n");
+      {
+         id pso = make_pipeline("bg_add");
+         if (pso) {
+            const unsigned n = 65536;
+            id a = [g_dev newBufferWithLength:n * 4 options:0], b = [g_dev newBufferWithLength:n * 4 options:0],
+               o = [g_dev newBufferWithLength:n * 4 options:0];
+            float *fa = [a contents], *fb = [b contents], *fo = [o contents];
+            for (unsigned i = 0; i < n; i++) { fa[i] = (float)(i % 1000); fb[i] = (float)(i % 7); }
+            unsigned total_bad = 0, done = 0;
+            double t0 = now_ms();
+            for (unsigned r = 0; r < 20; r++) {
+               for (unsigned i = 0; i < n; i++) fo[i] = -1.0f;
+               id cb = [g_queue commandBuffer];
+               id enc = [cb computeCommandEncoder];
+               [enc setComputePipelineState:pso];
+               [enc setBuffer:a offset:0 atIndex:0]; [enc setBuffer:b offset:0 atIndex:1]; [enc setBuffer:o offset:0 atIndex:2];
+               uint32_t nn = n;
+               [enc setBytes:&nn length:4 atIndex:3];
+               [enc dispatchThreadgroups:MTLSizeMake(n / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+               [enc endEncoding];
+               [cb commit];
+               if ([cb status] != 4) { printf("  round %u: status %ld\n", r, (long)[cb status]); break; }
+               done++;
+               for (unsigned i = 0; i < n; i++) if (fo[i] != fa[i] + 2.0f * fb[i]) total_bad++;
+            }
+            printf("  %u rounds completed, %u wrong elements in total, %.1f ms per round (incl. CPU fill and verify)\n", done, total_bad, (now_ms() - t0) / (done ? done : 1));
+            CHECK(done == 20 && total_bad == 0, "T4: %u rounds, %u wrong", done, total_bad);
+         }
+      }
+      // an unknown function must be refused with an error, not a crash
+      {
+         NSError *e = nil;
+         BGFuncShim *s = [[BGFuncShim alloc] init];
+         s.name = @"no_such"; s.bitcodeData = [NSData dataWithBytes:"garbage" length:7];
+         id p = ((id (*)(id, SEL, id, id, NSError **))objc_msgSend)(g_dev, sel_getUid("bgPipelineForFunction:descriptor:error:"), s, nil, &e);
+         printf("  garbage bitcode: pipeline=%s error=%s\n", p ? "created (BUG)" : "refused", e ? [[e localizedDescription] UTF8String] : "(none)");
+         CHECK(!p && e, "garbage bitcode must be refused with an NSError");
+      }
+
       // ---- the device is not registered anywhere ----
       printf("== registration check (this process only)\n");
       {

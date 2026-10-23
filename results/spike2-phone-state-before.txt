@@ -1,0 +1,9 @@
+uptime: 191 s
+kern.sweet_gpu: state=on level=1 mhz=257 max_level=7 freq=fixed busy_pct=0 clients=1 pids=62 submitted=1915 completed=1915 suspends=0 resumes=0 recoveries=0 hangs=0 idle_ms=0 hwcg=0 boost_level=3 boosted=0 submits_100ms=0 total_ms=186640 res_ms=slumber:0,L1:18
+service SweetAdreno630     1
+service IOAcceleratorES    1
+service AGXAccelerator     0
+service IOGPU              0
+service IOSurfaceRoot      0
+service SweetFramebuffer   0
+IOServiceOpen(SweetAdreno630, type 0) = 0 (ok)

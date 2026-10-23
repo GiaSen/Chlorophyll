@@ -1,0 +1,13 @@
+os_same_file_description couldn't determine if two DRM fds reference the same file description. (No such process)
+Let's just assume that file descriptors for the same file probablyshare the file description instead. This may cause problems whenthat isn't the case.
+device: FD630 (RWA_SOFTWARE=unset)
+  bg_add: 3712 bytes of AIR, max_threads=1024 exec_width=32 buffers=4
+  bg_add: done in 7.08 ms
+  bg_add: 1024 of 1024 correct
+  bg_copy: 3536 bytes of AIR, max_threads=1024 exec_width=32 buffers=3
+  bg_copy: done in 6.13 ms
+  bg_copy: 4096 of 4096 correct
+  bg_groupsum: 3712 bytes of AIR, max_threads=1024 exec_width=32 buffers=3
+  bg_groupsum: done in 10.35 ms
+  bg_groupsum: 32 of 32 correct
+== result: 3 checks passed, 0 failed

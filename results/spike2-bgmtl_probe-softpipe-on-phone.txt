@@ -1,0 +1,31 @@
+bgmtl[859]: rwa_device_open: softpipe
+bgmtl[859]: pipeline bg_add: max_threads=1024 exec_width=1 buffers=4 textures=0
+bgmtl[859]: pipeline bg_copy: max_threads=1024 exec_width=1 buffers=3 textures=0
+bgmtl[859]: pipeline bg_groupsum: max_threads=1024 exec_width=1 buffers=3 textures=0
+bgmtl[859]: pipeline bg_add: max_threads=1024 exec_width=1 buffers=4 textures=0
+bgmtl[859]: refusing: reader: not LLVM bitcode (no 'BC' 0xC0DE magic)
+== BGMTLDevice probe (iOS Version 18.7.8 (Build 22H352))
+device: softpipe (Bergamota)  class=BGMTLDevice  super=_MTLDevice  conformsToMTLDevice=1 MTLDeviceSPI=1
+queue: BGMTLCommandQueue
+library via Metal: _MTLLibrary
+== T1 bg_add (compute, 4 buffers, setBytes)
+  (bg_add: function from Metal's own _MTLLibrary, bitcodeData 3712 bytes)
+  bg_add: status=4 (4=completed) in 19.48 ms
+  bg_add: 1024 of 1024 elements correct
+== T2 blit (GPU copy kernel; CPU blit encoder copy/fill on shared buffers)
+  (bg_copy: function from Metal's own _MTLLibrary, bitcodeData 3536 bytes)
+  bg_copy: status=4 (4=completed) in 4.81 ms
+  GPU copy: 4096 of 4096 words correct
+  blit: status=4 (4=completed) in 0.00 ms
+  CPU blit (copy + fill): 0 wrong
+== T3 bg_groupsum (threadgroup ids)
+  (bg_groupsum: function from Metal's own _MTLLibrary, bitcodeData 3712 bytes)
+  bg_groupsum: status=4 (4=completed) in 5.07 ms
+  bg_groupsum: 32 of 32 groups correct
+== T4 bg_add x20, 65536 elements
+  (bg_add: function from Metal's own _MTLLibrary, bitcodeData 3712 bytes)
+  20 rounds completed, 0 wrong elements in total, 25.5 ms per round (incl. CPU fill and verify)
+  garbage bitcode: pipeline=refused error=reader: not LLVM bitcode (no 'BC' 0xC0DE magic)
+== registration check (this process only)
+  MTLCopyAllDevices: 0 device(s), BGMTLDevice among them: no
+== result: 12 checks passed, 0 failed, via Metal _MTLLibrary: yes

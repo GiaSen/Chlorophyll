@@ -1,0 +1,51 @@
+== completeness of the BGMTL classes against the protocols of iOS 18.7.8's Metal (software backend)
+    missing: registryID
+    missing: newTextureWithDescriptor:
+    missing: newFence
+    missing: newIndirectCommandBufferWithDescriptor:maxCommandCount:options:
+    missing: newBufferWithBytesNoCopy:length:options:deallocator:
+    missing: newDepthStencilStateWithDescriptor:
+    missing: newSamplerStateWithDescriptor:
+    missing: newTextureWithDescriptor:iosurface:plane:
+    missing: heapBufferSizeAndAlignWithLength:options:
+    missing: heapTextureSizeAndAlignWithDescriptor:
+    missing: isDepth24Stencil8PixelFormatSupported
+    missing: minimumTextureBufferAlignmentForPixelFormat:
+    missing: newHeapWithDescriptor:
+    missing: sparseTileSizeWithTextureType:pixelFormat:sampleCount:
+    missing: sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:
+BGMTLDevice                MTLDevice                    required=109  answered_by_us=16  inherited_from_Metal_base=78   UNANSWERED=15
+    missing: supportPriorityBand
+    missing: dedicatedMemorySize
+    missing: sharedMemorySize
+    missing: newIndirectArgumentBufferLayoutWithStructType:
+    missing: newIntersectionFunctionTableWithDescriptor:
+    missing: newBufferWithIOSurface:
+    missing: newTextureWithDescriptor:iosurface:plane:
+    missing: doubleFPConfig
+    missing: halfFPConfig
+    missing: newIndirectCommandBufferWithDescriptor:maxCount:options:
+    missing: newIndirectComputeCommandEncoderWithBuffer:
+    missing: newIndirectRenderCommandEncoderWithBuffer:
+    missing: newVisibleFunctionTableWithDescriptor:
+    missing: singleFPConfig
+    missing: supportsSampleCount:
+BGMTLDevice                MTLDeviceSPI                 required=376  answered_by_us=4   inherited_from_Metal_base=357  UNANSWERED=15
+BGMTLCommandQueue          MTLCommandQueue              protocol not found in this process
+    missing: encodeWaitForEvent:value:
+    missing: encodeSignalEvent:value:
+    missing: renderCommandEncoderWithDescriptor:
+    missing: parallelRenderCommandEncoderWithDescriptor:
+    missing: resourceStateCommandEncoder
+BGMTLCommandBuffer         MTLCommandBuffer             required=39   answered_by_us=14  inherited_from_Metal_base=20   UNANSWERED=5
+BGMTLComputeEncoder        MTLComputeCommandEncoder     protocol not found in this process
+BGMTLComputeEncoder        MTLCommandEncoder            required=7    answered_by_us=2   inherited_from_Metal_base=5    UNANSWERED=0
+BGMTLBlitEncoder           MTLBlitCommandEncoder        protocol not found in this process
+    missing: removeAllDebugMarkers
+    missing: addDebugMarker:range:
+    missing: gpuAddress
+    missing: newTextureWithDescriptor:offset:bytesPerRow:
+BGMTLBuffer                MTLBuffer                    required=7    answered_by_us=3   inherited_from_Metal_base=0    UNANSWERED=4
+    missing: setOwnerWithIdentity:
+BGMTLBuffer                MTLResource                  required=14   answered_by_us=11  inherited_from_Metal_base=2    UNANSWERED=1
+MTL* protocols registered in this process: 86 of 479
