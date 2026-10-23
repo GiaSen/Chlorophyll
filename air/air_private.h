@@ -132,6 +132,10 @@ struct air_ctx {
    struct hash_table *phi_cursors;
    /* phi -> nir register decl */
    struct hash_table *phi_regs;
+   /* function-constant folding (Bergamota): see sc_eval in air_to_nir.c */
+   struct hash_table *sc_memo;   /* air_value -> struct sc_val */
+   struct hash_table *sc_known;  /* program-scope global -> struct sc_val, after the static initializers ran */
+   bool sc_known_ok;
    /* Where this function's constants are built: the top of its entry block,
     * which dominates every use of them. air_get caches a constant the first
     * time it is asked for, so the def has to be somewhere every later block

@@ -1917,6 +1917,21 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (strncmp(name, "air.", 4))
       return air_call_in_module(c, in, name);
 
+   /* Bergamota: a null texture is a pointer that names nothing (AIR_PTR_NONE); a shader that selects it only
+    * ever tests it or has the branch removed by function-constant folding. Sampling it is refused where it happens. */
+   if (!strncmp(name, "air.get_null_texture", 20)) {
+      struct air_ptr np = { .class = AIR_PTR_NONE };
+      air_set(c, &in->base, air_val_ptr(c, np));
+      return true;
+   }
+   if (!strncmp(name, "air.is_null_texture", 19)) {
+      struct air_val *t = air_get(c, in->operands[1]);
+      if (!t || t->kind != AIR_VAL_PTR)
+         return air_error(c, "intrinsic: air.is_null_texture of something that is not a resolved texture");
+      air_set(c, &in->base, air_val_ssa(c, nir_imm_bool(&c->b, t->ptr.class == AIR_PTR_NONE)));
+      return true;
+   }
+
    struct air_name n;
    if (!split_name(name, &n))
       return air_error(c, "intrinsic: %s (a name this cannot take apart)", name);

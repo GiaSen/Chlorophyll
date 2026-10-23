@@ -337,7 +337,16 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
       if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
          unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
          struct air_val *v = air_val_agg(c, n);
-         /* fields stay NONE until insertvalue puts something there */
+         /* fields stay NONE until insertvalue puts something there; fields that are themselves
+          * aggregates are built too (Bergamota), because an insertvalue path such as `0, 4` walks
+          * through them: QuartzCore's `insertvalue [2 x Image] poison, i8 %x, 0, 4` */
+         for (unsigned i = 0; i < n; i++) {
+            const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
+            if (et && (et->kind == AIR_TYPE_STRUCT || et->kind == AIR_TYPE_ARRAY)) {
+               struct air_constant z = { .base = { .kind = AIR_VALUE_CONSTANT, .type = et }, .ckind = AIR_CONST_POISON };
+               v->elems[i] = air_constant_val(c, &z);
+            }
+         }
          return v;
       }
       if (t->kind == AIR_TYPE_POINTER) {
@@ -778,6 +787,20 @@ air_module_function_constants(void *mem_ctx, const void *bitcode, size_t size,
                 * the all-zero variant. Not an API; the Metal driver passes real values. */
                (*out)[num].index = idx;
                (*out)[num].bits = getenv("AIR_FC_FILL") ? strtoull(getenv("AIR_FC_FILL"), NULL, 0) : 0;
+               /* AIR_FC_SET="name=value,name=value": a hand-made specialization for the corpus run (names are
+                * the third operand of the !air.function_constants node), applied over the fill */
+               const char *set = getenv("AIR_FC_SET");
+               const char *nm = md_str(node, 2);
+               if (set && nm) {
+                  size_t nl = strlen(nm);
+                  for (const char *q = set; *q;) {
+                     const char *e = strchr(q, ',');
+                     size_t ql = e ? (size_t)(e - q) : strlen(q);
+                     if (ql > nl && !strncmp(q, nm, nl) && q[nl] == '=')
+                        (*out)[num].bits = strtoull(q + nl + 1, NULL, 0);
+                     q += ql + (e ? 1 : 0);
+                  }
+               }
                num++;
                break;
             }
@@ -2419,6 +2442,8 @@ air_value_kind_name(const struct air_value *v)
    return "a constant of an unknown kind";
 }
 
+static bool sc_eval(struct air_ctx *c, const struct air_value *v, uint64_t *out, unsigned depth);
+
 static bool
 translate_instruction(struct air_ctx *c, const struct air_inst *in)
 {
@@ -2468,6 +2493,11 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             }
             return air_error(c, "instruction: a select between two different places in "
                                 "an argument buffer");
+         }
+         uint64_t known_cond;
+         if (sc_eval(c, in->operands[0], &known_cond, 0)) {
+            air_set(c, &in->base, known_cond ? pa : pb);   /* decided by the function constants */
+            return true;
          }
          nir_def *pc = air_get_ssa(c, in->operands[0]);
          if (!pc)
@@ -2778,6 +2808,428 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
    return true;
 }
 
+/* -- function-constant folding (Bergamota) -----------------------------------
+ *
+ * Metal specialises a function by the values of its function constants at pipeline creation, and the compiler then
+ * deletes what they make dead. QuartzCore's ubershader (`fixed_frag_*`) is written for that: whole blocks hang on
+ * `fc_has_attachment_N` and the like, and some of them build a null texture that is never used on the path that
+ * survives. This frontend translates every block, so such a module fails on the dead one.
+ *
+ * This is a small constant evaluator over the AIR itself: integer constants, function-constant loads, loads of
+ * program-scope globals as left by the module's `air.static_init` functions (executed abstractly: straight-line code,
+ * and branches/switches whose condition is known), and the integer instructions on top of them. A conditional branch
+ * or switch whose condition evaluates is treated as the unconditional branch it is: only the taken successor is
+ * reachable, and a phi ignores the edge that is never taken. Anything the evaluator cannot decide stays dynamic.
+ */
+struct sc_val {
+   bool known;
+   uint64_t v;
+};
+
+static uint64_t
+sc_mask(uint64_t v, unsigned bits)
+{
+   return bits >= 64 ? v : (v & ((1ull << bits) - 1));
+}
+
+static int64_t
+sc_sext(uint64_t v, unsigned bits)
+{
+   if (bits >= 64)
+      return (int64_t)v;
+   uint64_t m = 1ull << (bits - 1);
+   return (int64_t)((v ^ m) - m);
+}
+
+static int function_constant_index(struct air_ctx *c, const struct air_global *g);
+
+/* The global at the root of a constant pointer expression (a constant getelementptr or cast of one), or NULL */
+static const struct air_global *
+sc_base_global(const struct air_value *v)
+{
+   for (unsigned depth = 0; v && depth < 8; depth++) {
+      if (v->kind == AIR_VALUE_GLOBAL)
+         return (const struct air_global *)v;
+      const struct air_constant *k = air_value_as_constant(v);
+      if (!k || k->ckind != AIR_CONST_EXPR || !k->num_operands ||
+          (k->expr_op != AIR_OP_GEP && k->expr_op != AIR_OP_CAST))
+         return NULL;
+      v = k->operands[0];
+   }
+   return NULL;
+}
+
+/* A byte address inside a global: the global and the offset, from a pointer built of constant getelementptrs and
+ * bitcasts (instructions or constant expressions), with every index evaluable. */
+struct sc_key {
+   const struct air_global *g;
+   uint64_t off;
+};
+
+static bool sc_eval(struct air_ctx *c, const struct air_value *v, uint64_t *out, unsigned depth);
+
+static bool
+sc_gep_offset(struct air_ctx *c, const struct air_type *t, struct air_value *const *ops, unsigned num_ops,
+              uint64_t *off, unsigned depth)
+{
+   /* ops[0] is the first index (over the source type), the rest walk into it */
+   uint64_t idx;
+   if (!t || !num_ops || !sc_eval(c, ops[0], &idx, depth + 1))
+      return false;
+   *off += idx * air_type_alloc_size(c->m, t);
+   for (unsigned i = 1; i < num_ops; i++) {
+      if (!sc_eval(c, ops[i], &idx, depth + 1))
+         return false;
+      if (t->kind == AIR_TYPE_STRUCT) {
+         if (idx >= t->num_members)
+            return false;
+         *off += air_struct_member_offset(c->m, t, idx);
+         t = t->members[idx];
+      } else if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_VECTOR) {
+         *off += idx * (t->kind == AIR_TYPE_ARRAY ? air_type_alloc_size(c->m, t->elem)
+                                                   : MAX2(air_type_bit_size(t->elem) / 8, 1));
+         t = t->elem;
+      } else {
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+sc_addr(struct air_ctx *c, const struct air_value *v, struct sc_key *out, unsigned depth)
+{
+   if (!v || depth > 16)
+      return false;
+   if (v->kind == AIR_VALUE_GLOBAL) {
+      out->g = (const struct air_global *)v;
+      out->off = 0;
+      return true;
+   }
+   const struct air_constant *k = air_value_as_constant(v);
+   if (k && k->ckind == AIR_CONST_EXPR && k->num_operands) {
+      if (k->expr_op == AIR_OP_CAST)
+         return sc_addr(c, k->operands[0], out, depth + 1);
+      if (k->expr_op == AIR_OP_GEP && k->num_operands >= 2) {
+         if (!sc_addr(c, k->operands[0], out, depth + 1))
+            return false;
+         return sc_gep_offset(c, k->src_type, k->operands + 1, k->num_operands - 1, &out->off, depth);
+      }
+      return false;
+   }
+   const struct air_inst *in = air_value_as_inst(v);
+   if (in && in->op == AIR_OP_SELECT) {
+      uint64_t cond;
+      if (!sc_eval(c, in->operands[0], &cond, depth + 1))
+         return false;
+      return sc_addr(c, in->operands[cond ? 1 : 2], out, depth + 1);
+   }
+   if (in && in->op == AIR_OP_CAST && (in->sub == AIR_CAST_BITCAST || in->sub == AIR_CAST_ADDRSPACECAST))
+      return sc_addr(c, in->operands[0], out, depth + 1);
+   if (in && in->op == AIR_OP_GEP && in->num_operands >= 2) {
+      if (!sc_addr(c, in->operands[0], out, depth + 1))
+         return false;
+      return sc_gep_offset(c, in->aux_type, in->operands + 1, in->num_operands - 1, &out->off, depth);
+   }
+   return false;
+}
+
+static uint32_t
+sc_key_hash(const void *k)
+{
+   const struct sc_key *a = k;
+   return (uint32_t)(((uintptr_t)a->g >> 4) * 2654435761u) ^ (uint32_t)(a->off * 40503u);
+}
+
+static bool
+sc_key_equal(const void *x, const void *y)
+{
+   const struct sc_key *a = x, *b = y;
+   return a->g == b->g && a->off == b->off;
+}
+
+static struct sc_val *
+sc_known_get(struct air_ctx *c, const struct sc_key *k)
+{
+   struct hash_entry *e = _mesa_hash_table_search(c->sc_known, k);
+   return e ? e->data : NULL;
+}
+
+static void
+sc_known_set(struct air_ctx *c, const struct sc_key *k, bool known, uint64_t v)
+{
+   struct hash_entry *e = _mesa_hash_table_search(c->sc_known, k);
+   if (e)
+      _mesa_hash_table_remove(c->sc_known, e);
+   if (!known)
+      return;
+   struct sc_key *key = ralloc(c->mem_ctx, struct sc_key);
+   *key = *k;
+   struct sc_val *sv = rzalloc(c->mem_ctx, struct sc_val);
+   sv->known = true;
+   sv->v = v;
+   _mesa_hash_table_insert(c->sc_known, key, sv);
+}
+
+static bool
+sc_eval_uncached(struct air_ctx *c, const struct air_inst *in, uint64_t *out, unsigned depth);
+
+static bool
+sc_eval(struct air_ctx *c, const struct air_value *v, uint64_t *out, unsigned depth)
+{
+   if (!v || depth > 64)
+      return false;
+   if (air_const_uint(v, out))
+      return true;
+   const struct air_inst *in = air_value_as_inst(v);
+   if (!in || !in->base.type || in->base.type->kind != AIR_TYPE_INT)
+      return false;
+   if (!c->sc_memo)
+      c->sc_memo = _mesa_pointer_hash_table_create(c->mem_ctx);
+   struct hash_entry *e = _mesa_hash_table_search(c->sc_memo, in);
+   if (e) {
+      struct sc_val *sv = e->data;
+      *out = sv->v;
+      return sv->known;
+   }
+   struct sc_val *sv = rzalloc(c->mem_ctx, struct sc_val);
+   sv->known = sc_eval_uncached(c, in, &sv->v, depth);
+   _mesa_hash_table_insert(c->sc_memo, in, sv);
+   *out = sv->v;
+   return sv->known;
+}
+
+static bool
+sc_eval_uncached(struct air_ctx *c, const struct air_inst *in, uint64_t *out, unsigned depth)
+{
+   unsigned bits = in->base.type->bits;
+   uint64_t a = 0, b = 0, k = 0;
+   switch (in->op) {
+   case AIR_OP_LOAD: {
+      struct sc_key key;
+      if (!sc_addr(c, in->operands[0], &key, 0))
+         return false;
+      const struct air_global *g = key.g;
+      if (g->externally_initialized) {
+         int idx = function_constant_index(c, g);
+         if (idx < 0 || key.off)
+            return false;
+         for (unsigned i = 0; c->options && i < c->options->num_constants; i++)
+            if (c->options->constants[i].index == (unsigned)idx) {
+               *out = sc_mask(c->options->constants[i].bits, bits);
+               return true;
+            }
+         return false;
+      }
+      if (!c->sc_known_ok || !c->sc_known)
+         return false;
+      struct sc_val *sv = sc_known_get(c, &key);
+      if (!sv)
+         return false;
+      *out = sc_mask(sv->v, bits);
+      return true;
+   }
+   case AIR_OP_CALL: {
+      /* air.is_function_constant_defined(fc): whether the pipeline gave this constant a value */
+      const struct air_value *callee = in->operands[0];
+      if (callee && callee->name && !strncmp(callee->name, "air.normalize_function_constant_predicate", 41) &&
+          in->num_operands == 2) {
+         /* a byte is a predicate if it is not zero (the reading air_intrinsics.c gives it) */
+         if (!sc_eval(c, in->operands[1], &a, depth + 1))
+            return false;
+         *out = sc_mask(a, in->operands[1]->type ? in->operands[1]->type->bits : 8) != 0;
+         return true;
+      }
+      if (callee && callee->name && !strncmp(callee->name, "air.is_null_texture", 19) && in->num_operands == 2) {
+         /* decided by what the caller bound, which is already translated when a specialised callee starts */
+         struct hash_entry *pe = _mesa_hash_table_search(c->values, in->operands[1]);
+         struct air_val *pv = pe ? pe->data : NULL;
+         if (!pv || pv->kind != AIR_VAL_PTR)
+            return false;
+         *out = pv->ptr.class == AIR_PTR_NONE;
+         return true;
+      }
+      if (!callee || !callee->name || strcmp(callee->name, "air.is_function_constant_defined") || in->num_operands != 2)
+         return false;
+      const struct air_global *pg = sc_base_global(in->operands[1]);
+      if (!pg)
+         return false;
+      int idx = function_constant_index(c, pg);
+      if (idx < 0)
+         return false;
+      *out = 0;
+      for (unsigned i = 0; c->options && i < c->options->num_constants; i++)
+         if (c->options->constants[i].index == (unsigned)idx)
+            *out = 1;
+      return true;
+   }
+   case AIR_OP_BINOP:
+      if (!sc_eval(c, in->operands[0], &a, depth + 1) || !sc_eval(c, in->operands[1], &b, depth + 1))
+         return false;
+      switch (in->sub) {
+      case AIR_BINOP_ADD: *out = a + b; break;
+      case AIR_BINOP_SUB: *out = a - b; break;
+      case AIR_BINOP_MUL: *out = a * b; break;
+      case AIR_BINOP_AND: *out = a & b; break;
+      case AIR_BINOP_OR: *out = a | b; break;
+      case AIR_BINOP_XOR: *out = a ^ b; break;
+      case AIR_BINOP_SHL: *out = b >= bits ? 0 : a << b; break;
+      case AIR_BINOP_LSHR: *out = b >= bits ? 0 : sc_mask(a, bits) >> b; break;
+      default: return false;
+      }
+      *out = sc_mask(*out, bits);
+      return true;
+   case AIR_OP_CAST: {
+      const struct air_value *src = in->operands[0];
+      if (!src || !src->type || src->type->kind != AIR_TYPE_INT || !sc_eval(c, src, &a, depth + 1))
+         return false;
+      unsigned sb = src->type->bits;
+      switch (in->sub) {
+      case AIR_CAST_TRUNC: case AIR_CAST_ZEXT: *out = sc_mask(sc_mask(a, sb), bits); return true;
+      case AIR_CAST_SEXT: *out = sc_mask((uint64_t)sc_sext(a, sb), bits); return true;
+      default: return false;
+      }
+   }
+   case AIR_OP_CMP: {
+      const struct air_value *x = in->operands[0];
+      if (!x || !x->type || x->type->kind != AIR_TYPE_INT)
+         return false;
+      if (!sc_eval(c, in->operands[0], &a, depth + 1) || !sc_eval(c, in->operands[1], &b, depth + 1))
+         return false;
+      unsigned ob = x->type->bits;
+      a = sc_mask(a, ob); b = sc_mask(b, ob);
+      int64_t sa = sc_sext(a, ob), sb = sc_sext(b, ob);
+      switch (in->sub) {
+      case AIR_ICMP_EQ: *out = a == b; break;
+      case AIR_ICMP_NE: *out = a != b; break;
+      case AIR_ICMP_UGT: *out = a > b; break;
+      case AIR_ICMP_UGE: *out = a >= b; break;
+      case AIR_ICMP_ULT: *out = a < b; break;
+      case AIR_ICMP_ULE: *out = a <= b; break;
+      case AIR_ICMP_SGT: *out = sa > sb; break;
+      case AIR_ICMP_SGE: *out = sa >= sb; break;
+      case AIR_ICMP_SLT: *out = sa < sb; break;
+      case AIR_ICMP_SLE: *out = sa <= sb; break;
+      default: return false;
+      }
+      return true;
+   }
+   case AIR_OP_SELECT:
+      if (!sc_eval(c, in->operands[0], &k, depth + 1))
+         return false;
+      return sc_eval(c, in->operands[k ? 1 : 2], out, depth + 1);
+   case AIR_OP_FREEZE:
+      return sc_eval(c, in->operands[0], out, depth + 1);
+   default:
+      return false;
+   }
+}
+
+/* Which successor of a conditional br or a switch is the only one that is ever taken: its block index, or -1 */
+static int
+sc_taken_target(struct air_ctx *c, const struct air_inst *term)
+{
+   uint64_t v;
+   if (term->op == AIR_OP_BR && term->num_targets == 2) {
+      if (!sc_eval(c, term->operands[0], &v, 0))
+         return -1;
+      return term->targets[(v & 1) ? 0 : 1]->index;
+   }
+   if (term->op == AIR_OP_SWITCH && term->num_operands >= 1) {
+      if (!sc_eval(c, term->operands[0], &v, 0))
+         return -1;
+      uint64_t cv;
+      unsigned bits = term->operands[0]->type ? term->operands[0]->type->bits : 64;
+      for (unsigned k = 1; k < term->num_targets; k++) {
+         if (!sc_eval(c, term->operands[k], &cv, 0))
+            return -1;
+         if (sc_mask(cv, bits) == sc_mask(v, bits))
+            return term->targets[k]->index;
+      }
+      return term->targets[0]->index;
+   }
+   return -1;
+}
+
+/* Run the module's air.static_init functions abstractly and keep the program-scope globals they leave behind.
+ * Gives up (nothing is folded through globals) on anything it cannot follow.
+ */
+static void
+sc_run_static_init(struct air_ctx *c)
+{
+   c->sc_known = _mesa_hash_table_create(c->mem_ctx, sc_key_hash, sc_key_equal);
+   c->sc_known_ok = true;
+   for (unsigned fi = 0; fi < c->m->num_functions && c->sc_known_ok; fi++) {
+      const struct air_function *f = c->m->functions[fi];
+      if (f->is_declaration || !f->section || strcmp(f->section, "air.static_init") || !f->num_blocks)
+         continue;
+      unsigned bi = 0, steps = 0;
+      while (c->sc_known_ok) {
+         if (++steps > 20000 || bi >= f->num_blocks) { c->sc_known_ok = false; break; }
+         const struct air_block *blk = &f->blocks[bi];
+         const struct air_inst *term = blk->insts[blk->num_insts - 1];
+         for (unsigned i = 0; i + 1 < blk->num_insts && c->sc_known_ok; i++) {
+            const struct air_inst *in = blk->insts[i];
+            if (in->op == AIR_OP_STORE) {
+               struct sc_key key;
+               if (!sc_addr(c, in->operands[1], &key, 0)) {
+                  if (getenv("AIR_SC_DEBUG"))
+                     fprintf(stderr, "sc: store through a pointer that is not a global address in block %u inst %u\n", bi, i);
+                  c->sc_known_ok = false;
+                  break;
+               }
+               const struct air_value *val = in->operands[0];
+               uint64_t v = 0;
+               bool known = false;
+               /* the memo of an instruction must be redone each time it executes */
+               if (val && val->type && val->type->kind == AIR_TYPE_INT) {
+                  const struct air_inst *vi = air_value_as_inst(val);
+                  if (vi && c->sc_memo) {
+                     struct hash_entry *e = _mesa_hash_table_search(c->sc_memo, vi);
+                     if (e) _mesa_hash_table_remove(c->sc_memo, e);
+                  }
+                  known = sc_eval(c, val, &v, 0);
+               }
+               sc_known_set(c, &key, known, v);
+            } else if (in->op == AIR_OP_CALL) {
+               if (c->sc_memo) {
+                  struct hash_entry *me = _mesa_hash_table_search(c->sc_memo, in);
+                  if (me) _mesa_hash_table_remove(c->sc_memo, me);
+               }
+               const struct air_value *callee = in->operands[0];
+               if (!callee || !callee->name ||
+                   (strncmp(callee->name, "llvm.", 5) && strcmp(callee->name, "air.is_function_constant_defined") &&
+                    strncmp(callee->name, "air.normalize_function_constant_predicate", 41))) {
+                  if (getenv("AIR_SC_DEBUG")) fprintf(stderr, "sc: call to %s in static init\n", callee && callee->name ? callee->name : "?");
+                  c->sc_known_ok = false;
+               }
+            } else if (in->base.type && in->base.type->kind == AIR_TYPE_INT && c->sc_memo) {
+               struct hash_entry *e = _mesa_hash_table_search(c->sc_memo, in);
+               if (e) _mesa_hash_table_remove(c->sc_memo, e);
+            }
+         }
+         if (!c->sc_known_ok)
+            break;
+         if (term->op == AIR_OP_RET || term->op == AIR_OP_UNREACHABLE)
+            break;
+         if (term->op == AIR_OP_BR && term->num_targets == 1) {
+            bi = term->targets[0]->index;
+            continue;
+         }
+         int t = sc_taken_target(c, term);
+         if (t < 0) { if (getenv("AIR_SC_DEBUG")) fprintf(stderr, "sc: branch with an unknown condition in static init block %u\n", bi); c->sc_known_ok = false; break; }
+         bi = (unsigned)t;
+      }
+   }
+   if (getenv("AIR_SC_DEBUG"))
+      fprintf(stderr, "sc: static init %s, %u globals known\n", c->sc_known_ok ? "folded" : "NOT followed", c->sc_known ? _mesa_hash_table_num_entries(c->sc_known) : 0);
+   if (!c->sc_known_ok) {
+      _mesa_hash_table_clear(c->sc_known, NULL);
+      if (c->sc_memo)
+         _mesa_hash_table_clear(c->sc_memo, NULL);
+   }
+}
+
 /* The blocks in reverse post-order, so that every value is translated before
  * it is used: LLVM lays blocks out in its own order, and a block whose only
  * predecessor comes after it in that order is ordinary (a loop's exit, say).
@@ -2786,7 +3238,7 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
  * pass below ignores edges from them.
  */
 static unsigned
-reverse_post_order(struct air_ctx *c, const struct air_function *f, unsigned *order)
+reverse_post_order(struct air_ctx *c, const struct air_function *f, unsigned *order, const int *fold)
 {
    unsigned n = f->num_blocks;
    uint8_t *state = rzalloc_array(c->mem_ctx, uint8_t, MAX2(n, 1)); /* 0 new, 1 open, 2 done */
@@ -2800,8 +3252,9 @@ reverse_post_order(struct air_ctx *c, const struct air_function *f, unsigned *or
       unsigned bi = stack[sp - 1];
       const struct air_block *blk = &f->blocks[bi];
       const struct air_inst *term = blk->insts[blk->num_insts - 1];
-      if (next_succ[bi] < term->num_targets) {
-         unsigned to = term->targets[next_succ[bi]++]->index;
+      unsigned nsucc = fold[bi] >= 0 ? 1 : term->num_targets;
+      if (next_succ[bi] < nsucc) {
+         unsigned to = fold[bi] >= 0 ? (next_succ[bi]++, (unsigned)fold[bi]) : term->targets[next_succ[bi]++]->index;
          if (state[to] == 0) {
             state[to] = 1;
             next_succ[to] = 0;
@@ -3358,11 +3811,14 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
  * entry cannot reach at all is passed over.
  */
 static bool
-resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
+resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable, const int *fold, unsigned phi_block)
 {
    struct air_val *first = NULL;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
+         continue;
+      /* an edge a folded branch never takes is not an operand */
+      if (fold[in->targets[k]->index] >= 0 && (unsigned)fold[in->targets[k]->index] != phi_block)
          continue;
       struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
       if (!e)
@@ -3431,8 +3887,20 @@ translate_body(struct air_ctx *c)
     */
    _mesa_hash_table_insert(c->blocks, &f->blocks[0], nir_start_block(c->b.impl));
 
+   int *fold = rzalloc_array(c->mem_ctx, int, MAX2(f->num_blocks, 1));
+   if (c->sc_memo)
+      _mesa_hash_table_clear(c->sc_memo, NULL);   /* a specialised callee sees other arguments than the last one did */
+   for (unsigned bi = 0; bi < f->num_blocks; bi++) {
+      const struct air_block *fb = &f->blocks[bi];
+      fold[bi] = fb->num_insts ? sc_taken_target(c, fb->insts[fb->num_insts - 1]) : -1;
+      if (getenv("AIR_SC_DEBUG") && fb->num_insts) {
+         const struct air_inst *tm = fb->insts[fb->num_insts - 1];
+         if ((tm->op == AIR_OP_BR && tm->num_targets == 2) || tm->op == AIR_OP_SWITCH)
+            fprintf(stderr, "sc: block %u %s %s\n", bi, tm->op == AIR_OP_SWITCH ? "switch" : "br", fold[bi] >= 0 ? "folded" : "DYNAMIC");
+      }
+   }
    unsigned *order = rzalloc_array(c->mem_ctx, unsigned, MAX2(f->num_blocks, 1));
-   unsigned num_order = reverse_post_order(c, f, order);
+   unsigned num_order = reverse_post_order(c, f, order, fold);
    bool *reachable = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_blocks, 1));
    for (unsigned oi = 0; oi < num_order; oi++)
       reachable[order[oi]] = true;
@@ -3449,7 +3917,7 @@ translate_body(struct air_ctx *c)
          if (in->op != AIR_OP_PHI)
             continue;
          if (in->base.type->kind == AIR_TYPE_POINTER) {
-            if (!resolve_pointer_phi(c, in, reachable))
+            if (!resolve_pointer_phi(c, in, reachable, fold, bi))
                return false;
             continue;
          }
@@ -3499,6 +3967,8 @@ translate_body(struct air_ctx *c)
       case AIR_OP_BR:
          if (term->num_targets == 1) {
             nir_goto(&c->b, nir_block_of(c, term->targets[0]));
+         } else if (fold[bi] >= 0) {
+            nir_goto(&c->b, nir_block_of(c, &f->blocks[fold[bi]]));
          } else {
             nir_def *cond = air_get_ssa(c, term->operands[0]);
             if (!cond)
@@ -3511,6 +3981,10 @@ translate_body(struct air_ctx *c)
          }
          break;
       case AIR_OP_SWITCH: {
+         if (fold[bi] >= 0) {
+            nir_goto(&c->b, nir_block_of(c, &f->blocks[fold[bi]]));
+            break;
+         }
          /* NIR has no switch, so the cases become a chain of nir_goto_if:
           * each test gets its own block, and the last one falls to the
           * default. nir_lower_goto_ifs structures the result like every other
@@ -3578,6 +4052,8 @@ translate_body(struct air_ctx *c)
             struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
             if (!ce)
                continue; /* an edge from a block the entry cannot reach */
+            if (fold[in->targets[k]->index] >= 0 && (unsigned)fold[in->targets[k]->index] != bi)
+               continue; /* an edge a folded branch never takes */
             c->b.cursor = *(nir_cursor *)ce->data;
             nir_def *val = air_get_ssa(c, in->operands[k]);
             if (!val)
@@ -3992,6 +4468,8 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       plan_globals(&c);
    if (!c.error[0])
       materialise_globals(&c);
+   if (!c.error[0])
+      sc_run_static_init(&c);
    if (!c.error[0])
       run_static_initializers(&c);
 
