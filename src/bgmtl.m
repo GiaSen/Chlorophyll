@@ -55,6 +55,9 @@
 @interface _MTLSamplerState : NSObject
 - (instancetype)initWithDevice:(id)device samplerDescriptor:(id)descriptor;
 @end
+@interface _MTLDepthStencilState : NSObject
+- (instancetype)initWithDevice:(id)device depthStencilDescriptor:(id)descriptor;
+@end
 
 #define BG_LOG(...) bg_log(__VA_ARGS__)
 static void
@@ -107,6 +110,12 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
    id index_buffer;
    NSUInteger index_type, index_offset;
    NSInteger base_vertex;
+   id depth, depth_state;          // depth/stencil attachment texture and state object
+   BOOL clear_depth_set, clear_stencil_set;
+   float clear_depth;
+   unsigned clear_stencil, stencil_ref[2];
+   BOOL have_range;
+   float depth_range[2];
 }
 @end
 @implementation BGWork
@@ -114,7 +123,7 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
 {
    [pipeline release];
    for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) [buffers[i] release];
-   [src release]; [dst release]; [render release]; [index_buffer release];
+   [src release]; [dst release]; [render release]; [index_buffer release]; [depth release]; [depth_state release];
    for (unsigned i = 0; i < BG_MAX_TEX; i++) { [textures[i] release]; [samplers[i] release]; }
    for (unsigned i = 0; i < BG_MAX_BINDINGS; i++) [vbuffers[i] release];
    for (unsigned i = 0; i < 8; i++) [color[i] release];
@@ -208,6 +217,15 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
 - (struct rwa_sampler *)rwaSampler;
 @end
 
+@interface BGMTLDepthStencil : _MTLDepthStencilState {
+   BGMTLDevice *_owner;
+   struct rwa_depth_stencil *_ds;
+   BOOL _readsDepth, _writesDepth, _readsStencil, _writesStencil;
+}
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLDepthStencilDescriptor *)d;
+- (struct rwa_depth_stencil *)rwaState;
+@end
+
 @interface BGMTLRenderPipeline : _MTLRenderPipelineState {
  @public
    BGMTLDevice *_owner;
@@ -229,6 +247,12 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
    BOOL _clear_pending;
    float _clear[4];
    NSMutableArray *_scratch;
+   id _depth, _depth_state;
+   BOOL _clear_depth_pending, _clear_stencil_pending;
+   float _clear_depth_v;
+   unsigned _clear_stencil_v, _stencil_ref[2];
+   BOOL _have_range;
+   float _range[2];
 }
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d;
 @end
@@ -324,6 +348,11 @@ ensure_protocol(Class cls, const char *proto)
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane
 {
    return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d iosurface:surface plane:plane];
+}
+
+- (id)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d
+{
+   return [[BGMTLDepthStencil alloc] initWithBGDevice:self descriptor:d];
 }
 
 - (id)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d
@@ -600,6 +629,12 @@ ensure_protocol(Class cls, const char *proto)
          memset(&dr, 0, sizeof(dr));
          dr.color = colors; dr.color_count = w->color_count;
          dr.clear_color = w->clear ? w->clear_color : NULL;
+         if (w->depth) dr.depth = [(BGMTLTexture *)w->depth rwaTexture];
+         if (w->clear_depth_set) dr.clear_depth = &w->clear_depth;
+         if (w->clear_stencil_set) dr.clear_stencil = &w->clear_stencil;
+         if (w->depth_state) dr.depth_stencil = [(BGMTLDepthStencil *)w->depth_state rwaState];
+         dr.stencil_reference[0] = w->stencil_ref[0]; dr.stencil_reference[1] = w->stencil_ref[1];
+         if (w->have_range) dr.depth_range = w->depth_range;
          dr.vertex = (struct rwa_bindings){ .buffers = vb, .buffer_count = w->vcount };
          dr.fragment = (struct rwa_bindings){ .buffers = fb, .buffer_count = w->count, .textures = texs, .texture_count = w->texture_count,
                                               .samplers = smps, .sampler_count = w->sampler_count };
@@ -856,6 +891,41 @@ ensure_protocol(Class cls, const char *proto)
 - (id)device { return _owner; }
 @end
 
+
+@implementation BGMTLDepthStencil
++ (void)load { ensure_protocol(self, "MTLDepthStencilState"); }
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLDepthStencilDescriptor *)d
+{
+   self = [super initWithDevice:device depthStencilDescriptor:d];
+   if (!self) return nil;
+   struct rwa_depth_stencil_state st;
+   memset(&st, 0, sizeof(st));
+   st.depth_compare_function = (unsigned)[d depthCompareFunction];
+   st.depth_write_enabled = [d isDepthWriteEnabled];
+   MTLStencilDescriptor *f = [d frontFaceStencil], *b = [d backFaceStencil];
+   st.front = (struct rwa_stencil_face){ (unsigned)[f stencilCompareFunction], (unsigned)[f stencilFailureOperation], (unsigned)[f depthFailureOperation],
+                                         (unsigned)[f depthStencilPassOperation], (unsigned)[f readMask], (unsigned)[f writeMask] };
+   st.back = (struct rwa_stencil_face){ (unsigned)[b stencilCompareFunction], (unsigned)[b stencilFailureOperation], (unsigned)[b depthFailureOperation],
+                                        (unsigned)[b depthStencilPassOperation], (unsigned)[b readMask], (unsigned)[b writeMask] };
+   char why[256] = { 0 };
+   _ds = rwa_depth_stencil_create([device rwa], &st, why, sizeof(why));
+   if (!_ds) { BG_LOG("depth/stencil state refused: %s\n", why); [self release]; return nil; }
+   _owner = device;
+   _readsDepth = st.depth_compare_function != MTLCompareFunctionAlways;
+   _writesDepth = st.depth_write_enabled;
+   _readsStencil = f.stencilCompareFunction != MTLCompareFunctionAlways || b.stencilCompareFunction != MTLCompareFunctionAlways;
+   _writesStencil = f.writeMask || b.writeMask;
+   return self;
+}
+- (void)dealloc { if (_ds) rwa_depth_stencil_destroy(_ds); [super dealloc]; }
+- (struct rwa_depth_stencil *)rwaState { return _ds; }
+- (id)device { return _owner; }
+- (BOOL)readsDepth { return _readsDepth; }
+- (BOOL)writesDepth { return _writesDepth; }
+- (BOOL)readsStencil { return _readsStencil; }
+- (BOOL)writesStencil { return _writesStencil; }
+@end
+
 @implementation BGMTLRenderPipeline
 + (void)load { ensure_protocol(self, "MTLRenderPipelineState"); }
 - (void)dealloc { if (_render) rwa_render_destroy(_render); [super dealloc]; }
@@ -880,9 +950,19 @@ ensure_protocol(Class cls, const char *proto)
          _clear_pending = YES;
       }
    }
+   MTLRenderPassDepthAttachmentDescriptor *da = [d depthAttachment];
+   if (da && [da texture]) {
+      _depth = [[da texture] retain];
+      if ([da loadAction] == MTLLoadActionClear) { _clear_depth_v = (float)[da clearDepth]; _clear_depth_pending = YES; }
+   }
+   MTLRenderPassStencilAttachmentDescriptor *sa = [d stencilAttachment];
+   if (sa && [sa texture]) {
+      if (!_depth) _depth = [[sa texture] retain];
+      if ([sa loadAction] == MTLLoadActionClear) { _clear_stencil_v = (unsigned)[sa clearStencil]; _clear_stencil_pending = YES; }
+   }
    return self;
 }
-- (void)dealloc { for (unsigned i = 0; i < 8; i++) [_color[i] release]; [_scratch release]; [super dealloc]; }
+- (void)dealloc { for (unsigned i = 0; i < 8; i++) [_color[i] release]; [_scratch release]; [_depth release]; [_depth_state release]; [super dealloc]; }
 - (id)device { return [_cb device]; }
 - (void)setRenderPipelineState:(id)s { _pipeline = s; }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
@@ -901,7 +981,12 @@ ensure_protocol(Class cls, const char *proto)
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
 - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
-- (void)setViewport:(MTLViewport)v { (void)v; }
+- (void)setViewport:(MTLViewport)v { _range[0] = (float)v.znear; _range[1] = (float)v.zfar; _have_range = YES; }
+- (void)setDepthStencilState:(id)state { [_depth_state release]; _depth_state = [state retain]; }
+- (void)setStencilReferenceValue:(uint32_t)v { _stencil_ref[0] = _stencil_ref[1] = v; }
+- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _stencil_ref[0] = f; _stencil_ref[1] = b; }
+- (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp { (void)bias; (void)slope; (void)clamp; }
+- (void)setDepthClipMode:(NSUInteger)m { (void)m; }
 - (void)setScissorRect:(MTLScissorRect)r { (void)r; }
 - (void)setCullMode:(NSUInteger)m { (void)m; }
 - (void)setFrontFacingWinding:(NSUInteger)w { (void)w; }
@@ -926,6 +1011,11 @@ ensure_protocol(Class cls, const char *proto)
    w->color_count = _ncolor;
    for (unsigned i = 0; i < _ncolor; i++) w->color[i] = [_color[i] retain];
    if (_clear_pending) { w->clear = YES; memcpy(w->clear_color, _clear, sizeof(_clear)); _clear_pending = NO; }
+   w->depth = [_depth retain]; w->depth_state = [_depth_state retain];
+   if (_clear_depth_pending) { w->clear_depth_set = YES; w->clear_depth = _clear_depth_v; _clear_depth_pending = NO; }
+   if (_clear_stencil_pending) { w->clear_stencil_set = YES; w->clear_stencil = _clear_stencil_v; _clear_stencil_pending = NO; }
+   w->stencil_ref[0] = _stencil_ref[0]; w->stencil_ref[1] = _stencil_ref[1];
+   if (_have_range) { w->have_range = YES; w->depth_range[0] = _range[0]; w->depth_range[1] = _range[1]; }
    w->primitive = prim; w->vstart = start; w->vcount_verts = count; w->instances = inst; w->base_instance = bi;
    w->index_buffer = [ib retain]; w->index_type = it; w->index_offset = io; w->base_vertex = bv;
    [_cb bgRecord:w];

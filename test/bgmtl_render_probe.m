@@ -413,6 +413,52 @@ main(int argc, char **argv)
             printf("  %u of 4096 values correct\n", 4096 - bad);
          } else { g_fail++; printf("  setup failed (pso=%d)\n", pso != nil); }
       }
+      // ---- P9: depth test (Depth32Float, compare Less): the nearer triangle drawn FIRST must win over the farther one drawn second ----
+      printf("== P9 depth/stencil state: near red triangle then far green triangle, depth Less\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_color"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+         NSError *err = nil;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         printf("  pipeline: %s\n", pso ? "created" : (err ? [[err localizedDescription] UTF8String] : "nil"));
+         MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+         dd.depthCompareFunction = MTLCompareFunctionLess;
+         dd.depthWriteEnabled = YES;
+         id dss = [g_dev newDepthStencilStateWithDescriptor:dd];
+         static const float near_[3 * 8] = { -1, -1, 0.25f, 1, 1, 0, 0, 1,   3, -1, 0.25f, 1, 1, 0, 0, 1,   -1, 3, 0.25f, 1, 1, 0, 0, 1 };
+         static const float far_[3 * 8] = { -1, -1, 0.75f, 1, 0, 1, 0, 1,   3, -1, 0.75f, 1, 0, 1, 0, 1,   -1, 3, 0.75f, 1, 0, 1, 0, 1 };
+         id vb1 = [g_dev newBufferWithBytes:near_ length:sizeof(near_) options:0], vb2 = [g_dev newBufferWithBytes:far_ length:sizeof(far_) options:0];
+         id rt6 = tex2d(MTLPixelFormatBGRA8Unorm, 32, 32, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+         id dt = tex2d(MTLPixelFormatDepth32Float, 32, 32, MTLTextureUsageRenderTarget);
+         if (pso && dss && vb1 && vb2 && rt6 && dt) {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt6;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            rp.depthAttachment.texture = dt;
+            rp.depthAttachment.loadAction = MTLLoadActionClear;
+            rp.depthAttachment.clearDepth = 1.0;
+            id cb = [g_queue commandBuffer];
+            id e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:pso];
+            [e setDepthStencilState:dss];
+            [e setVertexBuffer:vb1 offset:0 atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e setVertexBuffer:vb2 offset:0 atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e endEncoding];
+            CHECK(run(cb, "depth test"), "render pass did not complete");
+            uint8_t px[32 * 32 * 4];
+            [rt6 getBytes:px bytesPerRow:32 * 4 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+            unsigned red = 0, green = 0;
+            for (int i = 0; i < 32 * 32; i++) { uint8_t *p = px + i * 4; if (p[2] > 200 && p[1] < 50) red++; else if (p[1] > 200 && p[2] < 50) green++; }
+            CHECK(red == 1024 && green == 0, "depth test: %u red, %u green pixels (want 1024 red)", red, green);
+            printf("  %u red (near), %u green (far) of 1024\n", red, green);
+         } else { g_fail++; printf("  setup failed (pso=%d dss=%d dt=%d)\n", pso != nil, dss != nil, dt != nil); }
+      }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }
