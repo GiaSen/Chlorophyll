@@ -1,9 +1,12 @@
-bgmtl[1167]: rwa_device_open: FD630
-bgmtl[1167]: pipeline bg_tex_read: max_threads=1024 exec_width=32 buffers=1 textures=1
-bgmtl[1167]: pipeline bg_tex_sample: max_threads=1024 exec_width=32 buffers=1 textures=1
-bgmtl[1167]: pipeline bg_tex_write: max_threads=1024 exec_width=32 buffers=0 textures=1
-bgmtl[1167]: render pipeline bg_vs + bg_fs_color: vertex_buffers=1 fragment_buffers=0 fragment_textures=0 samplers=0 streams=0
-bgmtl[1167]: render pipeline bg_vs + bg_fs_tex: vertex_buffers=1 fragment_buffers=0 fragment_textures=1 samplers=1 streams=0
+bgmtl[6352]: rwa_device_open: FD630
+bgmtl[6352]: pipeline bg_tex_read: max_threads=1024 exec_width=32 buffers=1 textures=1
+bgmtl[6352]: pipeline bg_tex_sample: max_threads=1024 exec_width=32 buffers=1 textures=1
+bgmtl[6352]: pipeline bg_tex_write: max_threads=1024 exec_width=32 buffers=0 textures=1
+bgmtl[6352]: render pipeline bg_vs + bg_fs_color: vertex_buffers=1 fragment_buffers=0 fragment_textures=0 samplers=0 streams=0
+bgmtl[6352]: render pipeline bg_vs + bg_fs_tex: vertex_buffers=1 fragment_buffers=0 fragment_textures=1 samplers=1 streams=0
+bgmtl[6352]: render pipeline bg_vs + bg_fs_tex_inline: vertex_buffers=1 fragment_buffers=0 fragment_textures=1 samplers=0 streams=0
+bgmtl[6352]: render pipeline bg_vs + bg_fs_tex_linear: vertex_buffers=1 fragment_buffers=2 fragment_textures=1 samplers=1 streams=0
+bgmtl[6352]: render pipeline bg_vs + bg_fs_tex3: vertex_buffers=1 fragment_buffers=0 fragment_textures=4 samplers=1 streams=0
 == BGMTLDevice textures/render probe (iOS Version 18.7.8 (Build 22H352))
 == P1 bg_tex_read
   bg_tex_read: status=4
@@ -22,5 +25,16 @@ bgmtl[1167]: render pipeline bg_vs + bg_fs_tex: vertex_buffers=1 fragment_buffer
   pipeline: created
   textured quad: status=4
   4096 of 4096 pixels correct
-== result: 10 checks passed, 0 failed
-kern.sweet_gpu: state=on level=3 mhz=414 max_level=7 freq=gov busy_pct=0 clients=1 pids=799 submitted=19010 completed=19010 suspends=0 resumes=0 recoveries=0 hangs=0 idle_ms=0 hwcg=0 boost_level=3 boosted=1 submits_100ms=18 dcvs_s
+== P6 textured quad with an inline sampler
+  pipeline: created
+  inline-sampler quad: status=4
+  4096 of 4096 pixels correct
+== P7 linear sample + constant buffer offset, RGBA32Float target
+  pipeline: created
+  linear quad: status=4
+  4096 of 4096 values within 0.01 of the CPU bilinear (worst error 0.00137256)
+== P8 texture at slot 3, nearest, RGBA32Float target
+  slot-3 quad: status=4
+  4096 of 4096 values correct
+== result: 16 checks passed, 0 failed
+kern.sweet_gpu: state=on level=3 mhz=414 max_level=7 freq=gov busy_pct=60 clients=1 pids=6226 submitted=91558 completed=91558 suspends=0 resumes=0 recoveries=0 hangs=0 idle_ms=0 hwcg=0 boost_level=3 b

@@ -325,10 +325,12 @@ ensure_protocol(Class cls, const char *proto)
    if (!bitcode) bitcode = sel_getUid("bitcodeData");
    if (!_rwa) return [self bgFail:error with:[NSString stringWithFormat:@"no GPU: %s", _why]];
    id vertex = [descriptor vertexFunction], fragment = [descriptor fragmentFunction];
-   if (!fragment || !vertex) return [self bgFail:error with:@"a render pipeline needs a vertex and a fragment function"];
-   NSData *vair = ((NSData * (*)(id, SEL))objc_msgSend)(vertex, bitcode);
+   if (!fragment) return [self bgFail:error with:@"a render pipeline needs a fragment function"];
+   /* no vertex function: libbgair supplies a pass-through stage over the whole attachment (a quad, 4 vertices as a strip) --
+    * the road the fragment shaders of a library are exercised by, as air_run did */
+   NSData *vair = vertex ? ((NSData * (*)(id, SEL))objc_msgSend)(vertex, bitcode) : nil;
    NSData *fair = ((NSData * (*)(id, SEL))objc_msgSend)(fragment, bitcode);
-   if (!vair.length || !fair.length) return [self bgFail:error with:@"a function has no bitcode"];
+   if (!fair.length || (vertex && !vair.length)) return [self bgFail:error with:@"a function has no bitcode"];
    struct rwa_render_shape shape;
    memset(&shape, 0, sizeof(shape));
    shape.sample_count = (unsigned)[descriptor sampleCount];
@@ -369,14 +371,14 @@ ensure_protocol(Class cls, const char *proto)
    char why[512] = { 0 };
    struct rwa_render_info info;
    memset(&info, 0, sizeof(info));
-   struct rwa_render *r = rwa_render_create(_rwa, vair.bytes, vair.length, [[vertex name] UTF8String], fair.bytes, fair.length,
+   struct rwa_render *r = rwa_render_create(_rwa, vair ? vair.bytes : NULL, vair ? vair.length : 0, vertex ? [[vertex name] UTF8String] : NULL, fair.bytes, fair.length,
                                             [[fragment name] UTF8String], &shape, &info, why, sizeof(why));
    if (!r) return [self bgFail:error with:[NSString stringWithUTF8String:why]];
    BGMTLRenderPipeline *p = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
    if (!p) { rwa_render_destroy(r); return [self bgFail:error with:@"_MTLRenderPipelineState refused to initialise"]; }
    p->_owner = self; p->_render = r; p->_info = info;
    BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
-          [[vertex name] UTF8String], [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
+          vertex ? [[vertex name] UTF8String] : "(generated)", [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
           info.fragment_textures, info.fragment_samplers, info.vertex_streams);
    return p;
 }
@@ -890,4 +892,18 @@ id
 bgmtl_create_device(void)
 {
    return [[BGMTLDevice alloc] initWithAcceleratorPort:0];
+}
+
+// for tests: what the library made of a render pipeline
+void
+bgmtl_render_info(id pipeline, unsigned *vertex_buffers, unsigned *fragment_buffers, unsigned *fragment_textures, unsigned *fragment_samplers)
+{
+   BGMTLRenderPipeline *p = (BGMTLRenderPipeline *)pipeline;
+   *vertex_buffers = p->_info.vertex_buffers; *fragment_buffers = p->_info.fragment_buffers;
+   *fragment_textures = p->_info.fragment_textures; *fragment_samplers = p->_info.fragment_samplers;
+}
+struct rwa_device *
+bgmtl_rwa(id device)
+{
+   return [(BGMTLDevice *)device rwa];
 }

@@ -21,3 +21,23 @@ fragment float4 bg_fs_tex(V in [[stage_in]], texture2d<float> t [[texture(0)]], 
 {
    return t.sample(s, in.uv);
 }
+
+// the same, with the sampler written into the shader (a constexpr sampler: AIR's inline sampler state), as CoreAnimation does
+fragment float4 bg_fs_tex_inline(V in [[stage_in]], texture2d<float> t [[texture(0)]])
+{
+   constexpr sampler s(filter::nearest, address::clamp_to_edge);
+   return t.sample(s, in.uv);
+}
+
+// linear filtering, an explicit lod and a constant-buffer offset: the shape of most of CoreAnimation's taps
+struct U { float2 off; };
+fragment float4 bg_fs_tex_linear(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant U &u [[buffer(1)]])
+{
+   return t.sample(s, in.uv + u.off, level(0));
+}
+
+// the same texture at a high slot, as CoreAnimation's shaders have it ([[texture(3)]])
+fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]], sampler s [[sampler(0)]])
+{
+   return t.sample(s, in.uv, level(0));
+}

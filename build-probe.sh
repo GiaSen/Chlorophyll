@@ -23,6 +23,8 @@ xcrun -sdk iphoneos metallib "$OUT/bg_kernels.air" -o "$OUT/bg_kernels.metallib"
 xcrun -sdk iphoneos metal -mios-version-min=18.0 -c "$HERE/test/bg_render.metal" -o "$OUT/bg_render.air"
 xcrun -sdk iphoneos metallib "$OUT/bg_render.air" -o "$OUT/bg_render.metallib"
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_render_probe.m" -o "$OUT/bgmtl_render_probe.o"
+$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -I"$HERE/air" -c "$HERE/test/bgmtl_ca_probe.m" -o "$OUT/bgmtl_ca_probe.o"
+$CC -o "$OUT/bgmtl_ca_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_ca_probe.o" "$OUT/libbgair.dylib" -framework Foundation -framework Metal -Wl,-rpath,@executable_path
 $CC -o "$OUT/bgmtl_render_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_render_probe.o" "$OUT/libbgair.dylib" -framework Foundation -framework Metal -Wl,-rpath,@executable_path
 $CC -O1 -g -fno-objc-arc -o "$OUT/mtl_introspect" "$HERE/test/mtl_introspect.m" -framework Foundation
 $CC -O1 -g -Wall -I"$HERE/air" "$HERE/test/bgair_test.c" -o "$OUT/bgair_test" "$OUT/libbgair.dylib" -Wl,-rpath,@executable_path

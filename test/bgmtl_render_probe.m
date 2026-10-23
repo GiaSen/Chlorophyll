@@ -258,6 +258,161 @@ main(int argc, char **argv)
             printf("  %u of 4096 pixels correct\n", 4096 - bad);
          } else { g_fail++; printf("  setup failed (pso=%d vb=%d t=%d smp=%d rt=%d)\n", pso != nil, vb != nil, t != nil, smp != nil, rt2 != nil); }
       }
+      // ---- P6: the same quad with a constexpr (inline) sampler ----
+      printf("== P6 textured quad with an inline sampler\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_tex_inline"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         NSError *err = nil;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         printf("  pipeline: %s\n", pso ? "created" : (err ? [[err localizedDescription] UTF8String] : "nil"));
+         static const float quad[6 * 8] = {
+            -1, -1, 0, 1, 1,1,1,1,   1, -1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1,
+             1, -1, 0, 1, 1,1,1,1,   1,  1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1 };
+         id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+         id t = tex2d(MTLPixelFormatRGBA8Unorm, 4, 4, MTLTextureUsageShaderRead);
+         id rt3 = tex2d(MTLPixelFormatBGRA8Unorm, 64, 64, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+         if (pso && vb && t && rt3) {
+            uint8_t tx[4 * 4 * 4];
+            for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) { uint8_t *p = tx + (y * 4 + x) * 4; p[0] = x * 80; p[1] = y * 80; p[2] = ((x + y) & 1) ? 255 : 0; p[3] = 255; }
+            [t replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:tx bytesPerRow:16];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt3;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+            id cb = [g_queue commandBuffer];
+            id e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:pso];
+            [e setVertexBuffer:vb offset:0 atIndex:0];
+            [e setFragmentTexture:t atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            [e endEncoding];
+            CHECK(run(cb, "inline-sampler quad"), "render pass did not complete");
+            uint8_t px[64 * 64 * 4];
+            [rt3 getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0];
+            unsigned bad = 0;
+            for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
+               int tcol = x / 16, trow = 3 - y / 16;
+               uint8_t *want = tx + (trow * 4 + tcol) * 4, *p = px + (y * 64 + x) * 4;
+               if (p[2] != want[0] || p[1] != want[1] || p[0] != want[2] || p[3] != 255) { if (bad++ < 3) printf("    (%d,%d) got %u,%u,%u want %u,%u,%u\n", x, y, p[2], p[1], p[0], want[0], want[1], want[2]); }
+            }
+            CHECK(bad == 0, "inline-sampler quad: %u of 4096 pixels wrong", bad);
+            printf("  %u of 4096 pixels correct\n", 4096 - bad);
+         } else { g_fail++; printf("  setup failed\n"); }
+      }
+      // ---- P7: linear filter, level(0), clamp, constant-buffer offset, into RGBA32Float (compared with a CPU bilinear) ----
+      printf("== P7 linear sample + constant buffer offset, RGBA32Float target\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_tex_linear"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+         NSError *err = nil;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         printf("  pipeline: %s\n", pso ? "created" : (err ? [[err localizedDescription] UTF8String] : "nil"));
+         static const float quad[6 * 8] = {
+            -1, -1, 0, 1, 1,1,1,1,   1, -1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1,
+             1, -1, 0, 1, 1,1,1,1,   1,  1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1 };
+         id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+         float off[4] = { 0.3f, -0.2f, 0, 0 };
+         id ub = [g_dev newBufferWithBytes:off length:16 options:0];
+         id t = tex2d(MTLPixelFormatRGBA8Unorm, 4, 4, MTLTextureUsageShaderRead);
+         MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+         sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+         id smp = [g_dev newSamplerStateWithDescriptor:sd];
+         id rt4 = tex2d(MTLPixelFormatRGBA32Float, 32, 32, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+         if (pso && vb && ub && t && smp && rt4) {
+            uint8_t tx[4 * 4 * 4];
+            for (int i = 0; i < 64; i++) tx[i] = (uint8_t)(i * 37 + 11);
+            [t replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:tx bytesPerRow:16];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt4;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(9, 9, 9, 9);
+            id cb = [g_queue commandBuffer];
+            id e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:pso];
+            [e setVertexBuffer:vb offset:0 atIndex:0];
+            [e setFragmentBuffer:ub offset:0 atIndex:1];
+            [e setFragmentTexture:t atIndex:0];
+            [e setFragmentSamplerState:smp atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            [e endEncoding];
+            CHECK(run(cb, "linear quad"), "render pass did not complete");
+            float px[32 * 32 * 4];
+            [rt4 getBytes:px bytesPerRow:32 * 16 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+            unsigned bad = 0;
+            double worst = 0;
+            for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) {
+               double uvx = (x + 0.5) / 32.0 + off[0], uvy = 1.0 - (y + 0.5) / 32.0 + off[1];
+               double ux = uvx * 4 - 0.5, uy = uvy * 4 - 0.5;
+               int ix = (int)floor(ux), iy = (int)floor(uy);
+               double fx = ux - ix, fy = uy - iy;
+               for (int c = 0; c < 4; c++) {
+                  double v = 0;
+                  for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) {
+                     int cx = ix + dx < 0 ? 0 : ix + dx > 3 ? 3 : ix + dx, cy = iy + dy < 0 ? 0 : iy + dy > 3 ? 3 : iy + dy;
+                     v += (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy) * (tx[(cy * 4 + cx) * 4 + c] / 255.0);
+                  }
+                  double d = fabs(px[(y * 32 + x) * 4 + c] - v);
+                  if (d > worst) worst = d;
+                  if (d > 0.01) { if (bad++ < 3) printf("    (%d,%d,c%d) got %g want %g\n", x, y, c, px[(y * 32 + x) * 4 + c], v); }
+               }
+            }
+            CHECK(bad == 0, "linear sample: %u of 4096 values off by more than 0.01 (worst %g)", bad, worst);
+            printf("  %u of 4096 values within 0.01 of the CPU bilinear (worst error %g)\n", 4096 - bad, worst);
+         } else { g_fail++; printf("  setup failed\n"); }
+      }
+      // ---- P8: texture at slot 3 ----
+      printf("== P8 texture at slot 3, nearest, RGBA32Float target\n");
+      {
+         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+         pd.vertexFunction = [rlib newFunctionWithName:@"bg_vs"];
+         pd.fragmentFunction = [rlib newFunctionWithName:@"bg_fs_tex3"];
+         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+         NSError *err = nil;
+         id pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+         static const float quad[6 * 8] = {
+            -1, -1, 0, 1, 1,1,1,1,   1, -1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1,
+             1, -1, 0, 1, 1,1,1,1,   1,  1, 0, 1, 1,1,1,1,   -1, 1, 0, 1, 1,1,1,1 };
+         id vb = [g_dev newBufferWithBytes:quad length:sizeof(quad) options:0];
+         id t = tex2d(MTLPixelFormatRGBA8Unorm, 4, 4, MTLTextureUsageShaderRead);
+         MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+         sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+         id smp = [g_dev newSamplerStateWithDescriptor:sd];
+         id rt5 = tex2d(MTLPixelFormatRGBA32Float, 32, 32, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+         if (pso && vb && t && smp && rt5) {
+            uint8_t tx[64];
+            for (int i = 0; i < 64; i++) tx[i] = (uint8_t)(i * 37 + 11);
+            [t replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:tx bytesPerRow:16];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt5;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(9, 9, 9, 9);
+            id cb = [g_queue commandBuffer];
+            id e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:pso];
+            [e setVertexBuffer:vb offset:0 atIndex:0];
+            [e setFragmentTexture:t atIndex:3];
+            [e setFragmentSamplerState:smp atIndex:0];
+            if (getenv("P8_SAMPLERS")) for (int i = 1; i < 4; i++) [e setFragmentSamplerState:smp atIndex:i];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            [e endEncoding];
+            CHECK(run(cb, "slot-3 quad"), "render pass did not complete");
+            float px[32 * 32 * 4];
+            [rt5 getBytes:px bytesPerRow:32 * 16 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+            unsigned bad = 0;
+            for (int y = 0; y < 32; y++) for (int x = 0; x < 32; x++) {
+               int tcol = x / 8, trow = 3 - y / 8;
+               for (int c = 0; c < 4; c++) if (fabsf(px[(y * 32 + x) * 4 + c] - tx[(trow * 4 + tcol) * 4 + c] / 255.0f) > 1e-3f) bad++;
+            }
+            CHECK(bad == 0, "slot 3: %u of 4096 values wrong", bad);
+            printf("  %u of 4096 values correct\n", 4096 - bad);
+         } else { g_fail++; printf("  setup failed (pso=%d)\n", pso != nil); }
+      }
       printf("== result: %d checks passed, %d failed\n", g_pass, g_fail);
       return g_fail ? 1 : 0;
    }
