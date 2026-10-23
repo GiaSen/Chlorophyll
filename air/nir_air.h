@@ -168,6 +168,7 @@ struct air_resource {
 struct air_varying {
    const char *name;  /* the AIR name that links vertex to fragment */
    unsigned slot;     /* gl_varying_slot assigned by the translator */
+   unsigned component; /* first component inside the slot (Bergamota: scalars past the 12th varying share vec4 slots) */
    unsigned components;
    bool flat, centroid, sample, no_perspective;
 };

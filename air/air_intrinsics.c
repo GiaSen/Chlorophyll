@@ -1951,6 +1951,22 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (!strcmp(n.part[0], "discard_fragment"))
       return discard_op(c, in);
 
+   /* Bergamota: air.sincos / air.fast_sincos(x, ptr): returns sin(x) and stores cos(x) through the pointer (Mercury's fluidity shaders) */
+   if (!strcmp(n.part[0], "sincos") || !strcmp(n.part[0], "fast_sincos")) {
+      if (in->num_operands != 3)
+         return air_error(c, "intrinsic: %s with %u arguments", name, in->num_operands - 1);
+      nir_def *x = air_get_ssa(c, in->operands[1]);
+      struct air_val *pv = air_get(c, in->operands[2]);
+      if (!x || !pv)
+         return false;
+      if (pv->kind != AIR_VAL_PTR)
+         return air_error(c, "intrinsic: %s whose second argument is not a pointer this can store through", name);
+      if (!air_store_ptr(c, pv->ptr, nir_fcos(&c->b, x), 0))
+         return false;
+      air_set(c, &in->base, air_val_ssa(c, nir_fsin(&c->b, x)));
+      return true;
+   }
+
    bool handled = false;
    /* before math_op, which resolves every argument as a number: these take a
     * lane number or nothing at all, and air.simd_sum falls through to it

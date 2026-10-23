@@ -136,6 +136,7 @@ struct air_ctx {
    struct hash_table *sc_memo;   /* air_value -> struct sc_val */
    struct hash_table *sc_known;  /* program-scope global -> struct sc_val, after the static initializers ran */
    bool sc_known_ok;
+   unsigned pk_used[2];   /* varying packing: components used in the last slot, [0] fragment inputs, [1] vertex outputs */
    /* Where this function's constants are built: the top of its entry block,
     * which dominates every use of them. air_get caches a constant the first
     * time it is asked for, so the def has to be somewhere every later block

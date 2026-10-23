@@ -208,6 +208,66 @@ ret_member_is_number(const struct air_type *m)
    return sc->kind == AIR_TYPE_INT || air_type_is_float(sc);
 }
 
+/* Bergamota: an aggregate return (a struct, an array, nested: Mercury's `metal::matrix` is a struct of [3 x <3 x float>]) travels as one out-parameter
+ * per NUMBER leaf, the leaves taken in tree order; leaves that are not numbers have no parameter. */
+static bool
+ret_is_agg(const struct air_type *rt)
+{
+   return rt && (rt->kind == AIR_TYPE_STRUCT || rt->kind == AIR_TYPE_ARRAY);
+}
+
+static void
+ret_leaf_types(const struct air_type *t, const struct air_type **out, unsigned *n)
+{
+   if (t->kind == AIR_TYPE_STRUCT) {
+      for (unsigned i = 0; i < t->num_members; i++)
+         ret_leaf_types(t->members[i], out, n);
+   } else if (t->kind == AIR_TYPE_ARRAY) {
+      for (uint64_t i = 0; i < t->count; i++)
+         ret_leaf_types(t->elem, out, n);
+   } else {
+      if (out)
+         out[*n] = t;
+      (*n)++;
+   }
+}
+
+static bool
+ret_store_leaves(struct air_ctx *c, const struct air_type *t, const struct air_val *v, unsigned *idx)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+      for (unsigned i = 0; i < n; i++) {
+         const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
+         const struct air_val *sub = v && v->kind == AIR_VAL_AGG && i < v->num_elems ? v->elems[i] : NULL;
+         if (!ret_store_leaves(c, et, sub, idx))
+            return false;
+      }
+      return true;
+   }
+   unsigned L = (*idx)++;
+   if (L >= c->num_ret_fields || !c->ret_fields[L] || !v)
+      return true;
+   if (v->kind != AIR_VAL_SSA)
+      return air_error(c, "instruction: leaf %u of a returned aggregate is not a number, from a function called in the module", L);
+   nir_store_deref(&c->b, c->ret_fields[L], v->def, nir_component_mask(v->def->num_components));
+   return true;
+}
+
+static struct air_val *
+ret_build_leaves(struct air_ctx *c, const struct air_type *t, nir_variable **fields, unsigned *idx)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+      struct air_val *agg = air_val_agg(c, n);
+      for (unsigned i = 0; i < n; i++)
+         agg->elems[i] = ret_build_leaves(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem, fields, idx);
+      return agg;
+   }
+   nir_variable *f = fields[(*idx)++];
+   return f ? air_val_ssa(c, nir_load_var(&c->b, f)) : NULL;
+}
+
 static struct air_val *air_constant_val(struct air_ctx *c, const struct air_constant *k);
 
 struct air_val *
@@ -978,18 +1038,45 @@ make_io_var(struct air_ctx *c, nir_variable_mode mode, const struct air_type *t,
    return var;
 }
 
+/* Bergamota: the slot and first component of the next varying. The first 12 take a slot each, as always; from the 13th on a 32-bit varying that
+ * fits shares the last slot (ir3 has 32 output slots and Mercury's torus vertex stage returns 55 members). Both sides walk the members in the
+ * same order, so a vertex output and the fragment input of the same member land in the same place. */
+static void
+alloc_varying(struct air_ctx *c, unsigned dir, unsigned *next_varying, unsigned comps, unsigned bits, unsigned *slot, unsigned *frac)
+{
+   unsigned *used = &c->pk_used[dir];
+   if (*next_varying >= 12 && bits == 32 && comps < 4 && *used && *used + comps <= 4 && *next_varying > 0) {
+      *slot = VARYING_SLOT_VAR0 + *next_varying - 1;
+      *frac = *used;
+      *used += comps;
+      return;
+   }
+   *slot = VARYING_SLOT_VAR0 + (*next_varying)++;
+   *frac = 0;
+   *used = (*next_varying > 12 && bits == 32) ? comps : 4;   /* the first 12 are never shared into */
+}
+
 /* fragment inputs and vertex outputs take the slots in the order they appear;
  * the runtime links the two sides by name (docs/air.md section 7.5)
  */
+static void add_varying_at(struct air_ctx *c, const char *name, unsigned slot, unsigned frac, unsigned comps, const struct air_md *node);
+
 static void
 add_varying(struct air_ctx *c, const char *name, unsigned slot, unsigned comps,
             const struct air_md *node)
+{
+   add_varying_at(c, name, slot, 0, comps, node);
+}
+
+static void
+add_varying_at(struct air_ctx *c, const char *name, unsigned slot, unsigned frac, unsigned comps,
+               const struct air_md *node)
 {
    struct air_shader_info *info = c->info;
    info->varyings = reralloc(c->mem_ctx, info->varyings, struct air_varying,
                              info->num_varyings + 1);
    info->varyings[info->num_varyings++] = (struct air_varying) {
-      .name = name, .slot = slot, .components = comps,
+      .name = name, .slot = slot, .component = frac, .components = comps,
       .flat = md_key(node, "air.flat") >= 0,
       .centroid = md_key(node, "air.centroid") >= 0,
       .sample = md_key(node, "air.sample") >= 0,
@@ -1937,10 +2024,12 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
        */
       if (c->nir->info.stage == MESA_SHADER_VERTEX)
          return translate_vertex_attribute(c, node, param, t);
-      unsigned slot = VARYING_SLOT_VAR0 + (*next_varying)++;
+      unsigned slot, frac;
+      alloc_varying(c, 0, next_varying, air_nir_components(t), air_nir_bit_size(c, t), &slot, &frac);
       const char *name = md_key_str(node, "air.arg_name");
       nir_variable *var = make_io_var(c, nir_var_shader_in, t, slot, name);
-      var->data.driver_location = c->nir->num_inputs++;
+      var->data.location_frac = frac;
+      var->data.driver_location = frac ? c->nir->num_inputs - 1 : c->nir->num_inputs++;
       if (md_key(node, "air.flat") >= 0)
          var->data.interpolation = INTERP_MODE_FLAT;
       else if (md_key(node, "air.no_perspective") >= 0)
@@ -1950,7 +2039,7 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       var->data.centroid = md_key(node, "air.centroid") >= 0;
       var->data.sample = md_key(node, "air.sample") >= 0;
       if (c->nir->info.stage == MESA_SHADER_FRAGMENT)
-         add_varying(c, name, slot, air_nir_components(t), node);
+         add_varying_at(c, name, slot, frac, air_nir_components(t), node);
       c->params[param] = air_val_ssa(c, nir_load_var(&c->b, var));
       return true;
    }
@@ -1975,7 +2064,7 @@ static bool
 translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
                  const struct air_type *t, unsigned *next_varying)
 {
-   unsigned location = ~0u, index = 0;
+   unsigned location = ~0u, index = 0, out_frac = 0;
    const char *name = md_key_str(node, "air.arg_name");
 
    int rt = md_key(node, "air.render_target");
@@ -2008,9 +2097,9 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
    } else if (md_key(node, "air.viewport_array_index") >= 0) {
       location = VARYING_SLOT_VIEWPORT;
    } else if (md_key(node, "air.vertex_output") >= 0) {
-      location = VARYING_SLOT_VAR0 + (*next_varying)++;
-      add_varying(c, md_str(node, md_key(node, "air.vertex_output") + 1), location,
-                  air_nir_components(t), node);
+      alloc_varying(c, 1, next_varying, air_nir_components(t), air_nir_bit_size(c, t), &location, &out_frac);
+      add_varying_at(c, md_str(node, md_key(node, "air.vertex_output") + 1), location, out_frac,
+                     air_nir_components(t), node);
    } else {
       for (unsigned i = 0; i < node->num_ops; i++) {
          const char *s = md_str(node, i);
@@ -2058,7 +2147,8 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
 
    nir_variable *var = make_io_var(c, nir_var_shader_out, t, location, name);
    var->data.index = index;
-   var->data.driver_location = c->nir->num_outputs++;
+   var->data.location_frac = out_frac;
+   var->data.driver_location = out_frac ? c->nir->num_outputs - 1 : c->nir->num_outputs++;
    c->outputs[field].location = location;
    c->outputs[field].index = index;
    c->outputs[field].var = var;
@@ -2754,28 +2844,12 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
     * has no such parameter and its return is its render targets, below.
     */
    if (c->num_ret_fields) {
-      /* A callee returning a struct: one out-parameter per member, because a
-       * NIR parameter carries a number and a struct here is a tree of values.
-       * The members with no parameter are the ones nothing can read (see
-       * ret_fields in air_private.h), and a member the callee left out of its
-       * insertvalue chain is undef -- Metal's own vertex-output structs leave
-       * their padding field exactly that way, so this is the normal case and
-       * not a defect.
-       */
-      if (v->kind != AIR_VAL_AGG || v->num_elems != c->num_ret_fields)
-         return air_error(c, "instruction: a returned struct that was never built, "
-                             "from a function called in the module");
-      for (unsigned i = 0; i < v->num_elems; i++) {
-         if (!c->ret_fields[i] || !v->elems[i])
-            continue;
-         if (v->elems[i]->kind != AIR_VAL_SSA)
-            return air_error(c, "instruction: field %u of a returned struct is not a "
-                                "number, from a function called in the module", i);
-         nir_def *d = v->elems[i]->def;
-         nir_store_deref(&c->b, c->ret_fields[i], d,
-                         nir_component_mask(d->num_components));
-      }
-      return true;
+      /* A callee returning an aggregate: one out-parameter per number leaf (ret_is_agg). A leaf the callee left out of its insertvalue chain
+       * is undef -- Metal's own vertex-output structs leave their padding exactly that way, so that is the normal case and not a defect. */
+      if (v->kind != AIR_VAL_AGG)
+         return air_error(c, "instruction: a returned struct that was never built, from a function called in the module");
+      unsigned L = 0;
+      return ret_store_leaves(c, in->operands[0]->type, v, &L);
    }
    if (c->ret_deref) {
       nir_def *d = air_get_ssa(c, in->operands[0]);
@@ -3310,6 +3384,56 @@ val_holds_ptr(const struct air_val *v)
  * phis are all keyed on this function's own objects, and leaving the caller's
  * entries in place would let a callee resolve a value it cannot see.
  */
+/* Bergamota: an array or struct argument by value (Mercury's `metal::matrix` is [3 x <3 x float>]) travels as one NIR parameter per leaf */
+static void
+agg_leaves(struct air_val *v, struct air_val **out, unsigned *n)
+{
+   if (!v)
+      return;   /* an undef leaf: no parameter, and none in the callee either */
+   if (v->kind == AIR_VAL_AGG) {
+      for (unsigned i = 0; i < v->num_elems; i++)
+         agg_leaves(v->elems[i], out, n);
+      return;
+   }
+   if (out)
+      out[*n] = v;
+   (*n)++;
+}
+
+static bool
+agg_all_ssa(const struct air_val *v)
+{
+   if (!v)
+      return true;   /* undef leaf */
+   if (v->kind == AIR_VAL_AGG) {
+      for (unsigned i = 0; i < v->num_elems; i++)
+         if (!agg_all_ssa(v->elems[i]))
+            return false;
+      return true;
+   }
+   return v->kind == AIR_VAL_SSA && v->def;
+}
+
+static bool
+agg_arg(struct air_val **argv, unsigned i)
+{
+   return argv && argv[i] && argv[i]->kind == AIR_VAL_AGG && argv[i]->num_elems && agg_all_ssa(argv[i]);
+}
+
+static struct air_val *
+agg_rebuild(struct air_ctx *c, const struct air_val *v, unsigned *pidx)
+{
+   if (!v)
+      return NULL;
+   if (v->kind == AIR_VAL_AGG) {
+      struct air_val *n = air_val_agg(c, v->num_elems);
+      for (unsigned i = 0; i < v->num_elems; i++)
+         n->elems[i] = agg_rebuild(c, v->elems[i], pidx);
+      return n;
+   }
+   return air_val_ssa(c, nir_load_param(&c->b, (*pidx)++));
+}
+
 /* A pointer argument carrying a computed byte offset: its offset goes through the call as a parameter of its own */
 static bool
 ptr_offset_arg(struct air_val **argv, unsigned i)
@@ -3355,7 +3479,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
                       "argument %u", i);
          return NULL;
       }
-      is_param[i] = !ptr;
+      is_param[i] = !ptr && !agg_arg(argv, i);
       specialised |= ptr;
    }
 
@@ -3378,18 +3502,33 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * a number belongs", which was emit_return inside the callee asking for the
     * returned struct as a register.
     */
-   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
+   bool ret_struct = has_ret && ret_is_agg(rt);
+   const struct air_type *rleaf[512];
+   unsigned nleaves_ret = 0;
+   if (ret_struct) {
+      ret_leaf_types(rt, NULL, &nleaves_ret);
+      if (nleaves_ret > 512) {
+         air_error(c, "instruction: a returned aggregate of %u leaves, which is too many to pass", nleaves_ret);
+         return NULL;
+      }
+      nleaves_ret = 0;
+      ret_leaf_types(rt, rleaf, &nleaves_ret);
+   }
    unsigned nret = 0;
    if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++)
-         nret += ret_member_is_number(rt->members[i]);
+      for (unsigned i = 0; i < nleaves_ret; i++)
+         nret += ret_member_is_number(rleaf[i]);
    } else if (has_ret) {
       nret = 1;
    }
    unsigned noff = 0;
    for (unsigned i = 0; i < f->num_args; i++)
       noff += ptr_offset_arg(argv, i);
-   unsigned nparams = f->num_args + nret + noff;
+   unsigned nleaf = 0;
+   for (unsigned i = 0; i < f->num_args; i++)
+      if (agg_arg(argv, i) && !is_param[i])
+         agg_leaves(argv[i], NULL, &nleaf);
+   unsigned nparams = f->num_args + nret + noff + nleaf;
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -3398,14 +3537,14 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    unsigned idx = 0;
    const struct glsl_type *ret_glsl = NULL;
    if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
+      for (unsigned i = 0; i < nleaves_ret; i++) {
+         if (!ret_member_is_number(rleaf[i]))
             continue;
          fn->params[idx++] = (nir_parameter){
             .num_components = 1, .bit_size = 32,
             .is_return = true,
             .mode = nir_var_function_temp,
-            .type = param_glsl_type(c, rt->members[i]),
+            .type = param_glsl_type(c, rleaf[i]),
          };
       }
    } else if (has_ret) {
@@ -3430,6 +3569,16 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       if (!ptr_offset_arg(argv, i))
          continue;
       fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };   /* the pointer's byte offset */
+   }
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (!agg_arg(argv, i) || is_param[i])
+         continue;
+      struct air_val *lv[256];
+      unsigned nl = 0;
+      if (argv[i]->num_elems > 64) { air_error(c, "intrinsic: an aggregate argument too large to pass"); return NULL; }
+      agg_leaves(argv[i], lv, &nl);
+      for (unsigned k = 0; k < nl; k++)
+         fn->params[idx++] = (nir_parameter){ .num_components = lv[k]->def->num_components, .bit_size = lv[k]->def->bit_size };
    }
    fn->num_params = idx;   /* the pointers took no parameter of their own */
 
@@ -3477,17 +3626,16 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * call's source at inline time and nir_opt_deref removes the cast afterwards.
     */
    if (ret_struct) {
-      c->ret_fields = rzalloc_array(c->mem_ctx, nir_deref_instr *,
-                                    MAX2(rt->num_members, 1));
-      c->num_ret_fields = rt->num_members;
+      c->ret_fields = rzalloc_array(c->mem_ctx, nir_deref_instr *, MAX2(nleaves_ret, 1));
+      c->num_ret_fields = nleaves_ret;
       unsigned p = 0;
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
+      for (unsigned i = 0; i < nleaves_ret; i++) {
+         if (!ret_member_is_number(rleaf[i]))
             continue;
          c->ret_fields[i] =
             nir_build_deref_cast(&c->b, nir_load_param(&c->b, p++),
                                  nir_var_function_temp,
-                                 param_glsl_type(c, rt->members[i]), 0);
+                                 param_glsl_type(c, rleaf[i]), 0);
       }
    } else if (has_ret) {
       c->ret_deref = nir_build_deref_cast(&c->b, nir_load_param(&c->b, 0),
@@ -3498,12 +3646,17 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    for (unsigned i = 0; i < f->num_args; i++)
       nreal += is_param[i];
    unsigned oidx = nret + nreal;
+   unsigned aidx = oidx + noff;
    for (unsigned i = 0; i < f->num_args && ok; i++) {
       if (!is_param[i]) {
          if (ptr_offset_arg(argv, i)) {
             struct air_val *pv = clone_val(c, argv[i]);
             pv->ptr.offset = nir_load_param(&c->b, oidx++);   /* the offset, now this function's own */
             air_set(c, &f->args[i], pv);
+            continue;
+         }
+         if (agg_arg(argv, i)) {
+            air_set(c, &f->args[i], agg_rebuild(c, argv[i], &aidx));   /* the leaves are this function's own parameters */
             continue;
          }
          air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
@@ -3572,7 +3725,12 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
 
    const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
    bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
-   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
+   bool ret_struct = has_ret && ret_is_agg(rt);
+   const struct air_type *rleaf[512];
+   unsigned nleaves_ret = 0;
+   if (ret_struct) {
+      ret_leaf_types(rt, rleaf, &nleaves_ret);   /* translate_callee has refused more than 512 */
+   }
 
    nir_variable *tmp = NULL;
    /* One local per member for a struct return, in the member order
@@ -3581,15 +3739,15 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
     * same thing an extractvalue of an undef field already reads.
     */
    nir_variable **fields = ret_struct ?
-      rzalloc_array(c->mem_ctx, nir_variable *, MAX2(rt->num_members, 1)) : NULL;
+      rzalloc_array(c->mem_ctx, nir_variable *, MAX2(nleaves_ret, 1)) : NULL;
    nir_call_instr *call = nir_call_instr_create(c->nir, fn);
    unsigned idx = 0;
    if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
+      for (unsigned i = 0; i < nleaves_ret; i++) {
+         if (!ret_member_is_number(rleaf[i]))
             continue;
          fields[i] = nir_local_variable_create(c->b.impl,
-                                               param_glsl_type(c, rt->members[i]),
+                                               param_glsl_type(c, rleaf[i]),
                                                "callret");
          call->params[idx++] =
             nir_src_for_ssa(&nir_build_deref_var(&c->b, fields[i])->def);
@@ -3611,14 +3769,20 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    for (unsigned i = 0; i < f->num_args; i++)
       if (ptr_offset_arg(argv, i))
          call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (!agg_arg(argv, i) || is_param[i])
+         continue;
+      struct air_val *lv[256];
+      unsigned nl = 0;
+      agg_leaves(argv[i], lv, &nl);
+      for (unsigned k = 0; k < nl; k++)
+         call->params[idx++] = nir_src_for_ssa(lv[k]->def);
+   }
    nir_builder_instr_insert(&c->b, &call->instr);
 
    if (ret_struct) {
-      struct air_val *agg = air_val_agg(c, rt->num_members);
-      for (unsigned i = 0; i < rt->num_members; i++)
-         if (fields[i])
-            agg->elems[i] = air_val_ssa(c, nir_load_var(&c->b, fields[i]));
-      air_set(c, &in->base, agg);
+      unsigned L = 0;
+      air_set(c, &in->base, ret_build_leaves(c, rt, fields, &L));
    } else if (has_ret) {
       air_set(c, &in->base, air_val_ssa(c, nir_load_var(&c->b, tmp)));
    }
@@ -3805,6 +3969,15 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
    for (unsigned i = 0; i < f->num_args; i++)
       if (ptr_offset_arg(argv, i))
          call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (!agg_arg(argv, i) || is_param[i])
+         continue;
+      struct air_val *lv[256];
+      unsigned nl = 0;
+      agg_leaves(argv[i], lv, &nl);
+      for (unsigned k = 0; k < nl; k++)
+         call->params[idx++] = nir_src_for_ssa(lv[k]->def);
+   }
    nir_builder_instr_insert(&c->b, &call->instr);
 
    struct air_ptr out = { .class = AIR_PTR_SSBO, .binding = 1, .pointee = rt };
