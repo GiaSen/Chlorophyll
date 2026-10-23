@@ -1873,6 +1873,12 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    tex_instr->coord_components = ncoord;
    tex_instr->texture_index = tex.binding;
    tex_instr->sampler_index = have_sampler ? samp.binding : 0;
+   if (tex.binding < 16 && c->info) {
+      int8_t *ts = c->info->tex_sampler;
+      int8_t want = have_sampler && samp.binding < 100 ? (int8_t)samp.binding : 0;
+      if (ts[tex.binding] == 0 && !c->info->tex_sampler_init[tex.binding]) { ts[tex.binding] = want; c->info->tex_sampler_init[tex.binding] = true; }
+      else if (ts[tex.binding] != want) ts[tex.binding] = -2;
+   }
    if (op == nir_texop_tg4) {
       uint64_t component;
       if (!tex_flag(c, in, arg, &component))

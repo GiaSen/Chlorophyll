@@ -315,6 +315,12 @@ struct air_shader_info {
     * time rather than only in a document.
     */
    unsigned num_notes;
+
+   /* Bergamota: which sampler each texture slot is sampled with, from the tex instructions (-1: not sampled, -2: sampled with more than
+    * one sampler). Needed by a back end whose texture instruction has ONE unit for both (softpipe through nir_to_tgsi: texture(3) with
+    * sampler(0) samples view 0), which then binds the paired sampler at the texture's own index. */
+   int8_t tex_sampler[16];
+   bool tex_sampler_init[16];
    const char **notes;
 
    unsigned threadgroup_bytes; /* static threadgroup memory */

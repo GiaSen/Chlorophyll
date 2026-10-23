@@ -358,9 +358,29 @@ type_size_vec4(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/* Bergamota: softpipe's texture instruction (nir_to_tgsi) has ONE unit for the view and the sampler, `sampler_index`; texture(3) with
+ * sampler(0) therefore samples view 0. For such a screen the instruction is made to use the texture's own index, and bind_stage binds the
+ * paired sampler there (air_shader_info.tex_sampler). The Adreno has separate indices and needs none of this.
+ */
+static bool
+lower_tex_unit_cb(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)b; (void)data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_index == tex->texture_index)
+      return false;
+   tex->sampler_index = tex->texture_index;
+   return true;
+}
+
 static void
 finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
 {
+   if (!screen->caps.fs_position_is_sysval) {
+      nir_shader_instructions_pass(nir, lower_tex_unit_cb, nir_metadata_all, NULL);
+   }
    /* A fragment shader's [[position]]: the frontend hands it over as a system-value
     * variable, because that is the one form both of the drivers behind this library can
     * be served from (the long version is beside air.position in air_to_nir.c and in
@@ -3778,6 +3798,21 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
 
       case AIR_RESOURCE_THREADGROUP_BUFFER:
          break;
+      }
+   }
+
+   /* softpipe: one unit for a texture and its sampler (see lower_tex_unit_cb): the sampler a texture is sampled with goes at the texture's index */
+   if (device->software) {
+      void *orig[RWA_MAX_TEXTURES];
+      memcpy(orig, samplers, sizeof(orig));
+      for (unsigned t = 0; t < num_views && t < 16; t++) {
+         if (!views[t] || !info->tex_sampler_init[t])
+            continue;
+         int sidx = info->tex_sampler[t];
+         if (sidx >= 0 && sidx < RWA_MAX_TEXTURES && orig[sidx]) {
+            samplers[t] = orig[sidx];
+            num_samplers = MAX2(num_samplers, t + 1);
+         }
       }
    }
 
