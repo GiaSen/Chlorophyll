@@ -2,8 +2,8 @@
  "summary": {
   "total": 20508,
   "reader_ok": 20485,
-  "translate_ok": 7988,
-  "ir3_ok": 7946,
+  "translate_ok": 8251,
+  "ir3_ok": 8208,
   "chip": "0x06030001",
   "classes": [
    {
@@ -34,16 +34,6 @@
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/pointSample",
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/F3V",
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/F3H"
-    ]
-   },
-   {
-    "class": "translate: intrinsic: a call passing a pointer at a computed offset as argument N, which would use the caller's own value here (block N, instruction N, opcode N)",
-    "count": 455,
-    "examples": [
-     "022_System__Library__ExtensionKit__Extensions__PridePosterExtension.appex__default.metallib/setup",
-     "023_System__Library__ExtensionKit__Extensions__Unity2025Poster.appex__default.metallib/unity2025FragmentShader",
-     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/arithmetic_binary_forward_float",
-     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/arithmetic_binary_gradient_float"
     ]
    },
    {
@@ -78,7 +68,7 @@
    },
    {
     "class": "translate: intrinsic: ID (block N, instruction N, opcode N)",
-    "count": 171,
+    "count": 175,
     "examples": [
      "043_System__Library__Frameworks__CoreImage.framework__default.metallib/sparserendering_xhlrb_scan",
      "043_System__Library__Frameworks__CoreImage.framework__default.metallib/sparserendering_xhlrb_diffuse",
@@ -117,13 +107,23 @@
     ]
    },
    {
+    "class": "translate: intrinsic: air.simdgroup.barrier (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 103,
+    "examples": [
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/kUpsample_1_0_2_2_3_3_1_2_8_4_1_1_1_1_0_0",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/kUpsample_1_0_2_2_3_3_1_4_4_8_1_1_1_1_1_0",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/kUpsample_1_0_2_2_3_3_2_2_32_1_1_1_1_1_1_0",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/kUpsample_1_0_2_2_3_5_1_4_4_8_1_1_1_1_1_0"
+    ]
+   },
+   {
     "class": "translate: instruction: a phi of pointers whose operand comes in over a loop edge, so which resource it is depends on the iteration",
-    "count": 95,
+    "count": 98,
     "examples": [
      "022_System__Library__ExtensionKit__Extensions__PridePosterExtension.appex__default.metallib/lightsMeshFragment",
      "046_System__Library__Frameworks__MLCompute.framework__default.metallib/arithmetic_reduce_gradient_any",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/image_rg_histogram_global_atomics_2x2",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/image_rgb_histogram_global_atomics_2x2"
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/scatter_forward",
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/gather_forward"
     ]
    },
    {
@@ -137,8 +137,18 @@
     ]
    },
    {
+    "class": "translate: instruction: an array where a number belongs, which has no single NIR width (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 91,
+    "examples": [
+     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::four::torusVertex",
+     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::four::torusFragment",
+     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::three::torusVertex",
+     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::three::torusFragment"
+    ]
+   },
+   {
     "class": "translate: instruction: insertelement at a run-time index (block N, instruction N, opcode N)",
-    "count": 73,
+    "count": 75,
     "examples": [
      "007_Applications__Measure.app__default.metallib/dotsUpdate",
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/trcMatTrcKernel",
@@ -154,16 +164,6 @@
      "127_System__Library__PrivateFrameworks__ImagePlaygroundInternal.framework__default.metallib/vfx_custom_shader_Effect3D_shader_77::vfx_fragment",
      "152_System__Library__PrivateFrameworks__Portrait.framework__default.metallib/vfx_custom_shader_lasers_shader_9::vfx_fragment",
      "152_System__Library__PrivateFrameworks__Portrait.framework__default.metallib/vfx_custom_shader_lasers_shader_17::vfx_fragment"
-    ]
-   },
-   {
-    "class": "translate: instruction: an array where a number belongs, which has no single NIR width (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
-    "count": 65,
-    "examples": [
-     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::four::torusVertex",
-     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::four::torusFragment",
-     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::three::torusVertex",
-     "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/tori::three::torusFragment"
     ]
    },
    {
@@ -197,6 +197,16 @@
     ]
    },
    {
+    "class": "ir3: signal N: MESA: error:",
+    "count": 43,
+    "examples": [
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/reduce_forward_any_all",
+     "058_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSRayIntersector.framework__default.metallib/generateDistances",
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/debug_light_indices_8_buffer_frag",
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/debug_light_indices_16_buffer_frag"
+    ]
+   },
+   {
     "class": "translate: interface: input air.primitive_acceleration_structure",
     "count": 42,
     "examples": [
@@ -207,18 +217,8 @@
     ]
    },
    {
-    "class": "ir3: signal N: MESA: error:",
-    "count": 42,
-    "examples": [
-     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/reduce_forward_any_all",
-     "058_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSRayIntersector.framework__default.metallib/generateDistances",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/debug_light_indices_8_buffer_frag",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/debug_light_indices_16_buffer_frag"
-    ]
-   },
-   {
     "class": "translate: instruction: a pointer where a number belongs (block N, instruction N, opcode N)",
-    "count": 40,
+    "count": 41,
     "examples": [
      "001_Applications__DiagnosticsService.app__PlugIns__Diagnostic-8187.appex__default.metallib/shadeKernel",
      "020_System__Library__ExtensionKit__Extensions__MercuryPosterExtension.appex__default.metallib/fluidity::sdfVertexShader",
@@ -227,13 +227,23 @@
     ]
    },
    {
-    "class": "translate: instruction: a pointer where a number belongs (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
-    "count": 35,
+    "class": "translate: instruction: a store of a pointer into memory, which this frontend has no address to write (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 40,
     "examples": [
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/image_r_histogram_local_atomics",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/image_rg_histogram_local_atomics",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/image_rgb_histogram_local_atomics",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/image_rgba_histogram_local_atomics"
+    ]
+   },
+   {
+    "class": "translate: instruction: a pointer where a number belongs (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 39,
+    "examples": [
+     "057_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNeuralNetwork.framework__default.metallib/local_contrast_normalization_gradient",
+     "057_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNeuralNetwork.framework__default.metallib/local_contrast_normalization_gradient_array",
      "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_specularPreIntegratedLD_texturecube",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_specularPreIntegratedLD_var_texturecube_half",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_specularPreIntegratedLD_var_texturecube_float",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_specularPreIntegratedLD_dual_paraboloid_half"
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_specularPreIntegratedLD_var_texturecube_half"
     ]
    },
    {
@@ -247,16 +257,6 @@
     ]
    },
    {
-    "class": "translate: intrinsic: a call passing a pointer at a computed offset as argument N, which would use the caller's own value here (block N, instruction N, opcode N) (block N,",
-    "count": 33,
-    "examples": [
-     "000_Applications__ColorPickerUIService.app__default.metallib/fragmentShader",
-     "057_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNeuralNetwork.framework__default.metallib/MPSCNNPooling_new_tex2d_tex2d_max_4x4_1",
-     "057_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNeuralNetwork.framework__default.metallib/MPSCNNPooling_new_tex2darray_tex2darray_max_4x4_1",
-     "057_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNeuralNetwork.framework__default.metallib/MPSCNNPooling_new_tex2d_tex2d_max_5x5_1"
-    ]
-   },
-   {
     "class": "translate: instruction: a pointer loaded from memory (argument buffers) (block N, instruction N, opcode N)",
     "count": 33,
     "examples": [
@@ -264,6 +264,16 @@
      "047_System__Library__Frameworks__Metal.framework__MTLBVHBuilder.metallib/getSerializedGeometrySizeKernel",
      "047_System__Library__Frameworks__Metal.framework__MTLBVHBuilder.metallib/getSerializedGeometryPrimitiveCountKernel",
      "047_System__Library__Frameworks__Metal.framework__MTLBVHBuilder.metallib/extractMTLBVHPrimitivesKernel"
+    ]
+   },
+   {
+    "class": "translate: instruction: a phi of pointers whose operand comes in over a loop edge, so which resource it is depends on the iteration (block N, instruction N, opcode N)",
+    "count": 33,
+    "examples": [
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_histogram_one_channel_per_thread",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_uchar_histogram_one_channel_per_thread",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_histogram",
+     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_uchar_histogram"
     ]
    },
    {
@@ -287,16 +297,6 @@
     ]
    },
    {
-    "class": "translate: instruction: a phi of pointers whose operand comes in over a loop edge, so which resource it is depends on the iteration (block N, instruction N, opcode N)",
-    "count": 28,
-    "examples": [
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_histogram_one_channel_per_thread",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_uchar_histogram_one_channel_per_thread",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_histogram",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/median_rgb_filter_local_uchar_histogram"
-    ]
-   },
-   {
     "class": "translate: instruction: a phi between pointers that name different places, which would have to be chosen at run time",
     "count": 26,
     "examples": [
@@ -307,6 +307,26 @@
     ]
    },
    {
+    "class": "translate: instruction: a phi between pointers that name different places, which would have to be chosen at run time (block N, instruction N, opcode N)",
+    "count": 26,
+    "examples": [
+     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float_4",
+     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float_8",
+     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float_12",
+     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float"
+    ]
+   },
+   {
+    "class": "translate: intrinsic: ID (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 23,
+    "examples": [
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/arithmetic_binary_forward_float",
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/arithmetic_binary_gradient_float",
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/mem_fill_bool",
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/select_forward"
+    ]
+   },
+   {
     "class": "translate: intrinsic: air.is_uniform.iN (block N, instruction N, opcode N)",
     "count": 23,
     "examples": [
@@ -314,16 +334,6 @@
      "052_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSCore.framework__default.metallib/copyNDArrayToImage",
      "052_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSCore.framework__default.metallib/reshapeNDArrayData",
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/canny_trace_edges"
-    ]
-   },
-   {
-    "class": "translate: instruction: a store of a pointer into memory, which this frontend has no address to write (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
-    "count": 23,
-    "examples": [
-     "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/scan_add",
-     "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/scan_mul",
-     "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/scan_max",
-     "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/scan_min"
     ]
    },
    {
@@ -387,6 +397,16 @@
     ]
    },
    {
+    "class": "translate: instruction: an array where a number belongs, which has no single NIR width (block N, instruction N, opcode N)",
+    "count": 15,
+    "examples": [
+     "022_System__Library__ExtensionKit__Extensions__PridePosterExtension.appex__default.metallib/setup",
+     "097_System__Library__PrivateFrameworks__CoreOCModules.framework__default.metallib/oc::voxel_hashing::integrateVoxelsBetweenCameraAndEndPoints",
+     "097_System__Library__PrivateFrameworks__CoreOCModules.framework__default.metallib/oc::voxel_hashing::integrateVoxelsUptoTruncationRegion",
+     "097_System__Library__PrivateFrameworks__CoreOCModules.framework__default.metallib/oc::voxel_hashing::integrateVoxelsInTruncationRegion"
+    ]
+   },
+   {
     "class": "translate: interface: member N of the argument buffer imgIn is described by air.struct_type_info and not by five fields and a descriptor",
     "count": 15,
     "examples": [
@@ -394,16 +414,6 @@
      "045_System__Library__Frameworks__ImageIO.framework__default.metallib/xdr::convert_image_to_image_block",
      "045_System__Library__Frameworks__ImageIO.framework__default.metallib/xdr::convert_image_to_image_quad_loop",
      "045_System__Library__Frameworks__ImageIO.framework__default.metallib/xdr::convert_image_to_image_loop"
-    ]
-   },
-   {
-    "class": "translate: intrinsic: ID (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
-    "count": 15,
-    "examples": [
-     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/mem_fill_bool",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/copy_image_matrix_rgba_nchw_fp16",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/copy_image_matrix_rgba_nchw_fp32",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/copy_image_matrix_rgba_nchw_fp16_flip"
     ]
    },
    {
@@ -437,6 +447,16 @@
     ]
    },
    {
+    "class": "translate: intrinsic: air.write_texture_cube with a N-component coordinate, wanting N (block N, instruction N, opcode N)",
+    "count": 13,
+    "examples": [
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_cube_from_equi",
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_cube_from_dual",
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/texturecube_copy_resample_kernel",
+     "073_System__Library__PrivateFrameworks__ARKitCore.framework__default.metallib/compute_cubemap_from_latlong"
+    ]
+   },
+   {
     "class": "translate: intrinsic: air.fast_fmaxN.fN (block N, instruction N, opcode N)",
     "count": 13,
     "examples": [
@@ -454,16 +474,6 @@
      "058_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSRayIntersector.framework__default.metallib/dispatchBinsKernel32",
      "058_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSRayIntersector.framework__default.metallib/dispatchBinsKernel64",
      "058_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSRayIntersector.framework__default.metallib/binFragmentsKernel"
-    ]
-   },
-   {
-    "class": "translate: intrinsic: air.write_texture_cube with a N-component coordinate, wanting N (block N, instruction N, opcode N)",
-    "count": 12,
-    "examples": [
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_cube_from_equi",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_cube_from_dual",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/texturecube_copy_resample_kernel",
-     "073_System__Library__PrivateFrameworks__ARKitCore.framework__default.metallib/compute_cubemap_from_latlong"
     ]
    },
    {
@@ -517,13 +527,13 @@
     ]
    },
    {
-    "class": "translate: instruction: a phi between pointers that name different places, which would have to be chosen at run time (block N, instruction N, opcode N)",
+    "class": "translate: intrinsic: air.atomic.global.cmpxchg -- compare-exchange, whose result is the old value and whose `expected` is a pointer this does not write back yet (block N,",
     "count": 8,
     "examples": [
-     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float_4",
-     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float_8",
-     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float_12",
-     "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib/vtopk_common_matrix_float"
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/pooling_max_gradient",
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/pooling_average_include_padding_gradient",
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/pooling_average_exclude_padding_gradient",
+     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/pooling_l2norm_gradient"
     ]
    },
    {
@@ -567,16 +577,6 @@
     ]
    },
    {
-    "class": "translate: intrinsic: air.simdgroup.barrier (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
-    "count": 6,
-    "examples": [
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/reduce_min_row_simd_rgba",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/reduce_max_row_simd_rgba",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/reduce_min_column_simd_rgba",
-     "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/reduce_max_column_simd_rgba"
-    ]
-   },
-   {
     "class": "translate: intrinsic: air.quad_shuffle_down.vNfN (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
     "count": 6,
     "examples": [
@@ -584,6 +584,26 @@
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/reduce_max_row_quadshuffle_rgba",
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/reduce_min_column_quadshuffle_rgba",
      "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib/reduce_max_column_quadshuffle_rgba"
+    ]
+   },
+   {
+    "class": "translate: instruction: insertelement at a run-time index (block N, instruction N, opcode N) (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 6,
+    "examples": [
+     "154_System__Library__PrivateFrameworks__Recon3D.framework__Reconstruction_Gpu_Shaders.metallib/FuseRawframeToKeyframe_Semantics",
+     "154_System__Library__PrivateFrameworks__Recon3D.framework__Reconstruction_Gpu_Shaders.metallib/FuseRawframeToKeyframe_Materials",
+     "154_System__Library__PrivateFrameworks__Recon3D.framework__Reconstruction_Gpu_Shaders.metallib/FuseRawframeToKeyframe_ColorAndSemantics",
+     "154_System__Library__PrivateFrameworks__Recon3D.framework__Reconstruction_Gpu_Shaders.metallib/FuseRawframeToKeyframe_ColorAndMaterials"
+    ]
+   },
+   {
+    "class": "translate: intrinsic: air.simd_shuffle_down.u.iN (block N, instruction N, opcode N)",
+    "count": 6,
+    "examples": [
+     "172_System__Library__PrivateFrameworks__VideoProcessing.framework__ProcessAccelerate.metallib/SpatialSumSadSIMD",
+     "172_System__Library__PrivateFrameworks__VideoProcessing.framework__ProcessAccelerate.metallib/SpatialSumSadUnorm",
+     "172_System__Library__PrivateFrameworks__VideoProcessing.framework__ProcessAccelerate.metallib/SpatialVarianceSIMD",
+     "172_System__Library__PrivateFrameworks__VideoProcessing.framework__ProcessAccelerate.metallib/SpatialVarianceUnorm"
     ]
    },
    {
@@ -637,6 +657,26 @@
     ]
    },
    {
+    "class": "translate: intrinsic: air.read_texture_cube with a N-component coordinate, wanting N (block N, instruction N, opcode N)",
+    "count": 5,
+    "examples": [
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/texturecube_copy_kernel",
+     "073_System__Library__PrivateFrameworks__ARKitCore.framework__default.metallib/cubemap_color_histogram_lab",
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/generateClampedMap",
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/generatePrefilteredSpecularMapFast"
+    ]
+   },
+   {
+    "class": "translate: instruction: a pointer where a number belongs (block N, instruction N, opcode N) (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 5,
+    "examples": [
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_specularPreIntegratedDFG_diffuseHammon",
+     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_diffusePreIntegrated_texture2d",
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/generatePrefilteredSpecularMap",
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/generatePrefilteredSpecularMapWithLinearToSRGB"
+    ]
+   },
+   {
     "class": "translate: interface: input air.barycentric_coord",
     "count": 5,
     "examples": [
@@ -654,16 +694,6 @@
      "145_System__Library__PrivateFrameworks__PassKitUI.framework__default.metallib/vfx_custom_shader_NearbyPeerPaymentVFX_shader_59::vfx_fragment",
      "145_System__Library__PrivateFrameworks__PassKitUI.framework__default.metallib/vfx_custom_shader_NearbyPeerPaymentVFX_shader_70::vfx_fragment",
      "145_System__Library__PrivateFrameworks__PassKitUI.framework__default.metallib/vfx_custom_shader_NearbyPeerPaymentVFX_shader_132::vfx_fragment"
-    ]
-   },
-   {
-    "class": "translate: intrinsic: air.simd_shuffle_down.u.iN (block N, instruction N, opcode N)",
-    "count": 5,
-    "examples": [
-     "172_System__Library__PrivateFrameworks__VideoProcessing.framework__ProcessAccelerate.metallib/SpatialSumSadSIMD",
-     "172_System__Library__PrivateFrameworks__VideoProcessing.framework__ProcessAccelerate.metallib/SpatialVarianceSIMD",
-     "172_System__Library__PrivateFrameworks__VideoProcessing.framework__ProcessAccelerate.metallib/SpatialVarianceUnorm",
-     "173_System__Library__PrivateFrameworks__VideoProcessing.framework__default.metallib/TransitionDetectionSIMD"
     ]
    },
    {
@@ -687,16 +717,6 @@
     ]
    },
    {
-    "class": "translate: intrinsic: air.read_texture_cube with a N-component coordinate, wanting N (block N, instruction N, opcode N)",
-    "count": 4,
-    "examples": [
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/texturecube_copy_kernel",
-     "073_System__Library__PrivateFrameworks__ARKitCore.framework__default.metallib/cubemap_color_histogram_lab",
-     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/generateClampedMap",
-     "169_System__Library__PrivateFrameworks__VFX.framework__default.metallib/texturecube_copy_kernel"
-    ]
-   },
-   {
     "class": "translate: interface: member dstStride of the argument buffer in is air.indirect_constant, and this frontend binds a buffer, a texture or a sampler",
     "count": 4,
     "examples": [
@@ -704,6 +724,16 @@
      "062_System__Library__Frameworks__SceneKit.framework__default.metallib/scn_osd_synchronize_indexed_coarse_positions",
      "169_System__Library__PrivateFrameworks__VFX.framework__default.metallib/vfx_osd_synchronize_coarse_positions",
      "169_System__Library__PrivateFrameworks__VFX.framework__default.metallib/vfx_osd_synchronize_indexed_coarse_positions"
+    ]
+   },
+   {
+    "class": "translate: intrinsic: air.simdgroup_matrix_NxN_init_filled.vNfN.fN (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 4,
+    "examples": [
+     "075_System__Library__PrivateFrameworks__AccelerateGPU.framework__GPUBLAS.metallib/strsmLU_32x128_main",
+     "075_System__Library__PrivateFrameworks__AccelerateGPU.framework__GPUBLAS.metallib/strsmLL_32x128_main",
+     "075_System__Library__PrivateFrameworks__AccelerateGPU.framework__GPUBLAS.metallib/strsmRU_128x32_main",
+     "075_System__Library__PrivateFrameworks__AccelerateGPU.framework__GPUBLAS.metallib/strsmRL_128x32_main"
     ]
    },
    {
@@ -724,16 +754,6 @@
      "129_System__Library__PrivateFrameworks__MOVStreamIO.framework__default.metallib/splitCompandedBayerIntoWarhol",
      "129_System__Library__PrivateFrameworks__MOVStreamIO.framework__default.metallib/joinWarholIntoBayer",
      "129_System__Library__PrivateFrameworks__MOVStreamIO.framework__default.metallib/joinCompandedWarholIntoBayer"
-    ]
-   },
-   {
-    "class": "translate: instruction: an array where a number belongs, which has no single NIR width (block N, instruction N, opcode N)",
-    "count": 4,
-    "examples": [
-     "164_System__Library__PrivateFrameworks__TSReading.framework__KeynoteMetalLibrary.metallib/buildAnvilSmokeVertexShader",
-     "164_System__Library__PrivateFrameworks__TSReading.framework__KeynoteMetalLibrary.metallib/buildCrumbleVertexShader",
-     "164_System__Library__PrivateFrameworks__TSReading.framework__KeynoteMetalLibrary.metallib/buildCrumbleSmokeVertexShader",
-     "164_System__Library__PrivateFrameworks__TSReading.framework__KeynoteMetalLibrary.metallib/transitionConfettiVertexShader"
     ]
    },
    {
@@ -782,6 +802,15 @@
     ]
    },
    {
+    "class": "translate: instruction: a struct where a number belongs, which has no single NIR width (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 3,
+    "examples": [
+     "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/NDArrayQuantizedMatmul",
+     "071_System__Library__Frameworks___RealityKit_SwiftUI.framework__default.metallib/objectcapture::vertexShaderFreeformMeshColorNoFiltering",
+     "156_System__Library__PrivateFrameworks__RenderBox.framework__default.metallib/uber_vertex"
+    ]
+   },
+   {
     "class": "translate: instruction: a phi of an array, which NIR has no register for",
     "count": 3,
     "examples": [
@@ -791,12 +820,12 @@
     ]
    },
    {
-    "class": "translate: instruction: a pointer where a number belongs (block N, instruction N, opcode N) (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "class": "translate: instruction: a struct where a number belongs, which has no single NIR width (block N, instruction N, opcode N) (block N, instruction N, opcode N) (block N, inst",
     "count": 3,
     "examples": [
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_specularPreIntegratedDFG_diffuseHammon",
-     "062_System__Library__Frameworks__SceneKit.framework__default.metallib/compute_diffusePreIntegrated_texture2d",
-     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/generateBrdfMap"
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/fsDebugCalculatedNormals",
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/fsDebugCalculatedBitangents",
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/fsDebugCalculatedTangents"
     ]
    },
    {
@@ -813,14 +842,6 @@
     "examples": [
      "046_System__Library__Frameworks__MLCompute.framework__default.metallib/arithmetic_unary_forward_float",
      "046_System__Library__Frameworks__MLCompute.framework__default.metallib/arithmetic_unary_gradient_float"
-    ]
-   },
-   {
-    "class": "translate: intrinsic: air.atomic.global.cmpxchg -- compare-exchange, whose result is the old value and whose `expected` is a pointer this does not write back yet (block N,",
-    "count": 2,
-    "examples": [
-     "046_System__Library__Frameworks__MLCompute.framework__default.metallib/padding_gradient_reflect_symmetric",
-     "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/ArrayMatrixMultiplicationSparseDense"
     ]
    },
    {
@@ -869,14 +890,6 @@
     "examples": [
      "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/ndArrayConvolution3D",
      "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/ndArrayConvolution3DGradientWithWeights"
-    ]
-   },
-   {
-    "class": "translate: instruction: a struct where a number belongs, which has no single NIR width (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
-    "count": 2,
-    "examples": [
-     "056_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNDArray.framework__default.metallib/NDArrayQuantizedMatmul",
-     "071_System__Library__Frameworks___RealityKit_SwiftUI.framework__default.metallib/objectcapture::vertexShaderFreeformMeshColorNoFiltering"
     ]
    },
    {
@@ -1007,6 +1020,13 @@
     ]
    },
    {
+    "class": "translate: intrinsic: air.quad_sum.vNfN (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 1,
+    "examples": [
+     "051_System__Library__Frameworks__MetalFX.framework__default.metallib/unified_pass_kern"
+    ]
+   },
+   {
     "class": "translate: intrinsic: air.fence_texture_Nd (a texture name this cannot take apart) (block N, instruction N, opcode N)",
     "count": 1,
     "examples": [
@@ -1112,6 +1132,13 @@
     ]
    },
    {
+    "class": "translate: intrinsic: air.fminN.fN (block N, instruction N, opcode N) (block N, instruction N, opcode N) (block N, instruction N, opcode N) (block N, instruction N, opcode",
+    "count": 1,
+    "examples": [
+     "088_System__Library__PrivateFrameworks__CMImaging.framework__default.metallib/generateColorCubes"
+    ]
+   },
+   {
     "class": "translate: intrinsic: air.fmaxN.fN (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
     "count": 1,
     "examples": [
@@ -1126,6 +1153,13 @@
     ]
    },
    {
+    "class": "translate: intrinsic: atomic sub (block N, instruction N, opcode N) (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 1,
+    "examples": [
+     "097_System__Library__PrivateFrameworks__CoreOCModules.framework__default.metallib/oc::voxel_hashing::allocateVoxelBlocksIntersectingRay"
+    ]
+   },
+   {
     "class": "translate: interface: input air.visible_function_table",
     "count": 1,
     "examples": [
@@ -1137,6 +1171,13 @@
     "count": 1,
     "examples": [
      "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/fsOverdrawDebug"
+    ]
+   },
+   {
+    "class": "translate: intrinsic: air.get_width_depth_Nd with aspect N (only N is understood) (block N, instruction N, opcode N) (block N, instruction N, opcode N)",
+    "count": 1,
+    "examples": [
+     "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib/fsRealityShadowReceiver"
     ]
    },
    {
@@ -1229,8 +1270,8 @@
     "lib": "000_Applications__ColorPickerUIService.app__default.metallib",
     "kind": "fragment",
     "total": 1,
-    "translate_ok": 0,
-    "ir3_ok": 0
+    "translate_ok": 1,
+    "ir3_ok": 1
    },
    {
     "lib": "000_Applications__ColorPickerUIService.app__default.metallib",
@@ -1558,8 +1599,8 @@
     "lib": "023_System__Library__ExtensionKit__Extensions__Unity2025Poster.appex__default.metallib",
     "kind": "fragment",
     "total": 1,
-    "translate_ok": 0,
-    "ir3_ok": 0
+    "translate_ok": 1,
+    "ir3_ok": 1
    },
    {
     "lib": "023_System__Library__ExtensionKit__Extensions__Unity2025Poster.appex__default.metallib",
@@ -1698,15 +1739,15 @@
     "lib": "046_System__Library__Frameworks__MLCompute.framework__default.metallib",
     "kind": "kernel",
     "total": 85,
-    "translate_ok": 44,
-    "ir3_ok": 43
+    "translate_ok": 54,
+    "ir3_ok": 53
    },
    {
     "lib": "047_System__Library__Frameworks__Metal.framework__MTLBVHBuilder.metallib",
     "kind": "kernel",
     "total": 227,
-    "translate_ok": 63,
-    "ir3_ok": 63
+    "translate_ok": 66,
+    "ir3_ok": 66
    },
    {
     "lib": "048_System__Library__Frameworks__Metal.framework__MTLECBE.metallib",
@@ -1726,15 +1767,15 @@
     "lib": "051_System__Library__Frameworks__MetalFX.framework__default.metallib",
     "kind": "fragment",
     "total": 6,
-    "translate_ok": 2,
-    "ir3_ok": 2
+    "translate_ok": 6,
+    "ir3_ok": 6
    },
    {
     "lib": "051_System__Library__Frameworks__MetalFX.framework__default.metallib",
     "kind": "kernel",
     "total": 29,
-    "translate_ok": 20,
-    "ir3_ok": 20
+    "translate_ok": 24,
+    "ir3_ok": 24
    },
    {
     "lib": "051_System__Library__Frameworks__MetalFX.framework__default.metallib",
@@ -1768,8 +1809,8 @@
     "lib": "054_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSImage.framework__default.metallib",
     "kind": "kernel",
     "total": 1837,
-    "translate_ok": 1344,
-    "ir3_ok": 1344
+    "translate_ok": 1487,
+    "ir3_ok": 1487
    },
    {
     "lib": "055_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSMatrix.framework__default.metallib",
@@ -1789,8 +1830,8 @@
     "lib": "057_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSNeuralNetwork.framework__default.metallib",
     "kind": "kernel",
     "total": 868,
-    "translate_ok": 274,
-    "ir3_ok": 274
+    "translate_ok": 282,
+    "ir3_ok": 282
    },
    {
     "lib": "058_System__Library__Frameworks__MetalPerformanceShaders.framework__Frameworks__MPSRayIntersector.framework__default.metallib",
@@ -1859,8 +1900,8 @@
     "lib": "061_System__Library__Frameworks__RoomPlan.framework__default.metallib",
     "kind": "vertex",
     "total": 3,
-    "translate_ok": 1,
-    "ir3_ok": 1
+    "translate_ok": 2,
+    "ir3_ok": 2
    },
    {
     "lib": "061_System__Library__Frameworks__RoomPlan.framework__default.metallib",
@@ -1873,22 +1914,22 @@
     "lib": "062_System__Library__Frameworks__SceneKit.framework__default.metallib",
     "kind": "fragment",
     "total": 130,
-    "translate_ok": 111,
-    "ir3_ok": 109
+    "translate_ok": 112,
+    "ir3_ok": 110
    },
    {
     "lib": "062_System__Library__Frameworks__SceneKit.framework__default.metallib",
     "kind": "kernel",
     "total": 139,
-    "translate_ok": 108,
-    "ir3_ok": 92
+    "translate_ok": 114,
+    "ir3_ok": 98
    },
    {
     "lib": "062_System__Library__Frameworks__SceneKit.framework__default.metallib",
     "kind": "vertex",
     "total": 68,
-    "translate_ok": 63,
-    "ir3_ok": 63
+    "translate_ok": 64,
+    "ir3_ok": 64
    },
    {
     "lib": "062_System__Library__Frameworks__SceneKit.framework__default.metallib",
@@ -1943,8 +1984,8 @@
     "lib": "067_System__Library__Frameworks__UIKit.framework__PlugIns__com.apple.UIKit.ColorPicker.appex__default.metallib",
     "kind": "fragment",
     "total": 1,
-    "translate_ok": 0,
-    "ir3_ok": 0
+    "translate_ok": 1,
+    "ir3_ok": 1
    },
    {
     "lib": "067_System__Library__Frameworks__UIKit.framework__PlugIns__com.apple.UIKit.ColorPicker.appex__default.metallib",
@@ -2223,8 +2264,8 @@
     "lib": "088_System__Library__PrivateFrameworks__CMImaging.framework__default.metallib",
     "kind": "kernel",
     "total": 144,
-    "translate_ok": 64,
-    "ir3_ok": 64
+    "translate_ok": 66,
+    "ir3_ok": 66
    },
    {
     "lib": "088_System__Library__PrivateFrameworks__CMImaging.framework__default.metallib",
@@ -2258,8 +2299,8 @@
     "lib": "090_System__Library__PrivateFrameworks__CameraColorProcessing.framework__default.metallib",
     "kind": "kernel",
     "total": 21,
-    "translate_ok": 9,
-    "ir3_ok": 9
+    "translate_ok": 11,
+    "ir3_ok": 11
    },
    {
     "lib": "091_System__Library__PrivateFrameworks__CameraEffectsKit.framework__default.metallib",
@@ -2321,8 +2362,8 @@
     "lib": "095_System__Library__PrivateFrameworks__CinematicFraming.framework__default.metallib",
     "kind": "kernel",
     "total": 13,
-    "translate_ok": 1,
-    "ir3_ok": 1
+    "translate_ok": 5,
+    "ir3_ok": 5
    },
    {
     "lib": "096_System__Library__PrivateFrameworks__ClockKitUI.framework__default.metallib",
@@ -2342,8 +2383,8 @@
     "lib": "097_System__Library__PrivateFrameworks__CoreOCModules.framework__default.metallib",
     "kind": "kernel",
     "total": 28,
-    "translate_ok": 15,
-    "ir3_ok": 15
+    "translate_ok": 19,
+    "ir3_ok": 19
    },
    {
     "lib": "097_System__Library__PrivateFrameworks__CoreOCModules.framework__default.metallib",
@@ -2419,8 +2460,8 @@
     "lib": "102_System__Library__PrivateFrameworks__CorePhotogrammetry.framework__Photogrammetry_Texturing_Kernels.metallib",
     "kind": "kernel",
     "total": 47,
-    "translate_ok": 42,
-    "ir3_ok": 42
+    "translate_ok": 44,
+    "ir3_ok": 44
    },
    {
     "lib": "102_System__Library__PrivateFrameworks__CorePhotogrammetry.framework__Photogrammetry_Texturing_Kernels.metallib",
@@ -2433,15 +2474,15 @@
     "lib": "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib",
     "kind": "fragment",
     "total": 154,
-    "translate_ok": 102,
-    "ir3_ok": 102
+    "translate_ok": 103,
+    "ir3_ok": 103
    },
    {
     "lib": "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib",
     "kind": "kernel",
     "total": 130,
-    "translate_ok": 95,
-    "ir3_ok": 95
+    "translate_ok": 104,
+    "ir3_ok": 104
    },
    {
     "lib": "103_System__Library__PrivateFrameworks__CoreRE.framework__default.metallib",
@@ -2489,8 +2530,8 @@
     "lib": "107_System__Library__PrivateFrameworks__DeepVideoProcessingCore.framework__opticalFlowMetalLib.metallib",
     "kind": "kernel",
     "total": 128,
-    "translate_ok": 95,
-    "ir3_ok": 95
+    "translate_ok": 97,
+    "ir3_ok": 97
    },
    {
     "lib": "107_System__Library__PrivateFrameworks__DeepVideoProcessingCore.framework__opticalFlowMetalLib.metallib",
@@ -2545,8 +2586,8 @@
     "lib": "111_System__Library__PrivateFrameworks__FMFindingUI.framework__default.metallib",
     "kind": "kernel",
     "total": 3,
-    "translate_ok": 1,
-    "ir3_ok": 1
+    "translate_ok": 3,
+    "ir3_ok": 3
    },
    {
     "lib": "112_System__Library__PrivateFrameworks__FRC.framework__default.metallib",
@@ -2559,8 +2600,8 @@
     "lib": "112_System__Library__PrivateFrameworks__FRC.framework__default.metallib",
     "kind": "kernel",
     "total": 84,
-    "translate_ok": 59,
-    "ir3_ok": 59
+    "translate_ok": 62,
+    "ir3_ok": 62
    },
    {
     "lib": "112_System__Library__PrivateFrameworks__FRC.framework__default.metallib",
@@ -2678,8 +2719,8 @@
     "lib": "122_System__Library__PrivateFrameworks__HearingTestUI.framework__default.metallib",
     "kind": "kernel",
     "total": 2,
-    "translate_ok": 0,
-    "ir3_ok": 0
+    "translate_ok": 1,
+    "ir3_ok": 1
    },
    {
     "lib": "123_System__Library__PrivateFrameworks__HomeAccessoryControlUI.framework__default.metallib",
@@ -2769,8 +2810,8 @@
     "lib": "130_System__Library__PrivateFrameworks__MagnifierSupport.framework__default.metallib",
     "kind": "fragment",
     "total": 3,
-    "translate_ok": 1,
-    "ir3_ok": 1
+    "translate_ok": 3,
+    "ir3_ok": 3
    },
    {
     "lib": "130_System__Library__PrivateFrameworks__MagnifierSupport.framework__default.metallib",
@@ -2972,8 +3013,8 @@
     "lib": "145_System__Library__PrivateFrameworks__PassKitUI.framework__default.metallib",
     "kind": "kernel",
     "total": 12,
-    "translate_ok": 5,
-    "ir3_ok": 5
+    "translate_ok": 8,
+    "ir3_ok": 8
    },
    {
     "lib": "146_System__Library__PrivateFrameworks__PassKitUIFoundation.framework__default.metallib",
@@ -3028,8 +3069,8 @@
     "lib": "152_System__Library__PrivateFrameworks__Portrait.framework__default.metallib",
     "kind": "kernel",
     "total": 184,
-    "translate_ok": 157,
-    "ir3_ok": 157
+    "translate_ok": 158,
+    "ir3_ok": 158
    },
    {
     "lib": "152_System__Library__PrivateFrameworks__Portrait.framework__default.metallib",
@@ -3049,29 +3090,29 @@
     "lib": "154_System__Library__PrivateFrameworks__Recon3D.framework__Reconstruction_Gpu_Shaders.metallib",
     "kind": "fragment",
     "total": 10,
-    "translate_ok": 7,
-    "ir3_ok": 7
+    "translate_ok": 8,
+    "ir3_ok": 8
    },
    {
     "lib": "154_System__Library__PrivateFrameworks__Recon3D.framework__Reconstruction_Gpu_Shaders.metallib",
     "kind": "kernel",
     "total": 35,
-    "translate_ok": 16,
-    "ir3_ok": 15
+    "translate_ok": 27,
+    "ir3_ok": 25
    },
    {
     "lib": "154_System__Library__PrivateFrameworks__Recon3D.framework__Reconstruction_Gpu_Shaders.metallib",
     "kind": "vertex",
     "total": 10,
-    "translate_ok": 9,
-    "ir3_ok": 9
+    "translate_ok": 10,
+    "ir3_ok": 10
    },
    {
     "lib": "156_System__Library__PrivateFrameworks__RenderBox.framework__default.metallib",
     "kind": "fragment",
     "total": 37,
-    "translate_ok": 3,
-    "ir3_ok": 3
+    "translate_ok": 4,
+    "ir3_ok": 4
    },
    {
     "lib": "156_System__Library__PrivateFrameworks__RenderBox.framework__default.metallib",
@@ -3105,8 +3146,8 @@
     "lib": "158_System__Library__PrivateFrameworks__SceneIntelligence.framework__default.metallib",
     "kind": "kernel",
     "total": 43,
-    "translate_ok": 36,
-    "ir3_ok": 36
+    "translate_ok": 37,
+    "ir3_ok": 37
    },
    {
     "lib": "158_System__Library__PrivateFrameworks__SceneIntelligence.framework__default.metallib",
@@ -3147,8 +3188,8 @@
     "lib": "163_System__Library__PrivateFrameworks__SiriUICore.framework__default.metallib",
     "kind": "fragment",
     "total": 19,
-    "translate_ok": 15,
-    "ir3_ok": 15
+    "translate_ok": 19,
+    "ir3_ok": 19
    },
    {
     "lib": "163_System__Library__PrivateFrameworks__SiriUICore.framework__default.metallib",
@@ -3259,8 +3300,8 @@
     "lib": "169_System__Library__PrivateFrameworks__VFX.framework__default.metallib",
     "kind": "fragment",
     "total": 192,
-    "translate_ok": 131,
-    "ir3_ok": 128
+    "translate_ok": 132,
+    "ir3_ok": 129
    },
    {
     "lib": "169_System__Library__PrivateFrameworks__VFX.framework__default.metallib",
@@ -3273,8 +3314,8 @@
     "lib": "169_System__Library__PrivateFrameworks__VFX.framework__default.metallib",
     "kind": "kernel",
     "total": 287,
-    "translate_ok": 212,
-    "ir3_ok": 199
+    "translate_ok": 217,
+    "ir3_ok": 204
    },
    {
     "lib": "169_System__Library__PrivateFrameworks__VFX.framework__default.metallib",
@@ -3315,8 +3356,8 @@
     "lib": "170_System__Library__PrivateFrameworks__VectorKit.framework__default.metallib",
     "kind": "vertex",
     "total": 154,
-    "translate_ok": 111,
-    "ir3_ok": 111
+    "translate_ok": 114,
+    "ir3_ok": 114
    },
    {
     "lib": "171_System__Library__PrivateFrameworks__VectorKit.framework__metal_libraries__AlloyCommonLibrary.metallib",
@@ -3371,8 +3412,8 @@
     "lib": "175_System__Library__PrivateFrameworks__VisionCore.framework__default.metallib",
     "kind": "kernel",
     "total": 6,
-    "translate_ok": 4,
-    "ir3_ok": 4
+    "translate_ok": 6,
+    "ir3_ok": 6
    },
    {
     "lib": "176_System__Library__PrivateFrameworks__VisionKitInternal.framework__default.metallib",
@@ -3532,8 +3573,8 @@
     "lib": "189_System__Library__VideoProcessors__FPDisparityV1.bundle__default.metallib",
     "kind": "kernel",
     "total": 25,
-    "translate_ok": 21,
-    "ir3_ok": 21
+    "translate_ok": 22,
+    "ir3_ok": 22
    },
    {
     "lib": "189_System__Library__VideoProcessors__FPDisparityV1.bundle__default.metallib",
@@ -3553,8 +3594,8 @@
     "lib": "190_System__Library__VideoProcessors__FPDisparityV3.bundle__default.metallib",
     "kind": "kernel",
     "total": 24,
-    "translate_ok": 20,
-    "ir3_ok": 20
+    "translate_ok": 21,
+    "ir3_ok": 21
    },
    {
     "lib": "190_System__Library__VideoProcessors__FPDisparityV3.bundle__default.metallib",
@@ -3602,15 +3643,15 @@
     "lib": "195_System__Library__VideoProcessors__UB.bundle__default.metallib",
     "kind": "fragment",
     "total": 22,
-    "translate_ok": 10,
-    "ir3_ok": 10
+    "translate_ok": 18,
+    "ir3_ok": 18
    },
    {
     "lib": "195_System__Library__VideoProcessors__UB.bundle__default.metallib",
     "kind": "kernel",
     "total": 100,
-    "translate_ok": 68,
-    "ir3_ok": 68
+    "translate_ok": 69,
+    "ir3_ok": 69
    },
    {
     "lib": "195_System__Library__VideoProcessors__UB.bundle__default.metallib",

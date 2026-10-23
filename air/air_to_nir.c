@@ -3310,6 +3310,13 @@ val_holds_ptr(const struct air_val *v)
  * phis are all keyed on this function's own objects, and leaving the caller's
  * entries in place would let a callee resolve a value it cannot see.
  */
+/* A pointer argument carrying a computed byte offset: its offset goes through the call as a parameter of its own */
+static bool
+ptr_offset_arg(struct air_val **argv, unsigned i)
+{
+   return argv && argv[i] && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset;
+}
+
 static nir_function *
 translate_callee(struct air_ctx *c, const struct air_function *f,
                  struct air_val **argv, bool *is_param)
@@ -3336,11 +3343,9 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
        */
       bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
                                      val_holds_ptr(argv[i]));
-      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
-         air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
-                      "argument %u, which would use the caller's own value here", i);
-         return NULL;
-      }
+      /* Bergamota: a pointer at a computed byte offset binds like any pointer (the resource is the caller's resolution), and its
+       * OFFSET, a def of the caller's impl, travels as an extra 32-bit parameter after the others (see ptr_offset_arg) and is the
+       * callee's offset again inside. */
       /* The same reason, for the two pointers that are values: a chosen
        * pointer's condition is a def of the CALLER's impl, and a slot's
        * soundness rests on every use being in one block of one function.
@@ -3381,7 +3386,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    } else if (has_ret) {
       nret = 1;
    }
-   unsigned nparams = f->num_args + nret;
+   unsigned noff = 0;
+   for (unsigned i = 0; i < f->num_args; i++)
+      noff += ptr_offset_arg(argv, i);
+   unsigned nparams = f->num_args + nret + noff;
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -3418,7 +3426,12 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          .bit_size = (uint8_t)air_nir_bit_size(c, at),
       };
    }
-   fn->num_params = idx;   /* the pointers took no parameter */
+   for (unsigned i = 0; i < f->num_args; i++) {
+      if (!ptr_offset_arg(argv, i))
+         continue;
+      fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };   /* the pointer's byte offset */
+   }
+   fn->num_params = idx;   /* the pointers took no parameter of their own */
 
    /* cached before the body is translated, so that a callee which calls itself
     * meets its own declaration rather than being translated for ever */
@@ -3481,8 +3494,18 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
                                           nir_var_function_temp, ret_glsl, 0);
    }
    unsigned pidx = nret;
+   unsigned nreal = 0;
+   for (unsigned i = 0; i < f->num_args; i++)
+      nreal += is_param[i];
+   unsigned oidx = nret + nreal;
    for (unsigned i = 0; i < f->num_args && ok; i++) {
       if (!is_param[i]) {
+         if (ptr_offset_arg(argv, i)) {
+            struct air_val *pv = clone_val(c, argv[i]);
+            pv->ptr.offset = nir_load_param(&c->b, oidx++);   /* the offset, now this function's own */
+            air_set(c, &f->args[i], pv);
+            continue;
+         }
          air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
          continue;
       }
@@ -3585,6 +3608,9 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
                           i, name);
       call->params[idx++] = nir_src_for_ssa(a);
    }
+   for (unsigned i = 0; i < f->num_args; i++)
+      if (ptr_offset_arg(argv, i))
+         call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
    nir_builder_instr_insert(&c->b, &call->instr);
 
    if (ret_struct) {
@@ -3776,6 +3802,9 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
          return air_error(c, "library: argument %u has no value to pass", i);
       call->params[idx++] = nir_src_for_ssa(a);
    }
+   for (unsigned i = 0; i < f->num_args; i++)
+      if (ptr_offset_arg(argv, i))
+         call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
    nir_builder_instr_insert(&c->b, &call->instr);
 
    struct air_ptr out = { .class = AIR_PTR_SSBO, .binding = 1, .pointee = rt };
