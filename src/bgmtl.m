@@ -1147,7 +1147,8 @@ bg_air_slice(NSData *d)
       [_scheduled removeAllObjects];
    }
    static int sync_commit = -1;     // BGMTL_SYNC=1 (the inject sets it when /private/var/tmp/bgmtl-bb.sync exists): wait inline, as before
-   if (sync_commit < 0) sync_commit = getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1';
+   if (sync_commit < 0)   // or /private/var/tmp/bgmtl.sync for every process (posters, plugin clients) launchd starts
+      sync_commit = (getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1') || access("/private/var/tmp/bgmtl.sync", F_OK) == 0;
    if (bg_trace() || sync_commit || _status == 5) {
       if (_status != 5 && rwa_fence_wait([dev rwa], fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
@@ -1207,6 +1208,26 @@ bg_air_slice(NSData *d)
          IOSurfaceLock((IOSurfaceRef)surf, 0, NULL);
          IOSurfaceUnlock((IOSurfaceRef)surf, 0, NULL);
       }
+   }
+   /*
+    * The compositor: one texel of each IOSurface it drew into is read back once the work has completed (a CPU map of the
+    * surface through freedreno, which flushes and waits for whatever still writes it). Without it the wallpaper area of the
+    * lock and home screens stayed black or grey whenever this process committed without the trace (whose readback of every
+    * attachment is how the difference showed: IOSurface attachments alone were enough). Cheap next to the full cache clean
+    * skipped above: a 1x1 map of a surface whose fence is already paid.
+    */
+   if (_status == 4 && in_compositor) {
+      NSMutableSet *seen = nil;
+      for (BGWork *w in _work)
+         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
+            for (unsigned i = 0; i < w->color_count; i++) {
+               BGMTLTexture *t = (BGMTLTexture *)w->color[i];
+               if (!t || ![t iosurface] || [seen containsObject:t]) continue;
+               if (!seen) seen = [NSMutableSet set];
+               [seen addObject:t];
+               uint8_t px[16];
+               [t getBytes:px bytesPerRow:sizeof(px) fromRegion:MTLRegionMake2D([t width] / 2, [t height] / 2, 1, 1) mipmapLevel:0];
+            }
    }
    if (bg_trace() && _status == 4) {   // what each colour attachment holds now: five texels, centre and quarter points
       NSMutableArray *seen = [NSMutableArray array];
