@@ -1419,7 +1419,28 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
          free(texture);
          return NULL;
       }
-      int sr = sweet_drm_surface_bo(-1, &sb);
+      /* Chlorophyll: QuartzCore wraps the same IOSurfaces in textures many times a frame, and SURFACE_BO plus the first-use
+       * cache clean are two kernel round trips each (45 % of backboardd's time on the Metal compositor). The kernel's answer
+       * is cached per surface ID together with a reference to the first resource made from it, which keeps that GEM handle
+       * open, so a later import of the same surface asks the kernel nothing and freedreno's handle table hands back the same
+       * BO. IOSurface IDs come from an increasing counter; the size and pixel format are part of the key besides. */
+      enum { SBO_CACHE = 128 };
+      static struct { struct rwa_device *dev; int id; unsigned w, h; enum pipe_format f; struct rwa_sbo sb; struct pipe_resource *res;
+                      uint64_t used; } sbo_cache[SBO_CACHE];
+      static uint64_t sbo_clock;
+      int sbo_slot = -1, sbo_victim = 0;
+      for (int k = 0; k < SBO_CACHE; k++) {
+         if (sbo_cache[k].res && sbo_cache[k].dev == device && sbo_cache[k].id == import->id && sbo_cache[k].w == width &&
+             sbo_cache[k].h == height && sbo_cache[k].f == fmt->pipe) { sbo_slot = k; break; }
+         if (!sbo_cache[k].res || sbo_cache[k].used < sbo_cache[sbo_victim].used) sbo_victim = k;
+      }
+      int sr = 0;
+      if (sbo_slot >= 0) {
+         sb = sbo_cache[sbo_slot].sb;
+         sbo_cache[sbo_slot].used = ++sbo_clock;
+      } else {
+         sr = sweet_drm_surface_bo(-1, &sb);
+      }
       if (sr != 0 || sb.planes > 1 || sb.bytes_per_row == 0) {
          say(why, why_size, "the kernel would not describe IOSurface %d (error %d, planes %u, %u bytes a row): it knows nothing of an ID that "
                             "was never made shareable", import->id, sr, sb.planes, sb.bytes_per_row);
@@ -1494,8 +1515,14 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
 
       texture->res = device->screen->resource_from_handle(device->screen, &templ, &whandle,
                                                           PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
-      if (texture->res)
+      if (texture->res && sbo_slot < 0) {
          sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);   /* clean the CPU's dirty lines before the GPU first writes */
+         pipe_resource_reference(&sbo_cache[sbo_victim].res, NULL);  /* evict the least recently used entry */
+         sbo_cache[sbo_victim].dev = device; sbo_cache[sbo_victim].id = import->id; sbo_cache[sbo_victim].w = width;
+         sbo_cache[sbo_victim].h = height; sbo_cache[sbo_victim].f = fmt->pipe; sbo_cache[sbo_victim].sb = sb;
+         sbo_cache[sbo_victim].used = ++sbo_clock;
+         pipe_resource_reference(&sbo_cache[sbo_victim].res, texture->res);
+      }
       if (!texture->res) {
          /*
           * Everything this side could check has been checked, so no reason is invented
@@ -3749,6 +3776,15 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             cb.buffer = b->res;
          } else {
             size_t want = r->size && r->size <= left ? r->size : left;
+            /* An UNSIZED constant pointer (no air.buffer_size: QuartzCore's texture_matrix, lod_bias) used to upload
+             * everything from the offset to the end of the buffer -- CoreAnimation's are one 256 KB allocation, so each
+             * such binding copied ~256 KB on every draw: 65 % of backboardd's time in the first live run, ~90 ms a frame.
+             * 4 KB is far beyond what those read; RWA_UNSIZED_CB overrides it. */
+            if (!r->size) {
+               static size_t cap;
+               if (!cap) cap = getenv("RWA_UNSIZED_CB") ? (size_t)strtoul(getenv("RWA_UNSIZED_CB"), NULL, 0) : 4096;
+               if (want > cap) want = cap;
+            }
 
             cb.user_buffer = (const char *)b->map + boffset;
             cb.buffer_offset = 0;
@@ -7211,7 +7247,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * come back (docs/air.md section 5). A link error between the stages, which ir3 only
     * finds now, surfaces as this not finishing.
     */
-   rc = finish_or_say_why(device, true, "draw", why, why_size);
+   /* Chlorophyll: waiting here costs a GPU round trip PER DRAW, which the compositor cannot afford (21 % of backboardd's
+    * time, dozens of draws a frame). The caller waits once at the end of its command buffer (rwa_finish), every resource of
+    * the draw stays referenced until then, and a failure still surfaces there; RWA_DRAW_FINISH=1 brings the per-draw wait
+    * back for finding which draw a hang belongs to. */
+   static int per_draw = -1;
+   if (per_draw < 0) per_draw = getenv("RWA_DRAW_FINISH") && getenv("RWA_DRAW_FINISH")[0] == '1';
+   rc = per_draw ? finish_or_say_why(device, true, "draw", why, why_size) : 0;
 
 unbind:
    unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);

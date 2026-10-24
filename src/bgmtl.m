@@ -1033,7 +1033,12 @@ bg_air_slice(NSData *d)
    else if (_status != 5)
       _status = 4;   // Completed: the fence has been paid
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
-   if (_status == 4) {
+   // In the compositor (backboardd, BGMTL_BB) the IOSurfaces drawn into are its own framebuffers: the GPU writes DRAM, the display
+   // reads DRAM, the CPU never touches them, so neither the cache clean nor the seed bump below is needed -- and each was a kernel
+   // round trip per attachment per commit over 10 MB surfaces (the largest cost in the first Metal-compositor profiles).
+   static int in_compositor = -1;
+   if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
+   if (_status == 4 && !in_compositor) {
       NSMutableSet *written = nil;
       for (BGWork *w in _work)
          if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
