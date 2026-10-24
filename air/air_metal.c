@@ -887,6 +887,39 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    { 124, "MTLPixelFormatRGBA32Sint",      PIPE_FORMAT_R32G32B32A32_SINT },
    { 125, "MTLPixelFormatRGBA32Float",     PIPE_FORMAT_R32G32B32A32_FLOAT },
 
+   /* ASTC LDR (sRGB 186-199, linear 204-217, the same fourteen block sizes in the same order). The Adreno 630
+    * samples them natively; CoreAnimation keeps app snapshots and wallpapers in ASTC 4x4, and declining them left
+    * the app switcher's cards black. Rows of these are rows of blocks: see caller_stride. HDR (222 and up) stays out.
+    */
+   { 186, "MTLPixelFormatASTC_4x4_sRGB", PIPE_FORMAT_ASTC_4x4_SRGB },
+   { 187, "MTLPixelFormatASTC_5x4_sRGB", PIPE_FORMAT_ASTC_5x4_SRGB },
+   { 188, "MTLPixelFormatASTC_5x5_sRGB", PIPE_FORMAT_ASTC_5x5_SRGB },
+   { 189, "MTLPixelFormatASTC_6x5_sRGB", PIPE_FORMAT_ASTC_6x5_SRGB },
+   { 190, "MTLPixelFormatASTC_6x6_sRGB", PIPE_FORMAT_ASTC_6x6_SRGB },
+   { 191, "MTLPixelFormatASTC_8x5_sRGB", PIPE_FORMAT_ASTC_8x5_SRGB },
+   { 192, "MTLPixelFormatASTC_8x6_sRGB", PIPE_FORMAT_ASTC_8x6_SRGB },
+   { 193, "MTLPixelFormatASTC_8x8_sRGB", PIPE_FORMAT_ASTC_8x8_SRGB },
+   { 194, "MTLPixelFormatASTC_10x5_sRGB", PIPE_FORMAT_ASTC_10x5_SRGB },
+   { 195, "MTLPixelFormatASTC_10x6_sRGB", PIPE_FORMAT_ASTC_10x6_SRGB },
+   { 196, "MTLPixelFormatASTC_10x8_sRGB", PIPE_FORMAT_ASTC_10x8_SRGB },
+   { 197, "MTLPixelFormatASTC_10x10_sRGB", PIPE_FORMAT_ASTC_10x10_SRGB },
+   { 198, "MTLPixelFormatASTC_12x10_sRGB", PIPE_FORMAT_ASTC_12x10_SRGB },
+   { 199, "MTLPixelFormatASTC_12x12_sRGB", PIPE_FORMAT_ASTC_12x12_SRGB },
+   { 204, "MTLPixelFormatASTC_4x4_LDR", PIPE_FORMAT_ASTC_4x4 },
+   { 205, "MTLPixelFormatASTC_5x4_LDR", PIPE_FORMAT_ASTC_5x4 },
+   { 206, "MTLPixelFormatASTC_5x5_LDR", PIPE_FORMAT_ASTC_5x5 },
+   { 207, "MTLPixelFormatASTC_6x5_LDR", PIPE_FORMAT_ASTC_6x5 },
+   { 208, "MTLPixelFormatASTC_6x6_LDR", PIPE_FORMAT_ASTC_6x6 },
+   { 209, "MTLPixelFormatASTC_8x5_LDR", PIPE_FORMAT_ASTC_8x5 },
+   { 210, "MTLPixelFormatASTC_8x6_LDR", PIPE_FORMAT_ASTC_8x6 },
+   { 211, "MTLPixelFormatASTC_8x8_LDR", PIPE_FORMAT_ASTC_8x8 },
+   { 212, "MTLPixelFormatASTC_10x5_LDR", PIPE_FORMAT_ASTC_10x5 },
+   { 213, "MTLPixelFormatASTC_10x6_LDR", PIPE_FORMAT_ASTC_10x6 },
+   { 214, "MTLPixelFormatASTC_10x8_LDR", PIPE_FORMAT_ASTC_10x8 },
+   { 215, "MTLPixelFormatASTC_10x10_LDR", PIPE_FORMAT_ASTC_10x10 },
+   { 216, "MTLPixelFormatASTC_12x10_LDR", PIPE_FORMAT_ASTC_12x10 },
+   { 217, "MTLPixelFormatASTC_12x12_LDR", PIPE_FORMAT_ASTC_12x12 },
+
    /* Depth and stencil. These are in the same table because a depth texture is a
     * texture (air_metal.h) and every caller asks for one the same way; what the format
     * changes is which binding it can have and how its texels are read, and both of
@@ -1023,8 +1056,8 @@ pixel_format_refusal(unsigned f)
       return "one of the EAC or ETC2 compressed formats, whose texels come in blocks this "
              "library cannot make";
    if (f >= 186 && f <= 236)
-      return "one of the ASTC compressed formats, whose texels come in blocks this library "
-             "cannot make";
+      return "one of the ASTC HDR formats (the LDR ones are served), which this GPU does not "
+             "decode";
    if (f == 240 || f == 241)
       return "one of Metal's packed 4:2:2 video formats (GBGR422, BGRG422), where one block "
              "holds two texels and a region in texels is not a region in bytes";
@@ -1720,8 +1753,9 @@ static bool
 caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, size_t stride,
               size_t *out, char *why, size_t why_size)
 {
+   /* A row is a row of blocks: one texel for the plain formats, a 4x4 (or larger) block for ASTC. */
    unsigned texel = util_format_get_blocksize(texture->res->format);
-   size_t least = (size_t)box->width * texel;
+   size_t least = (size_t)util_format_get_nblocksx(texture->res->format, box->width) * texel;
    if (stride == 0) {
       *out = least;
       return true;
@@ -1802,7 +1836,7 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
     */
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
-                                          row * box.height);
+                                          row * util_format_get_nblocksy(texture->res->format, box.height));
    return 0;
 }
 
