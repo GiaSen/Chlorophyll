@@ -4068,6 +4068,37 @@ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
    return finish_or_say_why(device, false, "work", why, why_size);
 }
 
+/* Chlorophyll: asynchronous completion. rwa_flush submits what the context holds and returns its fence (NULL when nothing
+ * was queued); rwa_fence_wait may be called from ANOTHER thread, since it uses only the screen (fence_finish with no
+ * context), which is how a command buffer's completion runs off the encoding thread; rwa_fence_release drops it. */
+struct rwa_fence *
+rwa_flush(struct rwa_device *device)
+{
+   struct pipe_fence_handle *fence = NULL;
+   device->pipe->flush(device->pipe, &fence, 0);
+   return (struct rwa_fence *)fence;
+}
+
+int
+rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, size_t why_size)
+{
+   if (!fence)
+      return 0;
+   if (!device->screen->fence_finish(device->screen, NULL, (struct pipe_fence_handle *)fence, RWA_FENCE_TIMEOUT_NS)) {
+      say(why, why_size, "the GPU did not finish the work within the fence timeout");
+      return -1;
+   }
+   return 0;
+}
+
+void
+rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence)
+{
+   struct pipe_fence_handle *f = (struct pipe_fence_handle *)fence;
+   if (f)
+      device->screen->fence_reference(device->screen, &f, NULL);
+}
+
 /*
  * ---------------------------------------------------------------------------------------
  * Drawing.
@@ -6014,6 +6045,42 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen 
    return true;
 }
 
+/* Chlorophyll: an unsized constant pointer (no air.buffer_size) whose every read has a constant offset is given the exact
+ * size it reads, so the upload a misaligned binding needs copies those bytes and not a 4 KB cap (CoreAnimation's
+ * texture_matrix reads 16, lod_bias 4, and the copies were the largest cost left in the Metal compositor). A pointer read
+ * at a computed offset keeps size 0 and the cap. */
+static void
+size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
+{
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      struct air_resource *r = &info->resources[i];
+      if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER || r->size)
+         continue;
+      unsigned end = 0;
+      bool bounded = true;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+               if (in->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(in->src[0]) ||
+                   nir_src_as_uint(in->src[0]) != r->index)
+                  continue;
+               if (!nir_src_is_const(in->src[1])) {
+                  bounded = false;
+                  continue;
+               }
+               unsigned e = (unsigned)nir_src_as_uint(in->src[1]) + in->def.num_components * in->def.bit_size / 8;
+               end = MAX2(end, e);
+            }
+         }
+      }
+      if (bounded && end)
+         r->size = end;
+   }
+}
+
 struct rwa_render *
 rwa_render_create(struct rwa_device *device,
                   const void *vertex_bitcode, size_t vertex_size,
@@ -6368,6 +6435,10 @@ rwa_render_create(struct rwa_device *device,
          var->data.location_frac = out->component;
       }
    }
+
+   size_unsized_constants(fs, &render->finfo);
+   if (!render->generated_vertex)
+      size_unsized_constants(vs, &render->vinfo);
 
    /* Compile both stages now. A failure here is a creation failure and says so; the
     * stages are linked later, at the draw.

@@ -266,6 +266,7 @@ bg_install_fallback(Class c)
    NSError *_error;
    NSInteger _status;
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
+   dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgRecord:(BGWork *)work;
@@ -872,12 +873,14 @@ bg_air_slice(NSData *d)
    _completed = [[NSMutableArray alloc] init];
    _scheduled = [[NSMutableArray alloc] init];
    _presents = [[NSMutableArray alloc] init];
+   _done = dispatch_group_create();
    _status = 1;   // MTLCommandBufferStatusEnqueued
    return self;
 }
 - (void)dealloc
 {
    [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
+   if (_done) dispatch_release(_done);
    [super dealloc];
 }
 - (id)device { return [_queue device]; }
@@ -888,7 +891,7 @@ bg_air_slice(NSData *d)
 - (void)addScheduledHandler:(void (^)(id))block
 {
    if (!block) return;
-   if (_status >= 3) block(self); else [_scheduled addObject:[[block copy] autorelease]];   // delivered when the work has been submitted, not before
+   if (_status >= 3) block(self); else [_scheduled addObject:[[block copy] autorelease]];   // delivered when submitted (compositor: when finished)
 }
 - (void)presentDrawable:(id)drawable { if (drawable) [_presents addObject:@[ drawable, @0.0, @0.0 ]]; }
 - (void)presentDrawable:(id)drawable atTime:(CFTimeInterval)t { if (drawable) [_presents addObject:@[ drawable, @(t), @0.0 ]]; }
@@ -898,7 +901,7 @@ bg_air_slice(NSData *d)
    if (!block) return;
    if (_status >= 4) block(self); else [_completed addObject:[[block copy] autorelease]];
 }
-- (void)waitUntilScheduled {}
+- (void)waitUntilScheduled { if (_status >= 2 && getenv("BGMTL_BB")) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
 
 - (void)bgFailWith:(NSString *)why code:(NSInteger)code
 {
@@ -1025,13 +1028,58 @@ bg_air_slice(NSData *d)
             memset((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, w->fill, w->size);
       }
    }
-   if (_status != 5) {
+   // Asynchronous completion (Chlorophyll: CPU and GPU overlap, as Metal's own do): the work is submitted and its fence handed to
+   // a serial completion queue, which waits for it and then runs what follows a completed command buffer (surface sync, presents,
+   // completed handlers), in submission order. BGMTL_TRACE keeps it synchronous: the trace reads attachments back through the
+   // drawing context, which belongs to the encoding thread.
+   dispatch_group_enter(_done);
+   // In the compositor "scheduled" is reported only when the GPU has FINISHED: the render server hands a framebuffer to the
+   // display from the scheduled notification / waitUntilScheduled, and this display path has no GPU write fence on the surface,
+   // so an earlier notice let the panel scan a half-drawn buffer (its previous frame showed: motion stepping back and forth).
+   // The encoding of the next frame still overlaps the GPU; only the hand-off waits.
+   static int defer_scheduled = -1;
+   if (defer_scheduled < 0) defer_scheduled = getenv("BGMTL_BB") != NULL;
+   if (_status != 5 && !defer_scheduled)
       _status = 3;   // Scheduled
+   struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
+   if (!defer_scheduled) {
+      for (void (^h)(id) in _scheduled) h(self);
+      [_scheduled removeAllObjects];
    }
-   if (_status != 5 && rwa_finish([dev rwa], why, sizeof(why)) != 0)
-      [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
-   else if (_status != 5)
-      _status = 4;   // Completed: the fence has been paid
+   if (bg_trace() || _status == 5) {
+      if (_status != 5 && rwa_fence_wait([dev rwa], fence, why, sizeof(why)) != 0)
+         [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
+      else if (_status != 5)
+         _status = 4;
+      rwa_fence_release([dev rwa], fence);
+      [self bgCompleteFrom:t_begin];
+      dispatch_group_leave(_done);
+      return;
+   }
+   static dispatch_queue_t completion;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{ completion = dispatch_queue_create("chlorophyll.completion", DISPATCH_QUEUE_SERIAL); });
+   [self retain];
+   dispatch_async(completion, ^{
+      char w2[512] = { 0 };
+      if (rwa_fence_wait([dev rwa], fence, w2, sizeof(w2)) != 0)
+         [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
+      else
+         _status = 4;   // Completed: the fence has been paid
+      rwa_fence_release([dev rwa], fence);
+      [self bgCompleteFrom:t_begin];
+      dispatch_group_leave(_done);
+      [self release];
+   });
+}
+
+// What follows a completed (or failed) command buffer; run by the completion queue, or inline when tracing.
+- (void)bgCompleteFrom:(uint64_t)t_begin
+{
+   BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
+   (void)dev;
+   for (void (^h)(id) in _scheduled) h(self);    // left here by the compositor's deferral (see commit)
+   [_scheduled removeAllObjects];
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
    // In the compositor (backboardd, BGMTL_BB) the IOSurfaces drawn into are its own framebuffers: the GPU writes DRAM, the display
    // reads DRAM, the CPU never touches them, so neither the cache clean nor the seed bump below is needed -- and each was a kernel
@@ -1076,8 +1124,6 @@ bg_air_slice(NSData *d)
          BG_LOG("  attachment %p %ux%u:%s\n", t, wd, ht, line);
       }
    }
-   for (void (^h)(id) in _scheduled) h(self);
-   [_scheduled removeAllObjects];
    if (_status == 4 && [_presents count]) {
       // per-present diagnostics: what this command buffer drew, how long it took, and whether the picture it presents is black. Five texels of
       // the last colour attachment (linear 8-bit formats only) are read back; this costs five tiny CPU reads of memory the fence already paid for.
@@ -1090,7 +1136,7 @@ bg_air_slice(NSData *d)
       }
       double luma = -1;
       unsigned wd = 0, ht = 0;
-      if (last && ([last pixelFormat] == MTLPixelFormatBGRA8Unorm || [last pixelFormat] == MTLPixelFormatRGBA8Unorm ||
+      if (bg_trace() && last && ([last pixelFormat] == MTLPixelFormatBGRA8Unorm || [last pixelFormat] == MTLPixelFormatRGBA8Unorm ||
                    [last pixelFormat] == MTLPixelFormatBGRA8Unorm_sRGB)) {
          wd = (unsigned)[last width]; ht = (unsigned)[last height];
          const unsigned pts[5][2] = { { wd / 2, ht / 2 }, { wd / 4, ht / 4 }, { 3 * wd / 4, ht / 4 }, { wd / 4, 3 * ht / 4 }, { 3 * wd / 4, 3 * ht / 4 } };
@@ -1124,7 +1170,7 @@ bg_air_slice(NSData *d)
    [_completed removeAllObjects];
 }
 
-- (void)waitUntilCompleted {}   // commit is synchronous in this spike: it returns after the fence
+- (void)waitUntilCompleted { if (_status >= 2) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
 
 - (id)computeCommandEncoder { return [[[BGMTLComputeEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
 - (id)computeCommandEncoderWithDescriptor:(id)d { (void)d; return [self computeCommandEncoder]; }
