@@ -102,6 +102,30 @@ make_scene(int n)
       }
       break;
    }
+   case 6: {   // a material: stripes behind a CABackdropLayer with blur + saturation and a translucent tint (an iOS platter)
+      for (int i = 0; i < 8; i++) {
+         CALayer *l = [CALayer layer];
+         l.frame = CGRectMake(i * 32, 0, 16, H);
+         l.backgroundColor = CGColorCreateGenericRGB(i & 1 ? 1 : 0.1, i & 2 ? 0.8 : 0.2, i & 4 ? 0.9 : 0.1, 1);
+         [root addSublayer:l];
+      }
+      Class bd = NSClassFromString(@"CABackdropLayer"), cf = NSClassFromString(@"CAFilter");
+      if (bd && cf) {
+         CALayer *b = [bd layer];
+         b.frame = CGRectMake(32, 32, 192, 192);
+         id blur = [cf performSelector:NSSelectorFromString(@"filterWithType:") withObject:@"gaussianBlur"];
+         [blur setValue:@12 forKey:@"inputRadius"];
+         id sat = [cf performSelector:NSSelectorFromString(@"filterWithType:") withObject:@"colorSaturate"];
+         [sat setValue:@1.8 forKey:@"inputAmount"];
+         b.filters = @[ blur, sat ];
+         [root addSublayer:b];
+         CALayer *tint = [CALayer layer];
+         tint.frame = b.frame;
+         tint.backgroundColor = CGColorCreateGenericRGB(1, 1, 1, 0.3);
+         [root addSublayer:tint];
+      }
+      break;
+   }
    }
    return root;
 }
@@ -160,7 +184,7 @@ main(int argc, char **argv)
       printf("default device: %s\n", d ? [[d name] UTF8String] : "nil");
       if (!d) return 2;
       int bad = 0, done = 0;
-      for (int n = 0; n < 6; n++) {
+      for (int n = 0; n < 7; n++) {
          if (only >= 0 && n != only) continue;
          CALayer *scene = make_scene(n);
          // the reference: CoreAnimation's CPU path into a bitmap

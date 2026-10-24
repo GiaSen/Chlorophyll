@@ -583,6 +583,8 @@ struct rwa_fence;
 struct rwa_fence *rwa_flush(struct rwa_device *device);
 int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why, size_t why_size);
 void rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence);
+int rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, const unsigned so[3],
+                     struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3], const unsigned size[3]);
 
 /*
  * ---------------------------------------------------------------------------------------

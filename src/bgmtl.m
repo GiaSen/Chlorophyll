@@ -17,6 +17,7 @@
 #import <Foundation/Foundation.h>
 #include <libkern/OSByteOrder.h>
 #include <os/lock.h>
+#include <pthread.h>
 #include <Block.h>
 #include <sys/stat.h>
 #import <Metal/Metal.h>
@@ -84,6 +85,22 @@ bg_trace(void)
    return t;
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
+
+// One Gallium context serves every thread of the process, and QuartzCore commits from several (the render thread and
+// com.apple.coreanimation.asynchronous at once crashed in fd6_draw_vbos). Every call that reaches the context runs under this
+// recursive lock; only the fence wait of the completion queue stays outside (it uses the screen).
+static pthread_mutex_t bg_ctx_mutex;
+static void
+bg_ctx_init(void)
+{
+   pthread_mutexattr_t a;
+   pthread_mutexattr_init(&a);
+   pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+   pthread_mutex_init(&bg_ctx_mutex, &a);
+   pthread_mutexattr_destroy(&a);
+}
+static void bg_lock(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, bg_ctx_init); pthread_mutex_lock(&bg_ctx_mutex); }
+static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
 #define BG_MAX_BINDINGS 16
 
@@ -300,10 +317,14 @@ bg_install_fallback(Class c)
    @public
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
+   const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
+   NSUInteger _ncLength;
+   void (^_ncDealloc)(void *, NSUInteger);
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
 - (struct rwa_texture *)rwaTexture;
+- (struct rwa_texture *)rwaTextureSampled;   // also cleans the CPU cache of a surface another process wrote since
 @end
 
 @interface BGMTLSampler : _MTLSamplerState {
@@ -617,6 +638,18 @@ bg_air_slice(NSData *d)
    return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d];
 }
 
+// A texture over the caller's memory (QuartzCore's CPU-drawn images): a texture of our own, refreshed from those bytes at each use
+// (rows of length / height bytes), and the deallocator called when it is freed.
+- (id)newTextureWithBytesNoCopy:(void *)p length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *, NSUInteger))dealloc
+{
+   BGMTLTexture *t = [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d];
+   if (!t) return nil;
+   t->_ncBytes = p;
+   t->_ncLength = length;
+   t->_ncDealloc = dealloc ? Block_copy(dealloc) : NULL;
+   return t;
+}
+
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane
 {
    return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d iosurface:surface plane:plane];
@@ -704,11 +737,13 @@ bg_air_slice(NSData *d)
    char why[512] = { 0 };
    struct rwa_render_info info;
    memset(&info, 0, sizeof(info));
+   bg_lock();
    struct rwa_render *r = rwa_render_create(_rwa, vair ? vair.bytes : NULL, vair ? vair.length : 0, vertex ? [[vertex name] UTF8String] : NULL, fair.bytes, fair.length,
                                             [[fragment name] UTF8String], &shape, &info, why, sizeof(why));
+   bg_unlock();
    if (!r) return [self bgFail:error with:[NSString stringWithUTF8String:why]];
    BGMTLRenderPipeline *p = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
-   if (!p) { rwa_render_destroy(r); return [self bgFail:error with:@"_MTLRenderPipelineState refused to initialise"]; }
+   if (!p) { bg_lock(); rwa_render_destroy(r); bg_unlock(); return [self bgFail:error with:@"_MTLRenderPipelineState refused to initialise"]; }
    p->_owner = self; p->_render = r; p->_info = info;
    {
       char dwhy[128] = { 0 };
@@ -733,10 +768,12 @@ bg_air_slice(NSData *d)
    if (!air.length) return [self bgFail:error with:@"function has no bitcode"];
    char why[512] = { 0 };
    struct rwa_compute_info info = { 0 };
+   bg_lock();
    struct rwa_compute *c = rwa_compute_create(_rwa, air.bytes, air.length, [[function name] UTF8String], &info, why, sizeof(why));
+   bg_unlock();
    if (!c) return [self bgFail:error with:[NSString stringWithUTF8String:why]];
    BGMTLComputePipeline *p = [[BGMTLComputePipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
-   if (!p) { rwa_compute_destroy(c); return [self bgFail:error with:@"_MTLComputePipelineState refused to initialise"]; }
+   if (!p) { bg_lock(); rwa_compute_destroy(c); bg_unlock(); return [self bgFail:error with:@"_MTLComputePipelineState refused to initialise"]; }
    p->_owner = self;
    p->_compute = c;
    p->_info = info;
@@ -778,7 +815,9 @@ bg_air_slice(NSData *d)
    if (!self) return nil;
    char why[256] = { 0 };
    if (![device rwa] || !length) { BG_LOG("buffer of %lu bytes: no GPU device\n", (unsigned long)length); [self release]; return nil; }
+   bg_lock();
    _buf = rwa_buffer_create([device rwa], length, why, sizeof(why));
+   bg_unlock();
    if (!_buf) { BG_LOG("rwa_buffer_create(%lu): %s\n", (unsigned long)length, why); [self release]; return nil; }
    _owner = device;
    _length = length;
@@ -800,7 +839,7 @@ bg_air_slice(NSData *d)
 }
 - (void)dealloc
 {
-   if (_buf) rwa_buffer_destroy(_buf);
+   if (_buf) { bg_lock(); rwa_buffer_destroy(_buf); bg_unlock(); }
    if (_deallocator) { _deallocator(_contents, _length); Block_release(_deallocator); }
    [super dealloc];
 }
@@ -839,7 +878,7 @@ bg_air_slice(NSData *d)
 // ---- pipeline --------------------------------------------------------------------------------------------------------
 @implementation BGMTLComputePipeline
 + (void)load { ensure_protocol(self, "MTLComputePipelineState"); }
-- (void)dealloc { if (_compute) rwa_compute_destroy(_compute); [super dealloc]; }
+- (void)dealloc { bg_lock(); if (_compute) rwa_compute_destroy(_compute); bg_unlock(); [super dealloc]; }
 - (id)device { return _owner; }
 - (NSUInteger)maxTotalThreadsPerThreadgroup { return _info.max_threads_per_group; }
 - (NSUInteger)threadExecutionWidth { return _info.thread_execution_width; }
@@ -941,6 +980,7 @@ bg_air_slice(NSData *d)
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    _status = 2;   // Committed
    char why[512] = { 0 };
+   bg_lock();
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DISPATCH) {
          struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
@@ -952,7 +992,7 @@ bg_air_slice(NSData *d)
          }
          struct rwa_texture *texs[BG_MAX_TEX] = { NULL };
          struct rwa_sampler *smps[BG_MAX_TEX] = { NULL };
-         for (unsigned i = 0; i < w->texture_count; i++) texs[i] = [(BGMTLTexture *)w->textures[i] rwaTexture];
+         for (unsigned i = 0; i < w->texture_count; i++) texs[i] = [(BGMTLTexture *)w->textures[i] rwaTextureSampled];
          for (unsigned i = 0; i < w->sampler_count; i++) smps[i] = [(BGMTLSampler *)w->samplers[i] rwaSampler];
          struct rwa_bindings b = { .buffers = bufs, .buffer_count = w->count, .textures = texs, .texture_count = w->texture_count,
                                    .samplers = smps, .sampler_count = w->sampler_count };
@@ -990,7 +1030,7 @@ bg_air_slice(NSData *d)
          }
          struct rwa_texture *texs[BG_MAX_TEX] = { NULL }, *colors[8] = { NULL };
          struct rwa_sampler *smps[BG_MAX_TEX] = { NULL };
-         for (unsigned i = 0; i < w->texture_count; i++) texs[i] = [(BGMTLTexture *)w->textures[i] rwaTexture];
+         for (unsigned i = 0; i < w->texture_count; i++) texs[i] = [(BGMTLTexture *)w->textures[i] rwaTextureSampled];
          for (unsigned i = 0; i < w->sampler_count; i++) smps[i] = [(BGMTLSampler *)w->samplers[i] rwaSampler];
          for (unsigned i = 0; i < w->color_count; i++) colors[i] = [(BGMTLTexture *)w->color[i] rwaTexture];
          struct rwa_draw dr;
@@ -1017,6 +1057,13 @@ bg_air_slice(NSData *d)
             [self bgFailWith:[NSString stringWithUTF8String:why] code:4];
             break;
          }
+      } else if (w->kind == BG_WORK_TEXCOPY &&
+                 rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
+                                  (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },
+                                  [(BGMTLTexture *)w->dst rwaTexture], (unsigned)w->t_dlevel, (unsigned)w->t_dslice,
+                                  (const unsigned[3]){ (unsigned)w->t_dorg[0], (unsigned)w->t_dorg[1], (unsigned)w->t_dorg[2] },
+                                  (const unsigned[3]){ (unsigned)w->t_size[0], (unsigned)w->t_size[1], (unsigned)w->t_size[2] }) == 0) {
+         // copied on the GPU, in order with the draws
       } else {
          // CPU blit on shared memory: everything dispatched so far must be done first
          if (rwa_finish([dev rwa], why, sizeof(why)) != 0) { [self bgFailWith:[NSString stringWithUTF8String:why] code:3]; break; }
@@ -1042,6 +1089,7 @@ bg_air_slice(NSData *d)
    if (_status != 5 && !defer_scheduled)
       _status = 3;   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
+   bg_unlock();
    if (!defer_scheduled) {
       for (void (^h)(id) in _scheduled) h(self);
       [_scheduled removeAllObjects];
@@ -1363,30 +1411,83 @@ bg_air_slice(NSData *d)
    if (surface) {
       _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
+      bg_lock();
       _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
+      bg_unlock();
       _surface = CFRetain(surface);
       _plane = plane;
    } else {
+      bg_lock();
       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+      bg_unlock();
    }
    if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
    _owner = device;
    return self;
 }
-- (void)dealloc { if (_tex) rwa_texture_destroy(_tex); if (_surface) CFRelease(_surface); [_linSrc release]; [super dealloc]; }
+- (void)dealloc
+{
+   bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
+   if (_surface) CFRelease(_surface);
+   [_linSrc release];
+   if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
+   [super dealloc];
+}
 - (void *)iosurface { return (void *)_surface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isDrawable { return _surface != NULL; }
 // A linear texture over a buffer reads the buffer's current bytes each time it is handed to the GPU (at commit), so CPU
 // writes into the buffer after the texture was made still show, as with Apple's aliasing.
+- (struct rwa_texture *)rwaTextureSampled
+{
+   bg_lock();
+   struct rwa_texture *t = [self rwaTextureSampledLocked];
+   bg_unlock();
+   return t;
+}
+
+- (struct rwa_texture *)rwaTextureSampledLocked
+{
+   // An IOSurface another process draws with the CPU (SpringBoard's status bar, the volume HUD): its new pixels may still sit in
+   // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
+   // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
+   // (one kernel clean per surface, ever) left those layers stale or missing until this.
+   if (_surface && _tex) {
+      static NSMutableDictionary *seeds;
+      static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+      NSNumber *key = @(IOSurfaceGetID((IOSurfaceRef)_surface));
+      uint32_t seed = IOSurfaceGetSeed((IOSurfaceRef)_surface);
+      os_unfair_lock_lock(&lk);
+      if (!seeds) seeds = [[NSMutableDictionary alloc] init];
+      NSNumber *was = seeds[key];
+      BOOL changed = !was || [was unsignedIntValue] != seed;
+      if (changed) seeds[key] = @(seed);
+      if ([seeds count] > 4096) [seeds removeAllObjects];
+      os_unfair_lock_unlock(&lk);
+      if (changed) rwa_texture_flush_surface(_tex);
+   }
+   return [self rwaTexture];
+}
+
 - (struct rwa_texture *)rwaTexture
 {
+   if (_ncBytes && _tex) {
+      bg_lock();
+      char why[256] = { 0 };
+      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
+      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)_ncBytes, (unsigned)(_ncLength / (_shape.height ? _shape.height : 1)),
+                            why, sizeof(why)) != 0)
+         BG_LOG("no-copy texture refresh: %s\n", why);
+      bg_unlock();
+   }
    if (_linSrc && _tex) {
+      bg_lock();
       char why[256] = { 0 };
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
       if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff, (unsigned)_linBpr,
                             why, sizeof(why)) != 0)
          BG_LOG("linear texture refresh: %s\n", why);
+      bg_unlock();
    }
    return _tex;
 }
@@ -1427,7 +1528,9 @@ bg_air_slice(NSData *d)
    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
    char why[256] = { 0 };
+   bg_lock();
    if (rwa_texture_write(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("replaceRegion: %s\n", why);
+   bg_unlock();
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr
 {
@@ -1440,7 +1543,9 @@ bg_air_slice(NSData *d)
    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };
    char why[256] = { 0 };
+   bg_lock();
    if (rwa_texture_read(_tex, (unsigned)level, (unsigned)slice, o, sz, bytes, bpr, why, sizeof(why)) != 0) BG_LOG("getBytes: %s\n", why);
+   bg_unlock();
 }
 - (void)getBytes:(void *)bytes bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level
 {
@@ -1463,12 +1568,14 @@ bg_air_slice(NSData *d)
    st.normalized_coordinates = [d normalizedCoordinates];
    st.lod_min = [d lodMinClamp]; st.lod_max = [d lodMaxClamp];
    char why[256] = { 0 };
+   bg_lock();
    _smp = rwa_sampler_create([device rwa], &st, why, sizeof(why));
+   bg_unlock();
    if (!_smp) { BG_LOG("sampler refused: %s\n", why); [self release]; return nil; }
    _owner = device;
    return self;
 }
-- (void)dealloc { if (_smp) rwa_sampler_destroy(_smp); [super dealloc]; }
+- (void)dealloc { bg_lock(); if (_smp) rwa_sampler_destroy(_smp); bg_unlock(); [super dealloc]; }
 - (struct rwa_sampler *)rwaSampler { return _smp; }
 - (id)device { return _owner; }
 @end
@@ -1490,7 +1597,9 @@ bg_air_slice(NSData *d)
    st.back = (struct rwa_stencil_face){ (unsigned)[b stencilCompareFunction], (unsigned)[b stencilFailureOperation], (unsigned)[b depthFailureOperation],
                                         (unsigned)[b depthStencilPassOperation], (unsigned)[b readMask], (unsigned)[b writeMask] };
    char why[256] = { 0 };
+   bg_lock();
    _ds = rwa_depth_stencil_create([device rwa], &st, why, sizeof(why));
+   bg_unlock();
    if (!_ds) { BG_LOG("depth/stencil state refused: %s\n", why); [self release]; return nil; }
    _owner = device;
    _readsDepth = st.depth_compare_function != MTLCompareFunctionAlways;
@@ -1499,7 +1608,7 @@ bg_air_slice(NSData *d)
    _writesStencil = f.writeMask || b.writeMask;
    return self;
 }
-- (void)dealloc { if (_ds) rwa_depth_stencil_destroy(_ds); [super dealloc]; }
+- (void)dealloc { bg_lock(); if (_ds) rwa_depth_stencil_destroy(_ds); bg_unlock(); [super dealloc]; }
 - (struct rwa_depth_stencil *)rwaState { return _ds; }
 - (id)device { return _owner; }
 - (BOOL)readsDepth { return _readsDepth; }
@@ -1510,7 +1619,7 @@ bg_air_slice(NSData *d)
 
 @implementation BGMTLRenderPipeline
 + (void)load { ensure_protocol(self, "MTLRenderPipelineState"); }
-- (void)dealloc { if (_render) rwa_render_destroy(_render); [super dealloc]; }
+- (void)dealloc { bg_lock(); if (_render) rwa_render_destroy(_render); bg_unlock(); [super dealloc]; }
 - (id)device { return _owner; }
 @end
 

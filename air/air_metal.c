@@ -1424,7 +1424,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
        * is cached per surface ID together with a reference to the first resource made from it, which keeps that GEM handle
        * open, so a later import of the same surface asks the kernel nothing and freedreno's handle table hands back the same
        * BO. IOSurface IDs come from an increasing counter; the size and pixel format are part of the key besides. */
-      enum { SBO_CACHE = 128 };
+      enum { SBO_CACHE = 24 };   /* each entry pins its surface's memory: 128 screen-sized ones exhausted what the GPU maps (full-screen allocations refused, no backdrop for blur) */
       static struct { struct rwa_device *dev; int id; unsigned w, h; enum pipe_format f; struct rwa_sbo sb; struct pipe_resource *res;
                       uint64_t used; } sbo_cache[SBO_CACHE];
       static uint64_t sbo_clock;
@@ -1593,6 +1593,26 @@ rwa_texture_flush_surface(struct rwa_texture *texture)
    if (!texture || !texture->surface_handle)
       return 0;
    return sweet_drm_bo_sync(-1, texture->surface_handle, 0, 0);
+}
+
+/* Chlorophyll: a texture-to-texture copy on the GPU (freedreno's blitter), queued in order with the draws: no CPU read of memory
+ * the GPU wrote (no cache maintenance, no wait). QuartzCore copies its framebuffer into a texture for every backdrop blur; done
+ * on the CPU that read stale cache lines (white materials) or needed a full clean of a 10 MB surface. Refuses (-1, the caller
+ * copies on the CPU instead) when the formats are not copy-compatible. */
+int
+rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, const unsigned so[3],
+                 struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3], const unsigned size[3])
+{
+   if (!src || !dst || !src->res || !dst->res || src->device != dst->device)
+      return -1;
+   if (util_format_get_blocksize(src->res->format) != util_format_get_blocksize(dst->res->format) ||
+       util_format_get_blockwidth(src->res->format) != util_format_get_blockwidth(dst->res->format))
+      return -1;
+   struct pipe_box box;
+   u_box_3d((int)so[0], (int)so[1], (int)(so[2] + sslice), (int)size[0], (int)size[1], (int)(size[2] ? size[2] : 1), &box);
+   struct pipe_context *pipe = src->device->pipe;
+   pipe->resource_copy_region(pipe, dst->res, dlevel, dorg[0], dorg[1], dorg[2] + dslice, src->res, slevel, &box);
+   return 0;
 }
 
 void
