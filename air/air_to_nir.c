@@ -2779,8 +2779,12 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[2]);
       if (!v || !x || !i)
          return false;
-      if (!nir_src_is_const(nir_src_for_ssa(i)))
-         return air_error(c, "instruction: insertelement at a run-time index");
+      if (!nir_src_is_const(nir_src_for_ssa(i))) {
+         /* Bergamota: a run-time index (CoreAnimation's poster-editor colour-matrix shaders): nir_vector_insert
+          * picks each component with a bcsel on index == k (the lock-screen Customize aborted backboardd) */
+         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x, nir_u2u32(&c->b, i))));
+         return true;
+      }
       air_set(c, &in->base,
               air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x,
                                                    nir_src_as_uint(nir_src_for_ssa(i)))));
