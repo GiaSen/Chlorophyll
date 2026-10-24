@@ -944,11 +944,26 @@ bg_air_slice(NSData *d)
    else if (_status != 5)
       _status = 4;   // Completed: the fence has been paid
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
-   if (_status == 4)
+   if (_status == 4) {
+      NSMutableSet *written = nil;
       for (BGWork *w in _work)
          if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
-            for (unsigned i = 0; i < w->color_count; i++)
-               rwa_texture_flush_surface([(BGMTLTexture *)w->color[i] rwaTexture]);
+            for (unsigned i = 0; i < w->color_count; i++) {
+               BGMTLTexture *t = (BGMTLTexture *)w->color[i];
+               rwa_texture_flush_surface([t rwaTexture]);
+               if ([t iosurface]) {
+                  if (!written) written = [NSMutableSet set];
+                  [written addObject:(id)[t iosurface]];
+               }
+            }
+      // A GPU write does not change an IOSurface's seed, but consumers cache by it: the ES compositor re-uploads a surface it
+      // copied only when the seed moved, so a CAMetalLayer drawable (Mercury: three of them in turn) kept showing the frame it
+      // held one cycle earlier and animations stepped back and forth. A write lock/unlock is the defined way to bump the seed.
+      for (id surf in written) {
+         IOSurfaceLock((IOSurfaceRef)surf, 0, NULL);
+         IOSurfaceUnlock((IOSurfaceRef)surf, 0, NULL);
+      }
+   }
    for (void (^h)(id) in _scheduled) h(self);
    [_scheduled removeAllObjects];
    if (_status == 4 && [_presents count]) {
