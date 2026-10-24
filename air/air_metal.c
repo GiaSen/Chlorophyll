@@ -6558,6 +6558,11 @@ rwa_render_create(struct rwa_device *device,
    render->rast = device->pipe->create_rasterizer_state(device->pipe,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+         /* Chlorophyll: Metal's provoking vertex is the FIRST vertex of a primitive ([[flat]] varyings take its value);
+          * Gallium's default is OpenGL's last. CoreAnimation passes per-quad flat data, so with the default one triangle of
+          * every quad sampled the wrong source: the diagonal split across Control Center's materials and artwork
+          * (test/bgmtl_quad_probe: [[flat]] colours came out swapped between the two triangles). */
+         .flatshade_first = 1,
          /* Chlorophyll: Metal's scissor rect always applies; the draw sets it (the whole attachment when the
           * encoder never did). CoreAnimation draws a widget's corner patches and edge lines one pixel outside
           * the rect it scissors them to, and without this they landed in the neighbouring pixels (the dark

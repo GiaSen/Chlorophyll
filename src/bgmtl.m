@@ -1297,6 +1297,22 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
             n += snprintf(line + n, sizeof(line) - n, " (%u,%u,%u,%u)", px[0], px[1], px[2], px[3]);
          }
          BG_LOG("  attachment %p %ux%u:%s\n", t, wd, ht, line);
+         // small attachments in full, as raw BGRA files, when /private/var/tmp/bgmtl.dumpatt exists (blur chain debugging; the
+         // full-screen ones are skipped: reading 11 MB per pass back through this path rebooted the phone)
+         static int dump = -1;
+         static unsigned seq;
+         if (dump < 0) dump = access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0;
+         if (dump && wd * ht <= 256 * 256 && ([t pixelFormat] == MTLPixelFormatBGRA8Unorm || [t pixelFormat] == MTLPixelFormatBGRA8Unorm_sRGB) && seq < 400) {
+            uint8_t *buf = malloc((size_t)wd * ht * 4);
+            if (buf) {
+               [t getBytes:buf bytesPerRow:wd * 4 fromRegion:MTLRegionMake2D(0, 0, wd, ht) mipmapLevel:0];
+               char path[128];
+               snprintf(path, sizeof(path), "/private/var/tmp/att/%04u-%ux%u.raw", seq++, wd, ht);
+               FILE *f = fopen(path, "wb");
+               if (f) { fwrite(buf, 1, (size_t)wd * ht * 4, f); fclose(f); BG_LOG("  dumped %s\n", path); }
+               free(buf);
+            }
+         }
       }
    }
    if (_status == 4 && [_presents count]) {
@@ -1874,8 +1890,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       for (unsigned i = 0; i < _vhigh; i++) {
          if (!_vbuf[i]) continue;
          const float *f = (const float *)((const uint8_t *)[(BGMTLBuffer *)_vbuf[i] contents] + _voff[i]);
-         BG_LOG("  vbuf[%u] len %lu off %lu: %g %g %g %g %g %g %g %g\n", i, (unsigned long)[(BGMTLBuffer *)_vbuf[i] length],
-                (unsigned long)_voff[i], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+         BG_LOG("  vbuf[%u] len %lu off %lu: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n", i,
+                (unsigned long)[(BGMTLBuffer *)_vbuf[i] length], (unsigned long)_voff[i], f[0], f[1], f[2], f[3], f[4], f[5],
+                f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
       }
    }
    BGWork *w = [[[BGWork alloc] init] autorelease];
