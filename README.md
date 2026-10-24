@@ -37,4 +37,6 @@ builds the host tools; `build-ios.sh` cross-builds `libbgair.dylib` for iOS arm6
 
 ## Licence
 
-MIT. `air/` and `patches/` come from the hackios userland repository; see `NOTICE.md` and `LICENSE.hackios-userland`.
+MIT. The AIR front end and the AIR-to-ir3 library in `air/` (including `air_metal.c`/`air_metal.h`) and the Mesa patches
+`air-frontend`, `air-ir3`, `ir3-*` come from the hackios userland repository by OOSEX GANG / Darwin on redwood contributors
+(https://github.com/oosexgang/hackios-xnu-userland, MIT); see `NOTICE.md` and `LICENSE.hackios-userland`. Thanks to them.
