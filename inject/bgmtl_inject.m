@@ -318,6 +318,8 @@ bb_init(void)
    }
    // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+   // A/B switch: "scheduled" only once the GPU finished, as before 0229/0240 (see -commit in src/bgmtl.m)
+   if (exists("/private/var/tmp/bgmtl-bb.defersched")) { setenv("BGMTL_DEFER_SCHEDULED", "1", 1); ilog("backboardd: BGMTL_DEFER_SCHEDULED=1"); }
    if (exists("/private/var/tmp/bgmtl-bb.sync")) {     // A/B: synchronous commits (the frame-order glitches after the async change)
       setenv("BGMTL_SYNC", "1", 1);
       ilog("backboardd: BGMTL_SYNC=1 (synchronous commits)");

@@ -1221,8 +1221,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    // display from the scheduled notification / waitUntilScheduled, and this display path has no GPU write fence on the surface,
    // so an earlier notice let the panel scan a half-drawn buffer (its previous frame showed: motion stepping back and forth).
    // The encoding of the next frame still overlaps the GPU; only the hand-off waits.
+   // Now opt-in (BGMTL_DEFER_SCHEDULED=1, set by the inject when /private/var/tmp/bgmtl-bb.defersched exists): the kernel
+   // holds a swap until the GPU work before it completed (0229), and with its GPU scan-out copy (0240) the copy runs after
+   // that work on the same ring anyway. Deferring here made the render server wait for the GPU before every swap, so the
+   // next frame's encoding could not overlap the GPU at all.
    static int defer_scheduled = -1;
-   if (defer_scheduled < 0) defer_scheduled = getenv("BGMTL_BB") != NULL;
+   if (defer_scheduled < 0) defer_scheduled = getenv("BGMTL_DEFER_SCHEDULED") && getenv("BGMTL_DEFER_SCHEDULED")[0] == '1';
    if (_status != 5 && !defer_scheduled)
       _status = 3;   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
