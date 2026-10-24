@@ -145,3 +145,14 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
   with NIR's range analysis where possible, so those bindings copy up to the bound. With the current libdrm stand-in
   (madvise answered locally) installed too, the swipe test went from ~30 fps (300 frames / 10 s, backboardd at 93-98 %
   of a core) to ~41 fps (403-429 frames).
+
+## Linear sampled textures: why they drew black, and the fix (2026-10-24)
+
+- **Why.** c679731 (reverted by 5eb3387) added `PIPE_BIND_LINEAR` to the bind flags *before* the
+  `is_format_supported` check. freedreno refuses `SAMPLER_VIEW | LINEAR` there, so every such texture failed to be
+  created: CoreAnimation got a nil MTLTexture and drew nothing (icons and wallpaper black, text fine). It was never a
+  layout, cache or sampling problem; `bgmtl_render_probe` with `RWA_LINEAR_SAMPLED=1` showed `t=0` at creation.
+- **Fix.** Single-level 2D sampled-only textures of 4-byte texels (not imports) set LINEAR only on the allocation
+  template, after the check, and fall back to tiled if the allocation refuses. `-replaceRegion:` then writes through
+  the mapping for most uploads. Probe 18/18; texture uploads 6.4 % -> 4 % of backboardd, our share 37 % -> 30 %;
+  `RWA_LINEAR_SAMPLED=0` turns it off.

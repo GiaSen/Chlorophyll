@@ -1507,6 +1507,21 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       read = true;
    }
 
+   /* Chlorophyll: a single-level 2D texture of this library's own memory that is only sampled, of 4-byte texels, is
+    * allocated linear (below, after the format check). CoreAnimation fills these from the processor (-replaceRegion:), and freedreno uploads into a TILED texture
+    * through a staging buffer and a GPU blit every time (fd_resource_transfer_map: "we always need a staging texture for
+    * tiled buffers"), ~6 % of backboardd in a swipe. Linear, the upload writes through the mapping. An IOSurface import
+    * never gets the flag: its layout is the owner's. RWA_LINEAR_SAMPLED=0 turns it off. */
+   bool linear = false;
+   if (!import) {
+      static int lin = -1;
+      if (lin < 0)
+         lin = !(getenv("RWA_LINEAR_SAMPLED") && getenv("RWA_LINEAR_SAMPLED")[0] == '0');
+      linear = lin && bind == PIPE_BIND_SAMPLER_VIEW && target == PIPE_TEXTURE_2D && mips == 1 && array_size == 1 &&
+               !depth_stencil && !multisample && !util_format_is_compressed(fmt->pipe) &&
+               util_format_get_blocksize(fmt->pipe) == 4;
+   }
+
    /* Gallium counts a texture that is not multisampled as zero samples, not one,
     * everywhere a sample count is asked for -- and the difference is not cosmetic here.
     * freedreno's fd6_screen_is_format_supported refuses PIPE_BIND_SHADER_IMAGE outright
@@ -1714,7 +1729,19 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       return texture;
    }
 
-   texture->res = tex_pool_take(device, &templ, &texture->view);
+   /* The layout is the allocation's business only: is_format_supported (above) refuses SAMPLER_VIEW | LINEAR, so the
+    * flag asked there made every such texture a creation failure -- a nil MTLTexture, drawn black (c679731). A linear
+    * allocation that is refused falls back to the tiled one. */
+   if (linear) {
+      templ.bind |= PIPE_BIND_LINEAR;
+      texture->res = tex_pool_take(device, &templ, &texture->view);
+      if (!texture->res)
+         texture->res = device->screen->resource_create(device->screen, &templ);
+      if (!texture->res)
+         templ.bind &= ~PIPE_BIND_LINEAR;
+   }
+   if (!texture->res)
+      texture->res = tex_pool_take(device, &templ, &texture->view);
    if (!texture->res)
       texture->res = device->screen->resource_create(device->screen, &templ);
    if (!texture->res) {
