@@ -1,0 +1,24 @@
+diff --git a/src/freedreno/drm/freedreno_bo_cache.c b/src/freedreno/drm/freedreno_bo_cache.c
+index a656267..32d7660 100644
+--- a/src/freedreno/drm/freedreno_bo_cache.c
++++ b/src/freedreno/drm/freedreno_bo_cache.c
+@@ -203,9 +204,19 @@ find_in_bucket(struct fd_bo_bucket *bucket, uint32_t flags)
+     * (MRU, since likely to be in GPU cache), rather than head (LRU)..
+     */
+    foreach_bo (entry, &bucket->list) {
++#ifdef __APPLE__
++      /* Chlorophyll: buckets mix the compositor's textures (NOMAP|HINT_IMAGE) with thousands of short-lived
++       * GPUREADONLY buffers; stopping at the first busy entry hid idle textures behind a busy upload buffer
++       * (65 of 149 texture misses during home-screen swipes). Match the flags first, then skip busy entries. */
++      if (entry->alloc_flags != flags)
++         continue;
++      if (fd_bo_state(entry) != FD_BO_STATE_IDLE)
++         continue;
++#else
+       if (fd_bo_state(entry) != FD_BO_STATE_IDLE) {
+          break;
+       }
++#endif
+       if (entry->alloc_flags == flags) {
+          bo = entry;
+          bo_remove_from_bucket(bucket, bo);
