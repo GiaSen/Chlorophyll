@@ -1309,6 +1309,12 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+
+	/* Chlorophyll: MTLRenderCommandEncoder's scissor rect, or NULL for the whole
+	 * attachment (Metal's default). { x, y, width, height } in attachment pixels, top
+	 * left origin, which is Gallium's window space under this library's flipped
+	 * viewport. Appended, like the fields above. */
+	const unsigned *scissor;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,

@@ -6543,6 +6543,11 @@ rwa_render_create(struct rwa_device *device,
    render->rast = device->pipe->create_rasterizer_state(device->pipe,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+         /* Chlorophyll: Metal's scissor rect always applies; the draw sets it (the whole attachment when the
+          * encoder never did). CoreAnimation draws a widget's corner patches and edge lines one pixel outside
+          * the rect it scissors them to, and without this they landed in the neighbouring pixels (the dark
+          * dashes along the top and left edges of the widgets). */
+         .scissor = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
          .multisample = samples > 1,
          /* Metal's lines and points are one pixel; Gallium's zero default draws nothing.
@@ -6811,6 +6816,10 @@ fail:
       if (surf[i]) pipe_surface_reference(&surf[i], NULL);
    return -1;
 }
+
+/* Chlorophyll: freedreno's debug flags, present only in a build that links the freedreno driver (the host build runs
+ * softpipe). FD_DBG_SYSMEM (bit 9) makes every batch render in sysmem instead of tiling through GMEM. */
+extern int fd_mesa_debug __attribute__((weak_import));
 
 int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
@@ -7147,6 +7156,21 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       fb.zsbuf = zsurf;
    }
+   /*
+    * Chlorophyll: a shader that reads a colour attachment ([[color(n)]] framebuffer fetch) is drawn in SYSMEM.
+    *
+    * CoreAnimation clips a layer to its rounded corners by (1) copying the framebuffer's corner patches into a second
+    * attachment with fetch-only shaders (TimgA2S1Xhf_IsrcM0), (2) drawing the layer, and (3) blending the copy back
+    * outside the rounded SDF (TbdsA2Xhf_Isup_IsrcM1, which fetches BOTH attachments). Rendered through a6xx GMEM
+    * the fetches returned zeros in places, so the corners outside the shape came out black, as thin dark dashes
+    * along the bounding rectangle and as specks (home-screen widgets). Whether a batch tiles is decided at flush
+    * time, partly by freedreno's autotuner, which is why it was patchy. Sysmem rendering with the fetch descriptors
+    * patched from the resource (patch_fb_read_sysmem) is exact. Sticky for the process: such a batch can be flushed
+    * by a later call, and a client that fetches at all (CoreAnimation) does so every frame.
+    */
+   if (render->finfo.fbfetch_targets && &fd_mesa_debug)
+      fd_mesa_debug |= (1 << 9);
+
    pipe->set_framebuffer_state(pipe, &fb);
 
    /* The viewport, and now its z as well. Gallium's window depth is
@@ -7174,6 +7198,17 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
       .translate = { w / 2.0f, h / 2.0f, znear } });
 
+   {
+      /* Chlorophyll: Metal's scissor test (see rwa_draw.scissor), clamped to the attachment as Metal requires. */
+      struct pipe_scissor_state sc = { .minx = 0, .miny = 0, .maxx = w, .maxy = h };
+      if (draw->scissor) {
+         unsigned x0 = MIN2(draw->scissor[0], w), y0 = MIN2(draw->scissor[1], h);
+         unsigned x1 = MIN2((uint64_t)draw->scissor[0] + draw->scissor[2], w);
+         unsigned y1 = MIN2((uint64_t)draw->scissor[1] + draw->scissor[3], h);
+         sc = (struct pipe_scissor_state){ .minx = x0, .miny = y0, .maxx = x1, .maxy = y1 };
+      }
+      pipe->set_scissor_states(pipe, 0, 1, &sc);
+   }
    pipe->bind_blend_state(pipe, render->blend);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
     * behaviour with no MTLDepthStencilState set: no test and no write.

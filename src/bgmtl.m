@@ -172,6 +172,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
    unsigned clear_stencil, stencil_ref[2];
    BOOL have_range;
    float depth_range[2];
+   BOOL have_scissor;
+   unsigned scissor[4];
    // texture blits: source/destination slice+level, origins and the size of the region, buffer layout
    unsigned clear_mask;            // BG_WORK_CLEAR: bit i = colour attachment i is MTLLoadActionClear to clear_vals[i]
    float clear_vals[8][4];
@@ -372,6 +374,7 @@ bg_install_fallback(Class c)
    struct rwa_render_info _info;
    struct rwa_texture_decl _decls[16];   // the fragment stage's texture slots, for filling the ones nothing was bound to
    unsigned _ndecls;
+   char _names[96];
 }
 @end
 
@@ -394,6 +397,8 @@ bg_install_fallback(Class c)
    unsigned _clear_stencil_v, _stencil_ref[2];
    BOOL _have_range;
    float _range[2];
+   BOOL _have_scissor;
+   unsigned _scissor[4];
 }
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d;
 @end
@@ -804,6 +809,7 @@ bg_air_slice(NSData *d)
       unsigned nd = 0;
       if (rwa_module_textures(_rwa, fair.bytes, fair.length, [[fragment name] UTF8String], p->_decls, 16, &nd, dwhy, sizeof(dwhy)) == 0) p->_ndecls = nd;
    }
+   snprintf(p->_names, sizeof(p->_names), "%s+%s", vertex ? [[vertex name] UTF8String] : "gen", [[fragment name] UTF8String]);
    BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
           vertex ? [[vertex name] UTF8String] : "(generated)", [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
           info.fragment_textures, info.fragment_samplers, info.vertex_streams);
@@ -1052,6 +1058,34 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
    }
 }
 
+// Per-second timing of synchronous commits (the compositor): how a frame's time splits into CoreAnimation's own work between
+// commits, our encode (command translation, Mesa batch build, kernel submit) and the wait for the GPU. One line a second in
+// bgmtl.log while committing; off unless /private/var/tmp/bgmtl.perf exists when the process starts.
+static void
+bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned ndraw)
+{
+   static int on = -1;
+   static uint64_t win_start, last_end, n, draws, enc, wait, gap, enc_max, wait_max;
+   if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0;
+   if (!on) return;
+   if (win_start == 0) win_start = t_begin;
+   uint64_t e = t_flushed - t_begin, w = t_waited - t_flushed;
+   if (last_end && t_begin > last_end) gap += t_begin - last_end;
+   last_end = t_waited;
+   n++; draws += ndraw; enc += e; wait += w;
+   if (e > enc_max) enc_max = e;
+   if (w > wait_max) wait_max = w;
+   if (t_waited - win_start >= 1000000000ull) {
+      char line[256];
+      double sec = (t_waited - win_start) / 1e9;
+      snprintf(line, sizeof(line), "perf: %.1f cbuf/s, %.1f draws/cbuf; per second: encode %.0f ms, gpu wait %.0f ms, between commits %.0f ms; "
+               "max encode %.1f ms, max wait %.1f ms", n / sec, n ? (double)draws / n : 0, enc / 1e6 / sec, wait / 1e6 / sec, gap / 1e6 / sec,
+               enc_max / 1e6, wait_max / 1e6);
+      bgmtl_note_line(line);
+      win_start = t_waited; n = draws = enc = wait = gap = enc_max = wait_max = 0;
+   }
+}
+
 - (void)commit
 {
    bgmtl_note_committed();
@@ -1121,6 +1155,7 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
          if (w->depth_state) dr.depth_stencil = [(BGMTLDepthStencil *)w->depth_state rwaState];
          dr.stencil_reference[0] = w->stencil_ref[0]; dr.stencil_reference[1] = w->stencil_ref[1];
          if (w->have_range) dr.depth_range = w->depth_range;
+         if (w->have_scissor) dr.scissor = w->scissor;
          dr.vertex = (struct rwa_bindings){ .buffers = vb, .buffer_count = w->vcount };
          dr.fragment = (struct rwa_bindings){ .buffers = fb, .buffer_count = w->count, .textures = texs, .texture_count = w->texture_count,
                                               .samplers = smps, .sampler_count = w->sampler_count };
@@ -1168,6 +1203,7 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
    if (_status != 5 && !defer_scheduled)
       _status = 3;   // Scheduled
    struct rwa_fence *fence = _status != 5 ? rwa_flush([dev rwa]) : NULL;
+   uint64_t t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    bg_unlock();
    if (!defer_scheduled) {
       for (void (^h)(id) in _scheduled) h(self);
@@ -1181,6 +1217,12 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)
          _status = 4;
+      {
+         unsigned nd = 0;
+         for (BGWork *w in _work)
+            if (w->kind == BG_WORK_DRAW) nd++;
+         bg_perf_note(t_begin, t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), nd);
+      }
       rwa_fence_release([dev rwa], fence);
       [self bgCompleteFrom:t_begin];
       dispatch_group_leave(_done);
@@ -1760,7 +1802,7 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
 }
 - (void)dealloc { for (unsigned i = 0; i < 8; i++) [_color[i] release]; [_scratch release]; [_depth release]; [_depth_state release]; [super dealloc]; }
 - (id)device { return [_cb device]; }
-- (void)setRenderPipelineState:(id)s { _pipeline = s; }
+- (void)setRenderPipelineState:(id)s { _pipeline = s; BG_TRACE("setPipeline %s\n", ((BGMTLRenderPipeline *)s)->_names); }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 { BG_TRACE("setVertexBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
@@ -1795,8 +1837,8 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _stencil_ref[0] = f; _stencil_ref[1] = b; }
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp { (void)bias; (void)slope; (void)clamp; }
 - (void)setDepthClipMode:(NSUInteger)m { (void)m; }
-- (void)setScissorRect:(MTLScissorRect)r { (void)r; }
-- (void)setCullMode:(NSUInteger)m { (void)m; }
+- (void)setScissorRect:(MTLScissorRect)r { _scissor[0] = (unsigned)r.x; _scissor[1] = (unsigned)r.y; _scissor[2] = (unsigned)r.width; _scissor[3] = (unsigned)r.height; _have_scissor = YES; BG_TRACE("setScissor %lu %lu %lu %lu\n", (unsigned long)r.x, (unsigned long)r.y, (unsigned long)r.width, (unsigned long)r.height); }
+- (void)setCullMode:(NSUInteger)m { BG_TRACE("setCullMode %lu\n", (unsigned long)m); }
 - (void)setFrontFacingWinding:(NSUInteger)w { (void)w; }
 - (void)setTriangleFillMode:(NSUInteger)m { (void)m; }
 
@@ -1855,6 +1897,7 @@ bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_s
    if (_clear_depth_pending) { w->clear_depth_set = YES; w->clear_depth = _clear_depth_v; _clear_depth_pending = NO; }
    if (_clear_stencil_pending) { w->clear_stencil_set = YES; w->clear_stencil = _clear_stencil_v; _clear_stencil_pending = NO; }
    w->stencil_ref[0] = _stencil_ref[0]; w->stencil_ref[1] = _stencil_ref[1];
+   if (_have_scissor) { w->have_scissor = YES; memcpy(w->scissor, _scissor, sizeof(_scissor)); }
    if (_have_range) { w->have_range = YES; w->depth_range[0] = _range[0]; w->depth_range[1] = _range[1]; }
    w->primitive = prim; w->vstart = start; w->vcount_verts = count; w->instances = inst; w->base_instance = bi;
    w->index_buffer = [ib retain]; w->index_type = it; w->index_offset = io; w->base_vertex = bv;
