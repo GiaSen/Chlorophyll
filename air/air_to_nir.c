@@ -308,6 +308,13 @@ air_get(struct air_ctx *c, const struct air_value *v)
          air_set(c, v, val);
       return val;
    }
+   if (v->kind == AIR_VALUE_FUNCTION) {
+      struct air_val *fv = rzalloc(c->mem_ctx, struct air_val);
+      fv->kind = AIR_VAL_FUNC;
+      fv->fnv = v;
+      air_set(c, v, fv);
+      return fv;
+   }
    air_error(c, "instruction: a %s value used before it is defined%s%s",
              v->kind == AIR_VALUE_GLOBAL ? "global" :
              v->kind == AIR_VALUE_FUNCTION ? "function" :
@@ -2256,6 +2263,41 @@ translate_gep(struct air_ctx *c, const struct air_inst *in)
    struct air_val *base = air_get(c, in->operands[0]);
    if (!base)
       return false;
+   if (base->kind == AIR_VAL_FTABLE_ELEM && !base->def) {
+      /* a pointer to element e of a table, indexed again: element e + k (`gep ptr, p, k`) */
+      struct air_val *ev = rzalloc(c->mem_ctx, struct air_val);
+      ev->kind = AIR_VAL_FTABLE_ELEM;
+      ev->table = base->table;
+      const struct air_value *ix = in->operands[in->num_operands - 1];
+      uint64_t k;
+      if (air_const_uint(ix, &k)) {
+         ev->num_elems = base->num_elems + (unsigned)k;
+      } else {
+         nir_def *d = air_get_ssa(c, ix);
+         if (!d)
+            return false;
+         ev->def = base->num_elems ? nir_iadd_imm(&c->b, nir_u2u32(&c->b, d), base->num_elems) : d;
+      }
+      air_set(c, &in->base, ev);
+      return true;
+   }
+   if (base->kind == AIR_VAL_FTABLE) {
+      /* element k of a function table: `gep [N x ptr], t, 0, k` or `gep ptr, t, k` */
+      const struct air_value *ix = in->operands[in->num_operands - 1];
+      struct air_val *ev = rzalloc(c->mem_ctx, struct air_val);
+      ev->kind = AIR_VAL_FTABLE_ELEM;
+      ev->table = base->table;
+      uint64_t k;
+      if (air_const_uint(ix, &k)) {
+         ev->num_elems = (unsigned)k;
+      } else {
+         ev->def = air_get_ssa(c, ix);
+         if (!ev->def)
+            return false;
+      }
+      air_set(c, &in->base, ev);
+      return true;
+   }
    struct air_val *res = NULL;
    if (!gep_into(c, base, in, &res))
       return false;
@@ -2312,6 +2354,10 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
 
    if (in->sub == AIR_CAST_BITCAST && dt->kind == AIR_TYPE_POINTER) {
       struct air_val *v = air_get(c, in->operands[0]);
+      if (v && (v->kind == AIR_VAL_FTABLE || v->kind == AIR_VAL_FTABLE_ELEM || v->kind == AIR_VAL_FUNC)) {
+         air_set(c, &in->base, v);   /* a pointer to a function table, cast to a pointer */
+         return true;
+      }
       if (!v || v->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a bitcast of something that is not a pointer");
       struct air_ptr p = v->ptr;
@@ -2532,6 +2578,38 @@ air_value_kind_name(const struct air_value *v)
    return "a constant of an unknown kind";
 }
 
+/* Bergamota: the results of calling every entry of a function table, selected by the run-time index: leaf by leaf, an index equal to which[k] picks
+ * results[k], the last entry is the default. NULL leaves (void, undef) stay NULL. */
+static struct air_val *
+select_by_index(struct air_ctx *c, nir_def *idx, struct air_val **r, const unsigned *which, unsigned n)
+{
+   struct air_val *last = r[n - 1];
+   if (!last)
+      return NULL;
+   if (last->kind == AIR_VAL_AGG) {
+      struct air_val *out = air_val_agg(c, last->num_elems);
+      for (unsigned i = 0; i < last->num_elems; i++) {
+         struct air_val *sub[64];
+         for (unsigned k = 0; k < n; k++)
+            sub[k] = r[k] && r[k]->kind == AIR_VAL_AGG && i < r[k]->num_elems ? r[k]->elems[i] : NULL;
+         out->elems[i] = select_by_index(c, idx, sub, which, n);
+      }
+      return out;
+   }
+   if (last->kind != AIR_VAL_SSA) {
+      air_error(c, "instruction: a call through a function table whose result is not a number or an aggregate of numbers");
+      return NULL;
+   }
+   nir_def *acc = last->def;
+   for (int k = (int)n - 2; k >= 0; k--) {
+      if (!r[k] || r[k]->kind != AIR_VAL_SSA)
+         continue;
+      nir_def *cond = nir_ieq_imm(&c->b, nir_u2u32(&c->b, idx), which[k]);
+      acc = nir_bcsel(&c->b, cond, r[k]->def, acc);
+   }
+   return air_val_ssa(c, acc);
+}
+
 static bool sc_eval(struct air_ctx *c, const struct air_value *v, uint64_t *out, unsigned depth);
 
 static bool
@@ -2729,6 +2807,16 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
        * into such a local and never read them back, which LLVM left behind and
        * which used to stop the module at "a pointer where a number belongs".
        */
+      if (in->aux_type && in->aux_type->kind == AIR_TYPE_ARRAY && in->aux_type->elem &&
+          in->aux_type->elem->kind == AIR_TYPE_POINTER && in->aux_type->elem->addrspace == 0 && in->aux_type->count <= 64 && count == 1) {
+         /* a local table of function pointers: kept at translation time (see AIR_VAL_FTABLE) */
+         struct air_val *tv = rzalloc(c->mem_ctx, struct air_val);
+         tv->kind = AIR_VAL_FTABLE;
+         tv->table = rzalloc(c->mem_ctx, struct air_ftable);
+         tv->table->n = (unsigned)in->aux_type->count;
+         air_set(c, &in->base, tv);
+         return true;
+      }
       uint64_t size = air_type_alloc_size(c->m, in->aux_type) * count;
       unsigned align = MAX2(in->align, air_type_abi_align(c->m, in->aux_type));
       c->scratch_size = ALIGN_POT(c->scratch_size, MAX2(align, 1));
@@ -2745,6 +2833,21 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *p = air_get(c, in->operands[0]);
       if (!p)
          return false;
+      if (p->kind == AIR_VAL_FTABLE_ELEM) {
+         struct air_val *fv = rzalloc(c->mem_ctx, struct air_val);
+         if (!p->def) {
+            if (p->num_elems >= p->table->n || !p->table->entries[p->num_elems])
+               return air_error(c, "instruction: a load of a function table entry that was never stored");
+            fv->kind = AIR_VAL_FUNC;
+            fv->fnv = p->table->entries[p->num_elems];
+         } else {
+            fv->kind = AIR_VAL_FUNC_SELECT;
+            fv->table = p->table;
+            fv->def = p->def;
+         }
+         air_set(c, &in->base, fv);
+         return true;
+      }
       if (p->kind == AIR_VAL_PTR_SELECT) {
          nir_def *res = load_through_choice(c, p, in->base.type, in->align);
          if (!res)
@@ -2775,6 +2878,13 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *p = air_get(c, in->operands[1]);
       if (!p)
          return false;
+      if (p->kind == AIR_VAL_FTABLE_ELEM) {
+         struct air_val *fv = air_get(c, in->operands[0]);
+         if (!fv || fv->kind != AIR_VAL_FUNC || p->def || p->num_elems >= p->table->n)
+            return air_error(c, "instruction: a store into a function table that is not a function at a constant index");
+         p->table->entries[p->num_elems] = fv->fnv;
+         return true;
+      }
       /* A POINTER stored into memory. There is nothing to write: a pointer in
        * this frontend is a resolution -- a binding and a byte offset decided
        * while translating -- and not an address, so it has no bytes. Naming
@@ -2800,8 +2910,35 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
    }
    case AIR_OP_CALL: {
       const struct air_value *callee = in->operands[0];
-      if (callee->kind != AIR_VALUE_FUNCTION || !callee->name)
-         return air_error(c, "instruction: a call through a pointer");
+      if (callee->kind != AIR_VALUE_FUNCTION || !callee->name) {
+         /* a call through a function pointer: a known function, or a table entry chosen at run time (every entry is called and the results are
+          * selected by the index; the entries are pure material functions in the modules this exists for) */
+         struct air_val *fv = callee->kind == AIR_VALUE_INSTRUCTION ? air_get(c, callee) : NULL;
+         if (!fv || (fv->kind != AIR_VAL_FUNC && fv->kind != AIR_VAL_FUNC_SELECT))
+            return air_error(c, "instruction: a call through a pointer this frontend cannot resolve");
+         if (fv->kind == AIR_VAL_FUNC)
+            return fv->fnv->name ? air_translate_call(c, in, fv->fnv->name) : air_error(c, "instruction: a call of an unnamed function");
+         struct air_val *results[64];
+         unsigned nres = 0;
+         unsigned which[64];
+         for (unsigned k = 0; k < fv->table->n; k++) {
+            const struct air_value *e = fv->table->entries[k];
+            if (!e || !e->name)
+               continue;
+            if (!air_translate_call(c, in, e->name))
+               return false;
+            results[nres] = air_get(c, &in->base);
+            which[nres++] = k;
+         }
+         if (!nres)
+            return air_error(c, "instruction: a call through an empty function table");
+         struct air_val *merged = select_by_index(c, fv->def, results, which, nres);
+         if (!merged && c->error[0])
+            return false;
+         if (merged)
+            air_set(c, &in->base, merged);
+         return true;
+      }
       return air_translate_call(c, in, callee->name);
    }
    case AIR_OP_RET:
@@ -3349,6 +3486,49 @@ reverse_post_order(struct air_ctx *c, const struct air_function *f, unsigned *or
    return num_post;
 }
 
+/* Bergamota: a phi of an aggregate has one register per NUMBER leaf (leaves in tree order, as ret_leaf_types); it is kept in phi_regs under the
+ * key (phi | 1) */
+struct phi_agg {
+   const struct air_type *type;
+   unsigned n;
+   nir_def *regs[256];
+};
+
+static struct air_val *
+phi_agg_build(struct air_ctx *c, const struct air_type *t, struct phi_agg *pa, unsigned *i)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+      struct air_val *agg = air_val_agg(c, n);
+      for (unsigned k = 0; k < n; k++)
+         agg->elems[k] = phi_agg_build(c, t->kind == AIR_TYPE_STRUCT ? t->members[k] : t->elem, pa, i);
+      return agg;
+   }
+   nir_def *r = pa->regs[(*i)++];
+   return r ? air_val_ssa(c, nir_load_reg(&c->b, r)) : NULL;
+}
+
+static bool
+phi_agg_store(struct air_ctx *c, const struct air_type *t, const struct air_val *v, struct phi_agg *pa, unsigned *i)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
+      for (unsigned k = 0; k < n; k++) {
+         const struct air_val *sub = v && v->kind == AIR_VAL_AGG && k < v->num_elems ? v->elems[k] : NULL;
+         if (!phi_agg_store(c, t->kind == AIR_TYPE_STRUCT ? t->members[k] : t->elem, sub, pa, i))
+            return false;
+      }
+      return true;
+   }
+   nir_def *r = pa->regs[(*i)++];
+   if (!r || !v)
+      return true;
+   if (v->kind != AIR_VAL_SSA)
+      return air_error(c, "instruction: a leaf of an aggregate phi that is not a number");
+   nir_store_reg(&c->b, v->def, r);
+   return true;
+}
+
 static bool translate_body(struct air_ctx *c);
 static void materialise_globals(struct air_ctx *c);
 
@@ -3465,7 +3645,8 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
        * it then takes extractvalue of, and extractvalue of a value that is not
        * an aggregate here is exactly the error this used to produce.
        */
-      bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
+      bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR || argv[i]->kind == AIR_VAL_FTABLE ||
+                                     argv[i]->kind == AIR_VAL_FTABLE_ELEM || argv[i]->kind == AIR_VAL_FUNC ||
                                      val_holds_ptr(argv[i]));
       /* Bergamota: a pointer at a computed byte offset binds like any pointer (the resource is the caller's resolution), and its
        * OFFSET, a def of the caller's impl, travels as an extra 32-bit parameter after the others (see ptr_offset_arg) and is the
@@ -4073,11 +4254,23 @@ translate_body(struct air_ctx *c)
           * "a returned struct that was never built" -- true of the module, and
           * not what is wrong with it.
           */
-         if (in->base.type->kind == AIR_TYPE_STRUCT ||
-             in->base.type->kind == AIR_TYPE_ARRAY)
-            return air_error(c, "instruction: a phi of %s, which NIR has no register for",
-                             in->base.type->kind == AIR_TYPE_STRUCT ? "a struct"
-                                                                    : "an array");
+         if (in->base.type->kind == AIR_TYPE_STRUCT || in->base.type->kind == AIR_TYPE_ARRAY) {
+            const struct air_type *leaf[256];
+            unsigned nl = 0;
+            ret_leaf_types(in->base.type, NULL, &nl);
+            if (nl > 256)
+               return air_error(c, "instruction: a phi of an aggregate of %u leaves, which is too many", nl);
+            nl = 0;
+            ret_leaf_types(in->base.type, leaf, &nl);
+            struct phi_agg *pa = rzalloc(c->mem_ctx, struct phi_agg);
+            pa->type = in->base.type;
+            pa->n = nl;
+            for (unsigned k = 0; k < nl; k++)
+               if (ret_member_is_number(leaf[k]))
+                  pa->regs[k] = nir_decl_reg(&entry, air_nir_components(leaf[k]), air_nir_bit_size(c, leaf[k]), 0);
+            _mesa_hash_table_insert(c->phi_regs, (void *)((uintptr_t)in | 1), pa);
+            continue;
+         }
          nir_def *reg = nir_decl_reg(&entry, air_nir_components(in->base.type),
                                      air_nir_bit_size(c, in->base.type), 0);
          _mesa_hash_table_insert(c->phi_regs, in, reg);
@@ -4121,6 +4314,12 @@ translate_body(struct air_ctx *c)
          if (in->base.type->kind == AIR_TYPE_POINTER) {
             if (!resolve_pointer_phi(c, in, reachable, fold, bi))
                return false;
+            continue;
+         }
+         struct hash_entry *ea = _mesa_hash_table_search(c->phi_regs, (void *)((uintptr_t)in | 1));
+         if (ea) {
+            unsigned li = 0;
+            air_set(c, &in->base, phi_agg_build(c, in->base.type, ea->data, &li));
             continue;
          }
          struct hash_entry *e = _mesa_hash_table_search(c->phi_regs, in);
@@ -4247,8 +4446,9 @@ translate_body(struct air_ctx *c)
          const struct air_inst *in = blk->insts[i];
          if (in->op != AIR_OP_PHI)
             continue;
-         struct hash_entry *re = _mesa_hash_table_search(c->phi_regs, in);
-         if (!re)
+         struct hash_entry *rea = _mesa_hash_table_search(c->phi_regs, (void *)((uintptr_t)in | 1));
+         struct hash_entry *re = rea ? NULL : _mesa_hash_table_search(c->phi_regs, in);
+         if (!re && !rea)
             continue; /* a phi in an unreachable block, or one of pointers */
          for (unsigned k = 0; k < in->num_operands; k++) {
             struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
@@ -4257,6 +4457,16 @@ translate_body(struct air_ctx *c)
             if (fold[in->targets[k]->index] >= 0 && (unsigned)fold[in->targets[k]->index] != bi)
                continue; /* an edge a folded branch never takes */
             c->b.cursor = *(nir_cursor *)ce->data;
+            if (rea) {
+               struct air_val *av = air_get(c, in->operands[k]);
+               if (!av)
+                  return false;
+               unsigned li = 0;
+               if (!phi_agg_store(c, in->base.type, av, rea->data, &li))
+                  return false;
+               *(nir_cursor *)ce->data = c->b.cursor;
+               continue;
+            }
             nir_def *val = air_get_ssa(c, in->operands[k]);
             if (!val)
                return false;

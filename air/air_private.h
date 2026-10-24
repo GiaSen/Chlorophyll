@@ -67,6 +67,20 @@ enum air_val_kind {
     * values, which is the only form NIR has; that is why it leaves a note.
     */
    AIR_VAL_PTR_SELECT,
+
+   /* Bergamota: function pointers (Mercury's shippou kernels keep their materials in a `[4 x ptr]` local filled with function addresses and call
+    * through it). A function address is AIR_VAL_FUNC (.fnv); the table is AIR_VAL_FTABLE (.table); an element of it, with a constant or run-time
+    * index (.def, NULL when constant: .num_elems), is AIR_VAL_FTABLE_ELEM; a load of an element with a run-time index is AIR_VAL_FUNC_SELECT. A call
+    * through FUNC_SELECT calls every entry and selects the results by the index. */
+   AIR_VAL_FUNC,
+   AIR_VAL_FTABLE,
+   AIR_VAL_FTABLE_ELEM,
+   AIR_VAL_FUNC_SELECT,
+};
+
+struct air_ftable {
+   unsigned n;
+   const struct air_value *entries[64];
 };
 
 struct air_val {
@@ -75,6 +89,8 @@ struct air_val {
    struct air_ptr ptr;
    unsigned num_elems;
    struct air_val **elems;
+   const struct air_value *fnv;   /* FUNC */
+   struct air_ftable *table;      /* FTABLE, FTABLE_ELEM, FUNC_SELECT */
 };
 
 /* One member of an argument buffer, as `air.struct_type_info` declares it and
