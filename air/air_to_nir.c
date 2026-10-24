@@ -2094,8 +2094,14 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          var->data.interpolation = INTERP_MODE_SMOOTH;
       var->data.centroid = md_key(node, "air.centroid") >= 0;
       var->data.sample = md_key(node, "air.sample") >= 0;
-      if (c->nir->info.stage == MESA_SHADER_FRAGMENT)
-         add_varying_at(c, name, slot, frac, air_nir_components(t), node);
+      if (c->nir->info.stage == MESA_SHADER_FRAGMENT) {
+         /* The link identity is the string after air.fragment_input ("user(locn0)", or
+          * the generated name of a struct member), the same string the vertex stage
+          * records after air.vertex_output -- not the parameter's air.arg_name. */
+         int fk = md_key(node, "air.fragment_input");
+         const char *link = fk >= 0 ? md_str(node, fk + 1) : NULL;
+         add_varying_at(c, link ? link : name, slot, frac, air_nir_components(t), node);
+      }
       c->params[param] = air_val_ssa(c, nir_load_var(&c->b, var));
       return true;
    }

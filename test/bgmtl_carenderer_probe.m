@@ -188,6 +188,7 @@ main(int argc, char **argv)
          id<MTLCommandBuffer> fence = [q commandBuffer];
          [fence commit];
          [fence waitUntilCompleted];
+         usleep(200000);   // CoreAnimation may commit its own buffer after ours (seen as an all-zero read now and then)
          uint8_t *out = calloc(W * H, 4);
          [tex getBytes:out bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
          double sum = 0; unsigned nonzero = 0;

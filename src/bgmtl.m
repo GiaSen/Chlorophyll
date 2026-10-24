@@ -630,6 +630,8 @@ bg_air_slice(NSData *d)
          shape.vertex_attribute[i].format = (unsigned)[a format];
          shape.vertex_attribute[i].offset = (unsigned)[a offset];
          shape.vertex_attribute[i].buffer_index = (unsigned)[a bufferIndex];
+         BG_TRACE("  attribute %u: format %lu offset %lu buffer %lu\n", i, (unsigned long)[a format], (unsigned long)[a offset],
+                  (unsigned long)[a bufferIndex]);
       }
       for (unsigned k = 0; k < RWA_MAX_VERTEX_BUFFERS; k++) {
          MTLVertexBufferLayoutDescriptor *l = [[vd layouts] objectAtIndexedSubscript:k];
@@ -637,6 +639,7 @@ bg_air_slice(NSData *d)
          shape.vertex_layout[k].stride = (unsigned)[l stride];
          shape.vertex_layout[k].step_function = (unsigned)[l stepFunction];
          shape.vertex_layout[k].step_rate = (unsigned)[l stepRate];
+         if ([l stride]) BG_TRACE("  layout %u: stride %lu step %lu rate %lu\n", k, (unsigned long)[l stride], (unsigned long)[l stepFunction], (unsigned long)[l stepRate]);
       }
    }
    char why[512] = { 0 };
@@ -1375,7 +1378,7 @@ bg_air_slice(NSData *d)
 - (id)device { return [_cb device]; }
 - (void)setRenderPipelineState:(id)s { _pipeline = s; }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
-{ if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
+{ BG_TRACE("setVertexBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 { if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
 // CoreAnimation binds a buffer once per pass and then only moves the offset between draws
@@ -1387,6 +1390,7 @@ bg_air_slice(NSData *d)
 { for (NSUInteger k = 0; k < r.length; k++) [self setFragmentBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
+   BG_TRACE("setVertexBytes length %lu index %lu\n", (unsigned long)l, (unsigned long)i);
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
    if (b) { [_scratch addObject:b]; [self setVertexBuffer:b offset:0 atIndex:i]; }
 }
@@ -1415,6 +1419,20 @@ bg_air_slice(NSData *d)
    if (bg_trace()) {
       BG_LOG("draw: prim %lu start %lu count %lu inst %lu index %s type %lu off %lu\n", (unsigned long)prim, (unsigned long)start,
              (unsigned long)count, (unsigned long)inst, ib ? "yes" : "no", (unsigned long)it, (unsigned long)io);
+      if (ib && count <= 64 && _vbuf[1]) {      // the vertices an indexed draw uses, slot 1 as CoreAnimation lays them out
+         const uint8_t *base = (const uint8_t *)[(BGMTLBuffer *)_vbuf[1] contents] + _voff[1];
+         const uint16_t *ix = (const uint16_t *)((const uint8_t *)[(BGMTLBuffer *)ib contents] + io);
+         unsigned maxi = 0;
+         char line[512]; size_t n = 0;
+         for (unsigned k = 0; k < count && n < sizeof(line) - 8; k++) { n += snprintf(line + n, sizeof(line) - n, "%u ", ix[k]); if (ix[k] > maxi) maxi = ix[k]; }
+         BG_LOG("  indices: %s\n", line);
+         for (unsigned v = 0; v <= maxi && v < 16; v++) {
+            const float *f = (const float *)(base + 48 * v);
+            const __fp16 *h = (const __fp16 *)(base + 48 * v + 32);
+            BG_LOG("  v%u: pos %g %g %g %g  a1 %g %g  a2 %g %g  col %g %g %g %g\n", v, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+                   (float)h[0], (float)h[1], (float)h[2], (float)h[3]);
+         }
+      }
       for (unsigned i = 0; i < _vhigh; i++) {
          if (!_vbuf[i]) continue;
          const float *f = (const float *)((const uint8_t *)[(BGMTLBuffer *)_vbuf[i] contents] + _voff[i]);

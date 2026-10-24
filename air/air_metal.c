@@ -6250,6 +6250,43 @@ rwa_render_create(struct rwa_device *device,
       out.generated_vertex_stage = 1;
    }
 
+   /* Link the varyings BY NAME, as Metal does. Each stage numbers its varyings in the
+    * order it declares them, so the slots only agree when the vertex function outputs
+    * exactly what the fragment function reads, in the same order. QuartzCore shares one
+    * vertex function (VfxXh, ...) between many fragment functions that read a subset of
+    * its outputs: A2Xhf read its colour from the slot of the vertex stage's first
+    * user output, and every CoreAnimation draw came out with the right geometry and
+    * garbage colours. Every fragment input is moved to the slot (and component) of the
+    * vertex output with the same AIR name; an input no output names is reported, which
+    * Metal refuses as a pipeline error. The generated quad stage numbers its outputs
+    * after the fragment inputs and needs nothing here.
+    */
+   if (!render->generated_vertex) {
+      nir_foreach_shader_in_variable(var, fs) {
+         if (var->data.location < VARYING_SLOT_VAR0)
+            continue;
+         const struct air_varying *in = NULL, *out = NULL;
+         for (unsigned i = 0; i < render->finfo.num_varyings && !in; i++)
+            if (render->finfo.varyings[i].slot == (unsigned)var->data.location &&
+                render->finfo.varyings[i].component == var->data.location_frac)
+               in = &render->finfo.varyings[i];
+         if (!in || !in->name)
+            continue;
+         for (unsigned i = 0; i < render->vinfo.num_varyings && !out; i++)
+            if (render->vinfo.varyings[i].name && !strcmp(render->vinfo.varyings[i].name, in->name))
+               out = &render->vinfo.varyings[i];
+         if (!out) {
+            say(why, why_size, "%s reads the varying %s, which %s does not output: Metal "
+                               "refuses a pipeline whose stages do not link",
+                render->finfo.entry_point ? render->finfo.entry_point : "the fragment function",
+                in->name, render->vinfo.entry_point ? render->vinfo.entry_point : "the vertex function");
+            goto fail;
+         }
+         var->data.location = out->slot;
+         var->data.location_frac = out->component;
+      }
+   }
+
    /* Compile both stages now. A failure here is a creation failure and says so; the
     * stages are linked later, at the draw.
     */
