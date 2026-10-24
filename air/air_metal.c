@@ -6349,6 +6349,8 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
       }
       if (bounded && end)
          r->size = end;
+      else if (bounded)
+         r->size = 4;   /* never read by this stage (CoreAnimation binds its uniforms to both): not the 4 KB cap */
    }
    if (range_ht)
       _mesa_hash_table_destroy(range_ht, NULL);
