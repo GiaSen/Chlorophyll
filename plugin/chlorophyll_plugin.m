@@ -80,6 +80,10 @@ chl_refusal(unsigned *minor)
    if (chl_listed("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.deny", name) == 1) return "listed in chlorophyll.deny";
    if (chl_listed("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.allow", name) == 0) return "chlorophyll.allow exists and does not list it";
    if (chl_inject_loaded()) return "the bgmtl inject owns this process's device";
+   /* backboardd's Metal mode belongs to bgl-launch and the inject (compositor profile, readback, watchdog); when they chose
+    * the CPU renderer (bgmtl-bb.off) that is the fallback, and a plugin device there composited without the compositor
+    * profile (static areas showed the zoomed wallpaper) */
+   if (!strcmp(name, "backboardd")) return "backboardd: Metal only through the inject, else the CPU renderer";
    if (bgmtl_gpu_state(minor) != 1) return "the kernel reports the GPU not ready";
    return NULL;
 }
