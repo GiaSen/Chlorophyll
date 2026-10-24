@@ -13,6 +13,14 @@
 // While registered a watchdog thread polls the kernel GPU state once a second: LOST, or 3 failed command buffers, writes bgmtl.off and
 // _exit(0)s; the extension then relaunches as stock Metal-less. After 15 s alive the dead-man counter resets.
 // Everything it does is logged to /private/var/tmp/bgmtl.log.
+//
+// backboardd (Chlorophyll as the system compositor): only when bgl-launch chose Metal for this launch and says so with BGMTL_BB=1
+// (bgl-launch has already checked bgmtl-bb.arm, bgmtl-bb.off and that the previous Metal launch became healthy). Here: the device is
+// registered before QuartzCore creates its render server (which then builds CA::OGL::MetalContext itself), framebuffer and IOSurface
+// compression and deep framebuffers are turned off (Apple GPU layouts this GPU does not write), and a stricter watchdog runs: GPU
+// lost, 3 failed command buffers, or no completed command buffer within 60 s of launch write bgmtl-bb.off and _exit(0); launchd
+// relaunches backboardd and bgl-launch starts it on the ES path. 10 s after the first completed command buffer with no failure the
+// launch is marked healthy in bgmtl-bb.state. "crashtest" in bgmtl-bb.arm crashes on purpose 5 s after registration (guard test).
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
@@ -33,8 +41,13 @@ extern int bgmtl_gpu_state(unsigned *abi_minor);
 #define F_STATE "/private/var/tmp/bgmtl.state"
 #define F_LOG "/private/var/tmp/bgmtl.log"
 
+#define F_BB_OFF "/private/var/tmp/bgmtl-bb.off"
+#define F_BB_ARM "/private/var/tmp/bgmtl-bb.arm"
+#define F_BB_STATE "/private/var/tmp/bgmtl-bb.state"
+
 static const char *const kAllow[] = { "com.apple.MercuryPoster", NULL };
-static volatile int g_failures, g_registered;
+static volatile int g_failures, g_registered, g_bb;
+static volatile unsigned g_completed;
 
 static void
 ilog(const char *fmt, ...)
@@ -80,10 +93,20 @@ write_state(int unclean, int alive)
 }
 
 static void
+bb_state(int alive)
+{
+   FILE *f = fopen(F_BB_STATE, "w");
+   if (!f) return;
+   fprintf(f, "alive=%d boot=%s\n", alive, boot_id());
+   fclose(f);
+}
+
+static void
 trip(const char *why)
 {
-   ilog("DEAD-MAN: %s: writing %s and exiting", why, F_OFF);
-   FILE *f = fopen(F_OFF, "w");
+   const char *off = g_bb ? F_BB_OFF : F_OFF;
+   ilog("DEAD-MAN%s: %s: writing %s and exiting", g_bb ? " (backboardd)" : "", why, off);
+   FILE *f = fopen(off, "w");
    if (f) { fprintf(f, "%s\n", why); fclose(f); }
    _exit(0);
 }
@@ -105,8 +128,8 @@ bgmtl_note_present(const char *line)
 void
 bgmtl_note_completed(void)
 {
-   static volatile unsigned n;
-   if (__sync_add_and_fetch(&n, 1) == 1) {
+   if (__sync_add_and_fetch(&g_completed, 1) == 1) {
+      if (g_bb) { ilog("backboardd: first command buffer completed"); return; }
       write_state(0, 1);
       ilog("first command buffer completed: dead-man counter reset");
    }
@@ -125,6 +148,33 @@ bgmtl_note_failure(const char *why)
    ilog("command buffer failure %d: %s", n, why ? why : "?");
    if (n >= 3)
       trip("3 failed command buffers");
+}
+
+// backboardd: the stricter watchdog (see the header)
+static void *
+watchdog_bb(void *arg)
+{
+   int crashtest = (int)(intptr_t)arg;
+   unsigned healthy_at = 0;
+   for (unsigned t = 1;; t++) {
+      sleep(1);
+      unsigned minor = 0;
+      if (bgmtl_gpu_state(&minor) == 2)
+         trip("the kernel reports the GPU lost");
+      if (crashtest && t == 5) {
+         ilog("backboardd: crashtest armed: crashing on purpose");
+         abort();
+      }
+      if (!g_completed && t >= 60)
+         trip("no command buffer completed within 60 s of launch");
+      if (g_completed && !healthy_at)
+         healthy_at = t + 10;
+      if (healthy_at && t == healthy_at && g_failures == 0) {
+         bb_state(1);
+         ilog("backboardd: healthy (10 s after the first completed command buffer, no failure)");
+      }
+   }
+   return NULL;
 }
 
 static void *
@@ -173,10 +223,48 @@ install_diag(void)
    method_setImplementation(m, (IMP)bgmtl_dnrs);
 }
 
+static void
+bb_init(void)
+{
+   g_bb = 1;
+   if (exists(F_BB_OFF)) { ilog("backboardd: %s present, stock", F_BB_OFF); return; }
+   int crashtest = 0;
+   FILE *a = fopen(F_BB_ARM, "r");
+   if (!a) { ilog("backboardd: not armed, stock"); return; }
+   char word[32] = "";
+   if (fscanf(a, "%31s", word) == 1 && !strcmp(word, "crashtest")) crashtest = 1;
+   fclose(a);
+   unsigned minor = 0;
+   int st = bgmtl_gpu_state(&minor);
+   if (st != 1) { ilog("backboardd: GPU state %d (1 = ready): stock", st); return; }
+   // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
+   setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+   CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+   CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+   CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+   id dev = bgmtl_create_device();
+   if (!dev) { ilog("backboardd: no device could be made: stock"); return; }
+   void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
+   NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
+   if (!add || !all) { ilog("backboardd: Metal registration entry points missing: stock"); return; }
+   ilog("backboardd: devices before registration: %lu", (unsigned long)[all() count]);
+   install_diag();
+   add(dev);
+   g_registered = 1;
+   ilog("backboardd: Chlorophyll device registered (kernel ABI minor %u)%s", minor, crashtest ? ", CRASHTEST armed" : "");
+   pthread_t th;
+   pthread_create(&th, NULL, watchdog_bb, (void *)(intptr_t)crashtest);
+   pthread_detach(th);
+}
+
 __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
    @autoreleasepool {
+      if (getenv("BGMTL_BB") && !strcmp(getprogname(), "backboardd")) {   // bgl-launch chose Metal for this launch
+         bb_init();
+         return;
+      }
       NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
       int allowed = 0;
       for (const char *const *a = kAllow; *a; a++)
