@@ -74,12 +74,13 @@ bg_log(const char *fmt, ...)
 
 // provided by the injection dylib (gpu/metal/inject), absent in the test tools
 __attribute__((weak)) void bgmtl_note_failure(const char *why) { (void)why; }   // overridden by the injection dylib
+__attribute__((weak)) void bgmtl_note_unimplemented(const char *sel) { (void)sel; }   // likewise: logged by the injection dylib
 
 @class BGMTLDevice;
 @class BGMTLComputePipeline;
 
 // ---- recorded work ---------------------------------------------------------------------------------------------------
-enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
+enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF };
 #define BG_MAX_TEX 16
 @interface BGWork : NSObject {
  @public
@@ -116,6 +117,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
    unsigned clear_stencil, stencil_ref[2];
    BOOL have_range;
    float depth_range[2];
+   // texture blits: source/destination slice+level, origins and the size of the region, buffer layout
+   NSUInteger t_sslice, t_slevel, t_dslice, t_dlevel, t_sorg[3], t_dorg[3], t_size[3], t_bpr, t_bpi;
 }
 @end
 @implementation BGWork
@@ -136,8 +139,10 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
    struct rwa_device *_rwa;
    char _why[512];
    BOOL _assertions;
+   NSMutableDictionary *_nulls;    // zero textures for unbound slots, by type and element
 }
 - (struct rwa_device *)rwa;
+- (id)bgNullTextureForType:(unsigned)type element:(unsigned)element;
 - (NSString *)bgWhy;
 - (id)bgFail:(NSError **)error with:(NSString *)reason;
 @end
@@ -231,6 +236,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW };
    BGMTLDevice *_owner;
    struct rwa_render *_render;
    struct rwa_render_info _info;
+   struct rwa_texture_decl _decls[16];   // the fragment stage's texture slots, for filling the ones nothing was bound to
+   unsigned _ndecls;
 }
 @end
 
@@ -318,6 +325,66 @@ ensure_protocol(Class cls, const char *proto)
 - (uint64_t)currentAllocatedSize { return 0; }
 - (MTLSize)maxThreadsPerThreadgroup { return MTLSizeMake(1024, 1024, 64); }
 - (NSUInteger)maxThreadgroupMemoryLength { return 16384; }
+
+// The device is a stand-in for a Metal device in a process that has none, so a client may ask it something nobody has implemented yet.
+// Metal's stock behaviour for an unknown selector is to abort the process; for a selector that IS in the MTLDevice / MTLDeviceSPI
+// protocols we answer zero (nil / NO / 0) and tell the injection dylib, which logs it. Anything outside the protocols still aborts.
+- (id)bgNullTextureForType:(unsigned)type element:(unsigned)element
+{
+   if (!_nulls) _nulls = [[NSMutableDictionary alloc] init];
+   NSNumber *key = @(type * 8 + element);
+   id t = _nulls[key];
+   if (t) return t;
+   MTLTextureDescriptor *d = [[[MTLTextureDescriptor alloc] init] autorelease];
+   d.textureType = (MTLTextureType)type;
+   d.pixelFormat = element == RWA_ELEMENT_UINT ? MTLPixelFormatRGBA8Uint : element == RWA_ELEMENT_INT ? MTLPixelFormatRGBA8Sint : MTLPixelFormatRGBA8Unorm;
+   d.width = 1; d.height = 1; d.depth = 1; d.arrayLength = 1; d.mipmapLevelCount = 1; d.sampleCount = 1;
+   d.usage = MTLTextureUsageShaderRead;
+   t = [[self newTextureWithDescriptor:d] autorelease];
+   if (!t) return nil;
+   uint8_t zero[16] = { 0 };
+   unsigned slices = type == MTLTextureTypeCube ? 6 : 1;
+   for (unsigned sl = 0; sl < slices; sl++)
+      [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:sl withBytes:zero bytesPerRow:16 bytesPerImage:0];
+   _nulls[key] = t;
+   return t;
+}
+- (uint64_t)registryID { return 0x10000b630ULL; }
+- (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1 || count == 4; }
+- (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format { (void)format; return 64; }
+- (uint64_t)sharedMemorySize { return 2048ULL << 20; }
+- (uint64_t)dedicatedMemorySize { return 0; }
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+{
+   NSMethodSignature *sig = [super methodSignatureForSelector:sel];
+   if (sig) return sig;
+   const char *names[] = { "MTLDevice", "MTLDeviceSPI" };
+   for (unsigned i = 0; i < 2; i++) {
+      Protocol *pr = objc_getProtocol(names[i]);
+      if (!pr) continue;
+      for (int req = 0; req < 2; req++) {
+         struct objc_method_description d = protocol_getMethodDescription(pr, sel, req, YES);
+         if (d.name && d.types) return [NSMethodSignature signatureWithObjCTypes:d.types];
+      }
+   }
+   return nil;
+}
+
+- (void)forwardInvocation:(NSInvocation *)inv
+{
+   SEL sel = [inv selector];
+   BG_LOG("device: unimplemented %s answered with zero\n", sel_getName(sel));
+   bgmtl_note_unimplemented(sel_getName(sel));
+   NSUInteger len = [[inv methodSignature] methodReturnLength];
+   if (len) {
+      void *z = calloc(1, len);
+      [inv setReturnValue:z];
+      free(z);
+   }
+}
+
 - (BOOL)metalAssertionsEnabled { return _assertions; }
 - (void)setMetalAssertionsEnabled:(BOOL)enabled { _assertions = enabled; }
 
@@ -418,6 +485,11 @@ ensure_protocol(Class cls, const char *proto)
    BGMTLRenderPipeline *p = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
    if (!p) { rwa_render_destroy(r); return [self bgFail:error with:@"_MTLRenderPipelineState refused to initialise"]; }
    p->_owner = self; p->_render = r; p->_info = info;
+   {
+      char dwhy[128] = { 0 };
+      unsigned nd = 0;
+      if (rwa_module_textures(_rwa, fair.bytes, fair.length, [[fragment name] UTF8String], p->_decls, 16, &nd, dwhy, sizeof(dwhy)) == 0) p->_ndecls = nd;
+   }
    BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
           vertex ? [[vertex name] UTF8String] : "(generated)", [[fragment name] UTF8String], info.vertex_buffers, info.fragment_buffers,
           info.fragment_textures, info.fragment_samplers, info.vertex_streams);
@@ -582,6 +654,29 @@ ensure_protocol(Class cls, const char *proto)
    _status = 5;   // MTLCommandBufferStatusError
 }
 
+// texture blits run on the CPU through the textures' own read/write paths (shared memory; everything before it is finished).
+- (void)bgApplyTextureBlit:(BGWork *)w
+{
+   NSUInteger bpr = w->t_size[0] * 16, bpi = bpr * w->t_size[1];
+   if (w->kind == BG_WORK_TEXCOPY) {
+      void *tmp = malloc(bpi * w->t_size[2]);
+      if (!tmp) return;
+      MTLRegion sr = { { w->t_sorg[0], w->t_sorg[1], w->t_sorg[2] }, { w->t_size[0], w->t_size[1], w->t_size[2] } };
+      MTLRegion dr = { { w->t_dorg[0], w->t_dorg[1], w->t_dorg[2] }, { w->t_size[0], w->t_size[1], w->t_size[2] } };
+      [(BGMTLTexture *)w->src getBytes:tmp bytesPerRow:bpr bytesPerImage:bpi fromRegion:sr mipmapLevel:w->t_slevel slice:w->t_sslice];
+      [(BGMTLTexture *)w->dst replaceRegion:dr mipmapLevel:w->t_dlevel slice:w->t_dslice withBytes:tmp bytesPerRow:bpr bytesPerImage:bpi];
+      free(tmp);
+   } else if (w->kind == BG_WORK_BUF2TEX) {
+      MTLRegion dr = { { w->t_dorg[0], w->t_dorg[1], w->t_dorg[2] }, { w->t_size[0], w->t_size[1], w->t_size[2] } };
+      [(BGMTLTexture *)w->dst replaceRegion:dr mipmapLevel:w->t_dlevel slice:w->t_dslice
+                                  withBytes:(uint8_t *)[(BGMTLBuffer *)w->src contents] + w->src_off bytesPerRow:w->t_bpr bytesPerImage:w->t_bpi];
+   } else {
+      MTLRegion sr = { { w->t_sorg[0], w->t_sorg[1], w->t_sorg[2] }, { w->t_size[0], w->t_size[1], w->t_size[2] } };
+      [(BGMTLTexture *)w->src getBytes:(uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off bytesPerRow:w->t_bpr bytesPerImage:w->t_bpi
+                            fromRegion:sr mipmapLevel:w->t_slevel slice:w->t_sslice];
+   }
+}
+
 - (void)commit
 {
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
@@ -652,7 +747,9 @@ ensure_protocol(Class cls, const char *proto)
       } else {
          // CPU blit on shared memory: everything dispatched so far must be done first
          if (rwa_finish([dev rwa], why, sizeof(why)) != 0) { [self bgFailWith:[NSString stringWithUTF8String:why] code:3]; break; }
-         if (w->kind == BG_WORK_COPY)
+         if (w->kind == BG_WORK_TEXCOPY || w->kind == BG_WORK_BUF2TEX || w->kind == BG_WORK_TEX2BUF) {
+            [self bgApplyTextureBlit:w];
+         } else if (w->kind == BG_WORK_COPY)
             memmove((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, (uint8_t *)[(BGMTLBuffer *)w->src contents] + w->src_off, w->size);
          else
             memset((uint8_t *)[(BGMTLBuffer *)w->dst contents] + w->dst_off, w->fill, w->size);
@@ -770,6 +867,63 @@ ensure_protocol(Class cls, const char *proto)
    w->kind = BG_WORK_FILL; w->dst = [buffer retain]; w->dst_off = range.location; w->size = range.length; w->fill = value;
    [_cb bgRecord:w];
 }
+- (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size
+             toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg
+{
+   BGWork *w = [[[BGWork alloc] init] autorelease];
+   w->kind = BG_WORK_TEXCOPY; w->src = [src retain]; w->dst = [dst retain];
+   w->t_sslice = ss; w->t_slevel = sl; w->t_dslice = ds; w->t_dlevel = dl;
+   w->t_sorg[0] = so.x; w->t_sorg[1] = so.y; w->t_sorg[2] = so.z; w->t_dorg[0] = dorg.x; w->t_dorg[1] = dorg.y; w->t_dorg[2] = dorg.z;
+   w->t_size[0] = size.width; w->t_size[1] = size.height; w->t_size[2] = size.depth;
+   [_cb bgRecord:w];
+}
+- (void)copyFromTexture:(id)src toTexture:(id)dst
+{
+   NSUInteger levels = [(id<MTLTexture>)src mipmapLevelCount], slices = [(id<MTLTexture>)src arrayLength];
+   if (slices < 1) slices = 1;
+   for (NSUInteger l = 0; l < levels; l++) {
+      MTLSize sz = MTLSizeMake(MAX(1, [(id<MTLTexture>)src width] >> l), MAX(1, [(id<MTLTexture>)src height] >> l), MAX(1, [(id<MTLTexture>)src depth] >> l));
+      for (NSUInteger s = 0; s < slices; s++)
+         [self copyFromTexture:src sourceSlice:s sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:sz
+                     toTexture:dst destinationSlice:s destinationLevel:l destinationOrigin:MTLOriginMake(0, 0, 0)];
+   }
+}
+- (void)copyFromBuffer:(id)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size
+             toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg
+{
+   BGWork *w = [[[BGWork alloc] init] autorelease];
+   w->kind = BG_WORK_BUF2TEX; w->src = [buf retain]; w->dst = [dst retain]; w->src_off = so; w->t_bpr = bpr; w->t_bpi = bpi;
+   w->t_dslice = ds; w->t_dlevel = dl; w->t_dorg[0] = dorg.x; w->t_dorg[1] = dorg.y; w->t_dorg[2] = dorg.z;
+   w->t_size[0] = size.width; w->t_size[1] = size.height; w->t_size[2] = size.depth;
+   [_cb bgRecord:w];
+}
+- (void)copyFromBuffer:(id)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size
+             toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg options:(NSUInteger)opt
+{
+   (void)opt;
+   [self copyFromBuffer:buf sourceOffset:so sourceBytesPerRow:bpr sourceBytesPerImage:bpi sourceSize:size toTexture:dst destinationSlice:ds destinationLevel:dl destinationOrigin:dorg];
+}
+- (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size
+               toBuffer:(id)buf destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi
+{
+   BGWork *w = [[[BGWork alloc] init] autorelease];
+   w->kind = BG_WORK_TEX2BUF; w->src = [src retain]; w->dst = [buf retain]; w->dst_off = doff; w->t_bpr = bpr; w->t_bpi = bpi;
+   w->t_sslice = ss; w->t_slevel = sl; w->t_sorg[0] = so.x; w->t_sorg[1] = so.y; w->t_sorg[2] = so.z;
+   w->t_size[0] = size.width; w->t_size[1] = size.height; w->t_size[2] = size.depth;
+   [_cb bgRecord:w];
+}
+- (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size
+               toBuffer:(id)buf destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi options:(NSUInteger)opt
+{
+   (void)opt;
+   [self copyFromTexture:src sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:size toBuffer:buf destinationOffset:doff destinationBytesPerRow:bpr destinationBytesPerImage:bpi];
+}
+// shared memory: nothing to flush
+- (void)synchronizeResource:(id)r { (void)r; }
+- (void)synchronizeTexture:(id)t slice:(NSUInteger)s level:(NSUInteger)l { (void)t; (void)s; (void)l; }
+- (void)generateMipmapsForTexture:(id)t { BG_LOG("blit: generateMipmapsForTexture ignored\n"); (void)t; }
+- (void)optimizeContentsForGPUAccess:(id)t { (void)t; }
+- (void)optimizeContentsForCPUAccess:(id)t { (void)t; }
 - (void)endEncoding { [super endEncoding]; }
 @end
 
@@ -1008,6 +1162,15 @@ ensure_protocol(Class cls, const char *proto)
    w->vcount = _vhigh;
    for (unsigned i = 0; i < BG_MAX_TEX; i++) { w->textures[i] = [_tex[i] retain]; w->samplers[i] = [_smp[i] retain]; }
    w->texture_count = _thigh; w->sampler_count = _shigh;
+   // Metal reads zeros from a texture slot nothing was bound to; this library asks for a texture, so give it one that is zero
+   for (unsigned i = 0; i < _pipeline->_ndecls; i++) {
+      unsigned idx = _pipeline->_decls[i].index;
+      if (idx >= BG_MAX_TEX || w->textures[idx]) continue;
+      w->textures[idx] = [[(BGMTLDevice *)[_cb device] bgNullTextureForType:_pipeline->_decls[i].type_known ? _pipeline->_decls[i].type : 2
+                                                                    element:_pipeline->_decls[i].element] retain];
+      if (idx + 1 > w->texture_count) w->texture_count = idx + 1;
+      BG_LOG("draw: texture slot %u was not bound; a zero texture stands in\n", idx);
+   }
    w->color_count = _ncolor;
    for (unsigned i = 0; i < _ncolor; i++) w->color[i] = [_color[i] retain];
    if (_clear_pending) { w->clear = YES; memcpy(w->clear_color, _clear, sizeof(_clear)); _clear_pending = NO; }

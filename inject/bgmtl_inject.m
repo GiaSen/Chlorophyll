@@ -14,6 +14,7 @@
 // _exit(0)s; the extension then relaunches as stock Metal-less. After 15 s alive the dead-man counter resets.
 // Everything it does is logged to /private/var/tmp/bgmtl.log.
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -74,6 +75,12 @@ trip(const char *why)
 }
 
 void
+bgmtl_note_unimplemented(const char *sel)
+{
+   ilog("UNIMPLEMENTED (answered zero): %s", sel);
+}
+
+void
 bgmtl_note_failure(const char *why)
 {
    int n = __sync_add_and_fetch(&g_failures, 1);
@@ -106,6 +113,28 @@ clean_exit(void)
       write_state(0, 1);
 }
 
+
+// Diagnostics for the first live run: an unrecognised selector sent to one of OUR objects is logged (class, selector) before the stock
+// handler aborts. Only objects whose class name starts with BGMTL are logged; everything else goes straight to the original.
+static IMP g_orig_dnrs;
+static void
+bgmtl_dnrs(id self, SEL _cmd, SEL sel)
+{
+   const char *cn = class_getName(object_getClass(self));
+   if (cn && !strncmp(cn, "BGMTL", 5))
+      ilog("UNRECOGNISED SELECTOR %s sent to %s", sel_getName(sel), cn);
+   ((void (*)(id, SEL, SEL))g_orig_dnrs)(self, _cmd, sel);
+}
+
+static void
+install_diag(void)
+{
+   Method m = class_getInstanceMethod([NSObject class], @selector(doesNotRecognizeSelector:));
+   if (!m) return;
+   g_orig_dnrs = method_getImplementation(m);
+   method_setImplementation(m, (IMP)bgmtl_dnrs);
+}
+
 __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
@@ -133,6 +162,13 @@ bgmtl_inject_init(void)
       if (!dev) { ilog("no device could be made (sandbox? GPU?): staying stock"); write_state(unclean, 1); return; }
       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
       if (!add) { ilog("MTLAddDevice not found: staying stock"); write_state(unclean, 1); return; }
+      // MTLAddDevice asserts `_deviceArray != NULL` until Metal has enumerated once (found in the first live run: abort in the
+      // constructor, before main). MTLCopyAllDevices builds that array; in this process it answers without a GPU service.
+      NSArray *(*all)(void) = (NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
+      if (!all) { ilog("MTLCopyAllDevices not found: staying stock"); write_state(unclean, 1); return; }
+      NSArray *pre = all();
+      ilog("devices before registration: %lu", (unsigned long)[pre count]);
+      install_diag();
       add(dev);
       g_registered = 1;
       ilog("%s: BGMTLDevice registered in this process (kernel ABI minor %u)", [bid UTF8String], minor);
