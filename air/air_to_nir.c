@@ -1058,6 +1058,23 @@ make_io_var(struct air_ctx *c, nir_variable_mode mode, const struct air_type *t,
    return var;
 }
 
+/* Chlorophyll: a 16-bit VARYING crosses the stage boundary as 32 bits. ir3 has no tested path for half-precision
+ * vertex outputs feeding half-precision fragment inputs (QuartzCore's VfxXh returns its colour as half4 and A2Xhf reads
+ * it as half4: the quad came out in two differently coloured triangles), so the interface variable is widened and the
+ * value is converted on each side: f2f32/i2i32 at the vertex stage's store, f2f16/i2i16 after the fragment stage's load.
+ * The shader's arithmetic stays 16-bit. */
+static nir_variable *
+make_varying_var(struct air_ctx *c, nir_variable_mode mode, const struct air_type *t, unsigned location, const char *name)
+{
+   nir_variable *var = make_io_var(c, mode, t, location, name);
+   if (glsl_get_bit_size(var->type) == 16) {
+      unsigned comps = glsl_get_vector_elements(var->type);
+      var->type = glsl_base_type_is_integer(glsl_get_base_type(var->type)) ? glsl_vector_type(GLSL_TYPE_INT, comps)
+                                                                            : glsl_vec_type(comps);
+   }
+   return var;
+}
+
 /* Bergamota: the slot and first component of the next varying. The first 12 take a slot each, as always; from the 13th on a 32-bit varying that
  * fits shares the last slot (ir3 has 32 output slots and Mercury's torus vertex stage returns 55 members). Both sides walk the members in the
  * same order, so a vertex output and the fragment input of the same member land in the same place. */
@@ -2083,7 +2100,7 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       unsigned slot, frac;
       alloc_varying(c, 0, next_varying, air_nir_components(t), air_nir_bit_size(c, t), &slot, &frac);
       const char *name = md_key_str(node, "air.arg_name");
-      nir_variable *var = make_io_var(c, nir_var_shader_in, t, slot, name);
+      nir_variable *var = make_varying_var(c, nir_var_shader_in, t, slot, name);
       var->data.location_frac = frac;
       var->data.driver_location = frac ? c->nir->num_inputs - 1 : c->nir->num_inputs++;
       if (md_key(node, "air.flat") >= 0)
@@ -2102,7 +2119,13 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          const char *link = fk >= 0 ? md_str(node, fk + 1) : NULL;
          add_varying_at(c, link ? link : name, slot, frac, air_nir_components(t), node);
       }
-      c->params[param] = air_val_ssa(c, nir_load_var(&c->b, var));
+      {
+         nir_def *v = nir_load_var(&c->b, var);
+         unsigned want = air_nir_bit_size(c, t);
+         if (v->bit_size != want)      /* a widened 16-bit varying (make_varying_var) */
+            v = air_type_is_float(air_type_scalar(t)) ? nir_f2fN(&c->b, v, want) : nir_i2iN(&c->b, v, want);
+         c->params[param] = air_val_ssa(c, v);
+      }
       return true;
    }
 
@@ -2207,7 +2230,9 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
                        name ? name : "unnamed", tn ? tn : "an aggregate", t->num_members);
    }
 
-   nir_variable *var = make_io_var(c, nir_var_shader_out, t, location, name);
+   nir_variable *var = location >= VARYING_SLOT_VAR0 && c->nir->info.stage == MESA_SHADER_VERTEX
+                          ? make_varying_var(c, nir_var_shader_out, t, location, name)
+                          : make_io_var(c, nir_var_shader_out, t, location, name);
    var->data.index = index;
    var->data.location_frac = out_frac;
    var->data.driver_location = out_frac ? c->nir->num_outputs - 1 : c->nir->num_outputs++;
@@ -3061,8 +3086,12 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
             return air_error(c, "interface: field %u of the result has no output", i);
          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
             continue; /* a field left undef is a target nothing writes */
-         nir_store_var(&c->b, c->outputs[i].var, v->elems[i]->def,
-                       BITFIELD_MASK(v->elems[i]->def->num_components));
+         nir_def *d = v->elems[i]->def;
+         unsigned vb = glsl_get_bit_size(c->outputs[i].var->type);
+         if (d->bit_size != vb && vb == 32)      /* a widened 16-bit varying (make_varying_var) */
+            d = glsl_base_type_is_integer(glsl_get_base_type(c->outputs[i].var->type)) ? nir_i2iN(&c->b, d, 32)
+                                                                                     : nir_f2fN(&c->b, d, 32);
+         nir_store_var(&c->b, c->outputs[i].var, d, BITFIELD_MASK(d->num_components));
       }
       return true;
    }
@@ -3070,7 +3099,11 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
       return air_error(c, "instruction: a returned value that is not a number");
    if (!c->num_outputs || !c->outputs[0].var)
       return air_error(c, "interface: a returned value with no output");
-   nir_store_var(&c->b, c->outputs[0].var, v->def, BITFIELD_MASK(v->def->num_components));
+   nir_def *d = v->def;
+   unsigned vb = glsl_get_bit_size(c->outputs[0].var->type);
+   if (d->bit_size != vb && vb == 32)
+      d = glsl_base_type_is_integer(glsl_get_base_type(c->outputs[0].var->type)) ? nir_i2iN(&c->b, d, 32) : nir_f2fN(&c->b, d, 32);
+   nir_store_var(&c->b, c->outputs[0].var, d, BITFIELD_MASK(d->num_components));
    return true;
 }
 

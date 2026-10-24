@@ -17,6 +17,7 @@
 #import <Foundation/Foundation.h>
 #include <libkern/OSByteOrder.h>
 #include <os/lock.h>
+#include <sys/stat.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -602,6 +603,12 @@ bg_air_slice(NSData *d)
    NSData *vair = vertex ? ((NSData * (*)(id, SEL))objc_msgSend)(vertex, bitcode) : nil;
    NSData *fair = ((NSData * (*)(id, SEL))objc_msgSend)(fragment, bitcode);
    if (!fair.length || (vertex && !vair.length)) return [self bgFail:error with:@"a function has no bitcode"];
+   if (bg_trace() && getenv("BGMTL_DUMP")) {   // the exact modules this pipeline is built from, for air2nir on the Mac
+      mkdir(getenv("BGMTL_DUMP"), 0755);
+      NSString *d = [NSString stringWithUTF8String:getenv("BGMTL_DUMP")];
+      if (vair) [vair writeToFile:[d stringByAppendingFormat:@"/%@.v.bc", [vertex name]] atomically:NO];
+      [fair writeToFile:[d stringByAppendingFormat:@"/%@.f.bc", [fragment name]] atomically:NO];
+   }
    struct rwa_render_shape shape;
    memset(&shape, 0, sizeof(shape));
    shape.sample_count = (unsigned)[descriptor sampleCount];
