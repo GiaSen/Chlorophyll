@@ -18,6 +18,7 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#include <time.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <stdarg.h>
@@ -74,13 +75,14 @@ bg_log(const char *fmt, ...)
 
 // provided by the injection dylib (gpu/metal/inject), absent in the test tools
 __attribute__((weak)) void bgmtl_note_failure(const char *why) { (void)why; }   // overridden by the injection dylib
-__attribute__((weak)) void bgmtl_note_unimplemented(const char *sel) { (void)sel; }   // likewise: logged by the injection dylib
+__attribute__((weak)) void bgmtl_note_unimplemented(const char *sel) { (void)sel; }
+__attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib   // likewise: logged by the injection dylib
 
 @class BGMTLDevice;
 @class BGMTLComputePipeline;
 
 // ---- recorded work ---------------------------------------------------------------------------------------------------
-enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF };
+enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR };
 #define BG_MAX_TEX 16
 @interface BGWork : NSObject {
  @public
@@ -118,6 +120,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
    BOOL have_range;
    float depth_range[2];
    // texture blits: source/destination slice+level, origins and the size of the region, buffer layout
+   unsigned clear_mask;            // BG_WORK_CLEAR: bit i = colour attachment i is MTLLoadActionClear to clear_vals[i]
+   float clear_vals[8][4];
    NSUInteger t_sslice, t_slevel, t_dslice, t_dlevel, t_sorg[3], t_dorg[3], t_size[3], t_bpr, t_bpi;
 }
 @end
@@ -251,8 +255,8 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
    unsigned _thigh, _shigh;
    id _color[8];
    unsigned _ncolor;
-   BOOL _clear_pending;
-   float _clear[4];
+   unsigned _clear_mask;           // colour attachments cleared at the start of the pass
+   float _clear_vals[8][4];
    NSMutableArray *_scratch;
    id _depth, _depth_state;
    BOOL _clear_depth_pending, _clear_stencil_pending;
@@ -679,6 +683,7 @@ ensure_protocol(Class cls, const char *proto)
 
 - (void)commit
 {
+   uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    _status = 2;   // Committed
    char why[512] = { 0 };
@@ -699,6 +704,20 @@ ensure_protocol(Class cls, const char *proto)
                                    .samplers = smps, .sampler_count = w->sampler_count };
          if (rwa_dispatch_buffers(w->pipeline->_compute, &b, table, w->count, w->groups, w->group_size, why, sizeof(why)) != 0) {
             [self bgFailWith:[NSString stringWithUTF8String:why] code:2];
+            break;
+         }
+      } else if (w->kind == BG_WORK_CLEAR) {
+         struct rwa_texture *colors[8] = { NULL };
+         for (unsigned i = 0; i < w->color_count; i++) colors[i] = [(BGMTLTexture *)w->color[i] rwaTexture];
+         struct rwa_clear cl;
+         memset(&cl, 0, sizeof(cl));
+         cl.color = colors; cl.color_count = w->color_count; cl.color_mask = w->clear_mask;
+         memcpy(cl.color_value, w->clear_vals, sizeof(cl.color_value));
+         if (w->depth) cl.depth = [(BGMTLTexture *)w->depth rwaTexture];
+         if (w->clear_depth_set) cl.clear_depth = &w->clear_depth;
+         if (w->clear_stencil_set) cl.clear_stencil = &w->clear_stencil;
+         if (rwa_render_clear([dev rwa], &cl, why, sizeof(why)) != 0) {
+            [self bgFailWith:[NSString stringWithUTF8String:why] code:5];
             break;
          }
       } else if (w->kind == BG_WORK_DRAW) {
@@ -765,11 +784,41 @@ ensure_protocol(Class cls, const char *proto)
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
    if (_status == 4)
       for (BGWork *w in _work)
-         if (w->kind == BG_WORK_DRAW)
+         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
             for (unsigned i = 0; i < w->color_count; i++)
                rwa_texture_flush_surface([(BGMTLTexture *)w->color[i] rwaTexture]);
    for (void (^h)(id) in _scheduled) h(self);
    [_scheduled removeAllObjects];
+   if (_status == 4 && [_presents count]) {
+      // per-present diagnostics: what this command buffer drew, how long it took, and whether the picture it presents is black. Five texels of
+      // the last colour attachment (linear 8-bit formats only) are read back; this costs five tiny CPU reads of memory the fence already paid for.
+      unsigned ndraw = 0, nclear = 0, npass_att = 0;
+      BGMTLTexture *last = nil;
+      for (BGWork *w in _work) {
+         if (w->kind == BG_WORK_DRAW) { ndraw++; if (w->color_count) last = (BGMTLTexture *)w->color[0]; }
+         else if (w->kind == BG_WORK_CLEAR) { nclear++; if (w->color_count) last = (BGMTLTexture *)w->color[0]; }
+         npass_att = w->color_count > npass_att ? w->color_count : npass_att;
+      }
+      double luma = -1;
+      unsigned wd = 0, ht = 0;
+      if (last && ([last pixelFormat] == MTLPixelFormatBGRA8Unorm || [last pixelFormat] == MTLPixelFormatRGBA8Unorm ||
+                   [last pixelFormat] == MTLPixelFormatBGRA8Unorm_sRGB)) {
+         wd = (unsigned)[last width]; ht = (unsigned)[last height];
+         const unsigned pts[5][2] = { { wd / 2, ht / 2 }, { wd / 4, ht / 4 }, { 3 * wd / 4, ht / 4 }, { wd / 4, 3 * ht / 4 }, { 3 * wd / 4, 3 * ht / 4 } };
+         double sum = 0;
+         for (unsigned k = 0; k < 5; k++) {
+            uint8_t px[4] = { 0 };
+            [last getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(pts[k][0], pts[k][1], 1, 1) mipmapLevel:0];
+            sum += (px[0] + px[1] + px[2]) / 3.0;
+         }
+         luma = sum / 5;
+      }
+      uint64_t t_end = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+      char line[200];
+      snprintf(line, sizeof(line), "present: %u presents, %u draws, %u clears, up to %u attachments, %ux%u, mean texel value %.1f, commit %.1f ms, at %.3f s",
+               (unsigned)[_presents count], ndraw, nclear, npass_att, wd, ht, luma, (t_end - t_begin) / 1e6, t_end / 1e9);
+      bgmtl_note_present(line);
+   }
    if (_status == 4) {
       for (NSArray *p in _presents) {
          id dr = p[0];
@@ -1098,10 +1147,10 @@ ensure_protocol(Class cls, const char *proto)
       if (!a || ![a texture]) continue;
       _color[i] = [[a texture] retain];
       _ncolor = i + 1;
-      if (i == 0 && [a loadAction] == MTLLoadActionClear) {
+      if ([a loadAction] == MTLLoadActionClear) {
          MTLClearColor c = [a clearColor];
-         _clear[0] = (float)c.red; _clear[1] = (float)c.green; _clear[2] = (float)c.blue; _clear[3] = (float)c.alpha;
-         _clear_pending = YES;
+         _clear_mask |= 1u << i;
+         _clear_vals[i][0] = (float)c.red; _clear_vals[i][1] = (float)c.green; _clear_vals[i][2] = (float)c.blue; _clear_vals[i][3] = (float)c.alpha;
       }
    }
    MTLRenderPassDepthAttachmentDescriptor *da = [d depthAttachment];
@@ -1113,6 +1162,22 @@ ensure_protocol(Class cls, const char *proto)
    if (sa && [sa texture]) {
       if (!_depth) _depth = [[sa texture] retain];
       if ([sa loadAction] == MTLLoadActionClear) { _clear_stencil_v = (unsigned)[sa clearStencil]; _clear_stencil_pending = YES; }
+   }
+   // The pass's clears happen HERE, at the start of the pass, as one piece of work of their own -- not inside the first draw. A pass that
+   // draws nothing still clears; attachments clear to their own colours; and an attachment that is loaded is never touched by another's clear.
+   if (_clear_mask || _clear_depth_pending || _clear_stencil_pending) {
+      BGWork *w = [[[BGWork alloc] init] autorelease];
+      w->kind = BG_WORK_CLEAR;
+      w->color_count = _ncolor;
+      for (unsigned i = 0; i < _ncolor; i++) w->color[i] = [_color[i] retain];
+      w->clear_mask = _clear_mask;
+      memcpy(w->clear_vals, _clear_vals, sizeof(_clear_vals));
+      w->depth = [_depth retain];
+      if (_clear_depth_pending) { w->clear_depth_set = YES; w->clear_depth = _clear_depth_v; }
+      if (_clear_stencil_pending) { w->clear_stencil_set = YES; w->clear_stencil = _clear_stencil_v; }
+      _clear_depth_pending = _clear_stencil_pending = NO;
+      _clear_mask = 0;
+      [_cb bgRecord:w];
    }
    return self;
 }
@@ -1173,7 +1238,6 @@ ensure_protocol(Class cls, const char *proto)
    }
    w->color_count = _ncolor;
    for (unsigned i = 0; i < _ncolor; i++) w->color[i] = [_color[i] retain];
-   if (_clear_pending) { w->clear = YES; memcpy(w->clear_color, _clear, sizeof(_clear)); _clear_pending = NO; }
    w->depth = [_depth retain]; w->depth_state = [_depth_state retain];
    if (_clear_depth_pending) { w->clear_depth_set = YES; w->clear_depth = _clear_depth_v; _clear_depth_pending = NO; }
    if (_clear_stencil_pending) { w->clear_stencil_set = YES; w->clear_stencil = _clear_stencil_v; _clear_stencil_pending = NO; }

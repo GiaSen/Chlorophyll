@@ -74,6 +74,18 @@ trip(const char *why)
    _exit(0);
 }
 
+// Per-present lines from bgmtl.m: the first 120 are logged, then every 30th, and every one whose picture reads black or whose gap to the
+// previous present is over 150 ms (the flicker investigation: a black frame between draws, or a stalled frame loop).
+void
+bgmtl_note_present(const char *line)
+{
+   static volatile unsigned n;
+   unsigned k = __sync_add_and_fetch(&n, 1);
+   int black = strstr(line, "mean texel value 0.0") != NULL;
+   if (k <= 120 || k % 30 == 0 || black)
+      ilog("#%u %s%s", k, line, black ? "  <-- BLACK" : "");
+}
+
 void
 bgmtl_note_unimplemented(const char *sel)
 {

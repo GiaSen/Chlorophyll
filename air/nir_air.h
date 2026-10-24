@@ -325,6 +325,19 @@ struct air_shader_info {
    const char **notes;
 
    unsigned threadgroup_bytes; /* static threadgroup memory */
+
+   /* Bergamota: the IMAGEBLOCK of a tile function (Metal's tile shading; QuartzCore's tile_* kernels) -- `air.imageblock`, layout `implicit`, one member
+    * per colour attachment the function touches. This translator has no tile memory: a read or write of member i becomes a storage-image access of
+    * the pass's colour attachment `render_target` at tile_origin + position, and each used member shows up in `resources` as an IMAGE at
+    * `image_index` (named "imageblock.rtN") that the runtime binds to that attachment. A function that declares an imageblock is translated as a
+    * compute shader that runs once per tile: one workgroup per tile of the pass, workgroup size = threadsPerTile.
+    */
+   unsigned num_imageblock;
+   struct air_imageblock_member {
+      unsigned render_target;   /* the attachment this member is `[[color(n)]]` of */
+      unsigned bits;            /* 16 (half4) or 32 (float4) */
+      unsigned image_index;     /* the IMAGE resource's index; ~0u until a load or store used the member */
+   } imageblock[8];
 };
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call
@@ -353,6 +366,10 @@ struct air_to_nir_options {
     * entry point of the corpus and is counted separately.
     */
    bool library_wrapper;
+
+   /* Bergamota: the render pass's tile size, for a tile function (see air_shader_info.imageblock): the imageblock coordinate (0,0) of tile
+    * (tx,ty) is the attachment texel (tx*tile_size[0], ty*tile_size[1]). 0 means "the workgroup size". */
+   unsigned tile_size[2];
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may

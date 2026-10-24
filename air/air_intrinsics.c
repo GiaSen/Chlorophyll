@@ -498,7 +498,7 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fwidth")) {
       r = nir_fadd(&c->b, nir_fabs(&c->b, nir_ddx(&c->b, a[0])),
                    nir_fabs(&c->b, nir_ddy(&c->b, a[0])));
-   } else if (!strcmp(op, "get_simd_width") || !strcmp(op, "get_thread_execution_width")) {
+   } else if (!strcmp(op, "get_simd_width") || !strcmp(op, "get_thread_execution_width") || !strcmp(op, "get_simdgroup_size")) {
       r = nir_load_subgroup_size(&c->b);
    } else if (!strcmp(op, "all")) {
       r = nir_ball(&c->b, a[0]);
@@ -1913,6 +1913,58 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
 }
 
 /* -- the dispatcher ----------------------------------------------------- */
+/* Bergamota: air.load.implicit_imageblock.<ty>(i32 member, <2 x i16> position, i32 sample, i16 _) and
+ * air.store.implicit_imageblock.<ty>(value, i32 member, <2 x i16> position, i32 sample, i16 _): the tile function's access to the colour attachment it
+ * stands on. Without tile memory it is an access of the attachment's texture at tile_origin + position, with the tile origin
+ * workgroup_id * tile size (air_to_nir_options.tile_size; 0 = the workgroup size). See air_shader_info.imageblock. */
+static bool
+imageblock_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
+{
+   bool store = !strcmp(n->part[0], "store");
+   unsigned first = store ? 2 : 1;   /* the callee is operand 0; a store has the value at 1 */
+   if (!c->has_imageblock)
+      return air_error(c, "intrinsic: air.%s.implicit_imageblock in a function without an imageblock argument", n->part[0]);
+   uint64_t member;
+   if (!air_const_uint(in->operands[first], &member) || member >= c->info->num_imageblock)
+      return air_error(c, "intrinsic: air.%s.implicit_imageblock on member that is not a declared one", n->part[0]);
+   struct air_imageblock_member *m = &c->info->imageblock[member];
+   if (m->image_index == ~0u) {
+      unsigned next = 0;
+      for (unsigned i = 0; i < c->info->num_resources; i++)
+         if (c->info->resources[i].kind == AIR_RESOURCE_TEXTURE || c->info->resources[i].kind == AIR_RESOURCE_IMAGE)
+            next = MAX2(next, c->info->resources[i].index + 1);
+      m->image_index = next;
+      struct air_resource *r = air_add_imageblock_resource(c, next, m->render_target);
+      if (!r)
+         return false;
+   }
+   nir_def *pos = air_get_ssa(c, in->operands[first + 1]);
+   if (!pos)
+      return false;
+   pos = nir_u2u32(&c->b, pos);
+   unsigned tx = c->options && c->options->tile_size[0] ? c->options->tile_size[0] : 0;
+   unsigned ty = c->options && c->options->tile_size[1] ? c->options->tile_size[1] : 0;
+   nir_def *wg = nir_load_workgroup_id(&c->b);
+   nir_def *tsz = tx ? nir_imm_ivec2(&c->b, tx, ty) : nir_trim_vector(&c->b, nir_load_workgroup_size(&c->b), 2);
+   nir_def *origin = nir_imul(&c->b, nir_trim_vector(&c->b, nir_u2u32(&c->b, wg), 2), tsz);
+   nir_def *coord = nir_pad_vector(&c->b, nir_iadd(&c->b, nir_trim_vector(&c->b, pos, 2), origin), 4);
+   unsigned bits = m->bits;
+   nir_alu_type ty_f = nir_type_float | bits;
+   if (store) {
+      nir_def *value = air_get_ssa(c, in->operands[1]);
+      if (!value)
+         return false;
+      nir_image_store(&c->b, nir_imm_int(&c->b, m->image_index), coord, nir_imm_int(&c->b, 0),
+                      nir_pad_vector(&c->b, value, 4), nir_imm_int(&c->b, 0),
+                      .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false, .src_type = ty_f);
+      return true;
+   }
+   nir_def *res = nir_image_load(&c->b, 4, bits, nir_imm_int(&c->b, m->image_index), coord, nir_imm_int(&c->b, 0),
+                                 nir_imm_int(&c->b, 0), .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false, .dest_type = ty_f);
+   air_set(c, &in->base, air_val_ssa(c, res));
+   return true;
+}
+
 
 bool
 air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *name)
@@ -1938,6 +1990,8 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       return true;
    }
 
+
+
    struct air_name n;
    if (!split_name(name, &n))
       return air_error(c, "intrinsic: %s (a name this cannot take apart)", name);
@@ -1950,6 +2004,8 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))
       return discard_op(c, in);
+   if (n.num >= 2 && (!strcmp(n.part[0], "load") || !strcmp(n.part[0], "store")) && !strcmp(n.part[1], "implicit_imageblock"))
+      return imageblock_op(c, in, &n);
 
    /* Bergamota: air.sincos / air.fast_sincos(x, ptr): returns sin(x) and stores cos(x) through the pointer (Mercury's fluidity shaders) */
    if (!strcmp(n.part[0], "sincos") || !strcmp(n.part[0], "fast_sincos")) {

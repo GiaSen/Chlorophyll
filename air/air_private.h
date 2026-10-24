@@ -150,6 +150,7 @@ struct air_ctx {
    struct hash_table *phi_regs;
    /* function-constant folding (Bergamota): see sc_eval in air_to_nir.c */
    struct hash_table *sc_memo;   /* air_value -> struct sc_val */
+   bool has_imageblock;          /* the entry point takes an air.imageblock (tile function): see air_shader_info.imageblock */
    struct hash_table *sc_known;  /* program-scope global -> struct sc_val, after the static initializers ran */
    bool sc_known_ok;
    unsigned pk_used[2];   /* varying packing: components used in the last slot, [0] fragment inputs, [1] vertex outputs */
@@ -264,6 +265,7 @@ void air_note(struct air_ctx *c, const char *fmt, ...) PRINTFLIKE(2, 3);
 nir_def *air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
                       unsigned align);
 bool air_store_ptr(struct air_ctx *c, struct air_ptr ptr, nir_def *value, unsigned align);
+struct air_resource *air_add_imageblock_resource(struct air_ctx *c, unsigned index, unsigned render_target);
 struct air_ptr air_ptr_add(struct air_ctx *c, struct air_ptr ptr, nir_def *bytes);
 
 /* air.* and llvm.* calls; the result is set on the instruction by the callee */

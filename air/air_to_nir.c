@@ -1028,6 +1028,19 @@ add_resource(struct air_ctx *c, enum air_resource_kind kind, unsigned index, uns
    return &info->resources[info->num_resources++];
 }
 
+/* Bergamota: the IMAGE resource a tile function's imageblock member becomes (see air_shader_info.imageblock) */
+struct air_resource *
+air_add_imageblock_resource(struct air_ctx *c, unsigned index, unsigned render_target)
+{
+   struct air_resource *r = add_resource(c, AIR_RESOURCE_IMAGE, index, 0, true, true, ~0u, NULL);
+   if (r) {
+      char *nm = ralloc_asprintf(c->mem_ctx, "imageblock.rt%u", render_target);
+      r->name = nm;
+      r->type_name = "imageblock";
+   }
+   return r;
+}
+
 static nir_variable *
 make_io_var(struct air_ctx *c, nir_variable_mode mode, const struct air_type *t,
             unsigned location, const char *name)
@@ -1791,6 +1804,42 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       }
       add_resource(c, rk, index, size, read, write, param, node);
       c->params[param] = air_val_ptr(c, p);
+      return true;
+   }
+
+   /* Bergamota: a tile function's imageblock. Only the `implicit` layout (the colour attachments as they are: QuartzCore's thirteen tile kernels);
+    * the members are read off air.struct_type_info (type name, member name, "air.render_target", n). */
+   if (md_key(node, "air.imageblock") >= 0) {
+      if (c->nir->info.stage != MESA_SHADER_COMPUTE)
+         return air_error(c, "interface: air.imageblock in a %s shader", gl_shader_stage_name(c->nir->info.stage));
+      int ik = md_key(node, "air.imageblock");
+      const char *layout = md_str(node, ik + 1);
+      if (!layout || strcmp(layout, "implicit"))
+         return air_error(c, "interface: an imageblock with layout %s (only implicit)", layout ? layout : "?");
+      int sk = md_key(node, "air.struct_type_info");
+      const struct air_md *si = sk >= 0 && sk + 1 < (int)node->num_ops && node->ops[sk + 1] && node->ops[sk + 1]->kind == AIR_MD_NODE ? node->ops[sk + 1] : NULL;
+      if (!si)
+         return air_error(c, "interface: an imageblock without air.struct_type_info");
+      struct air_shader_info *info = c->info;
+      for (unsigned i = 0; i < si->num_ops; i++) {
+         const char *s = md_str(si, i);
+         if (!s || strcmp(s, "air.render_target"))
+            continue;
+         uint64_t rt = 0;
+         const char *tn = i >= 2 ? md_str(si, i - 2) : NULL;
+         if (!md_int(si, i + 1, &rt) || rt >= 8 || !tn)
+            return air_error(c, "interface: an imageblock member without a target");
+         unsigned bits = !strcmp(tn, "half4") ? 16 : !strcmp(tn, "float4") ? 32 : 0;
+         if (!bits)
+            return air_error(c, "interface: an imageblock member of type %s", tn);
+         if (info->num_imageblock >= 8)
+            return air_error(c, "interface: more than 8 imageblock members");
+         info->imageblock[info->num_imageblock++] = (struct air_imageblock_member) { .render_target = rt, .bits = bits, .image_index = ~0u };
+      }
+      if (!info->num_imageblock)
+         return air_error(c, "interface: an imageblock with no colour member");
+      c->has_imageblock = true;
+      c->params[param] = air_val_ssa(c, nir_undef(&c->b, 1, 32));   /* the argument itself is never read: its loads are intrinsics */
       return true;
    }
 

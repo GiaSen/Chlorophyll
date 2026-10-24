@@ -6521,6 +6521,76 @@ attachment_shape_fits(const struct rwa_texture *t, unsigned samples, const char 
    return true;
 }
 
+/* Bergamota: the pass's clears, without a draw (see struct rwa_clear). */
+int
+rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char *why, size_t why_size)
+{
+   struct pipe_context *pipe = device->pipe;
+   if (!clear || (clear->color_count == 0 && !clear->depth)) {
+      say(why, why_size, "a clear of nothing");
+      return -1;
+   }
+   unsigned w = 0, h = 0;
+   struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS] = { 0 };
+   struct pipe_surface *zsurf = NULL;
+   struct pipe_framebuffer_state fb = { .nr_cbufs = clear->color_count, .samples = 1 };
+   if (clear->color_count > PIPE_MAX_COLOR_BUFS) {
+      say(why, why_size, "a clear of %u colour attachments", clear->color_count);
+      return -1;
+   }
+   for (unsigned i = 0; i < clear->color_count; i++) {
+      struct rwa_texture *t = clear->color[i];
+      if (!t) { say(why, why_size, "a clear of a pass whose colour attachment %u is missing", i); goto fail; }
+      if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
+         say(why, why_size, "colour attachment %u (%s) was made without MTLTextureUsageRenderTarget", i, t->format_name);
+         goto fail;
+      }
+      if (i == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
+      surf[i] = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
+      if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
+      fb.cbufs[i] = surf[i];
+   }
+   if (clear->depth) {
+      struct rwa_texture *t = clear->depth;
+      if (clear->color_count == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
+      zsurf = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
+      if (!zsurf) { say(why, why_size, "no render surface for the depth attachment"); goto fail; }
+      fb.zsbuf = zsurf;
+   }
+   fb.width = w;
+   fb.height = h;
+   pipe->set_framebuffer_state(pipe, &fb);
+   for (unsigned i = 0; i < clear->color_count; i++) {
+      if (!(clear->color_mask & (1u << i)))
+         continue;
+      union pipe_color_union cv;
+      for (unsigned c = 0; c < 4; c++)
+         cv.f[c] = clear->color_value[i][c];
+      pipe->clear(pipe, PIPE_CLEAR_COLOR0 << i, NULL, &cv, 0.0, 0);
+   }
+   if (clear->depth) {
+      unsigned mask = 0;
+      if (clear->clear_depth && format_has_depth(clear->depth->res->format))
+         mask |= PIPE_CLEAR_DEPTH;
+      if (clear->clear_stencil && format_has_stencil(clear->depth->res->format))
+         mask |= PIPE_CLEAR_STENCIL;
+      if (mask) {
+         union pipe_color_union none = { 0 };
+         pipe->clear(pipe, mask, NULL, &none, clear->clear_depth ? (double)*clear->clear_depth : 0.0,
+                     clear->clear_stencil ? *clear->clear_stencil & 0xff : 0);
+      }
+   }
+   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
+   for (unsigned i = 0; i < clear->color_count; i++)
+      if (surf[i]) pipe->surface_destroy(pipe, surf[i]);
+   if (zsurf) pipe->surface_destroy(pipe, zsurf);
+   return 0;
+fail:
+   for (unsigned i = 0; i < clear->color_count; i++)
+      if (surf[i]) pipe->surface_destroy(pipe, surf[i]);
+   return -1;
+}
+
 int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                 char *why, size_t why_size)

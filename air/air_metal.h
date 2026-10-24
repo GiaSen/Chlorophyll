@@ -1308,6 +1308,24 @@ struct rwa_draw {
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
 
+/*
+ * Bergamota: a render pass's load actions, done at the start of the pass -- which is where Metal does them, and where a pass that draws nothing
+ * still does them. rwa_render_draw clears inside a draw, with ONE colour for every attachment, and refuses a draw of no vertices, so a pass with
+ * different clears per attachment (or a clear of one and a load of another) lost or got them wrong.
+ *   color_mask   bit i: attachment i is MTLLoadActionClear, to color_value[i]; the others are left as they are
+ *   depth/stencil  as rwa_draw: a NULL pointer is a load.
+ */
+struct rwa_clear {
+	struct rwa_texture *const *color;
+	unsigned color_count;
+	unsigned color_mask;
+	float color_value[8][4];
+	struct rwa_texture *depth;
+	const float *clear_depth;
+	const unsigned *clear_stencil;
+};
+int rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char *why, size_t why_size);
+
 #ifdef __cplusplus
 }
 #endif
