@@ -312,6 +312,10 @@ bb_init(void)
       setenv("BGMTL_SYNC", "1", 1);
       ilog("backboardd: BGMTL_SYNC=1 (synchronous commits)");
    }
+   if (exists("/private/var/tmp/bgmtl-bb.triple")) {   // three framebuffers: with sweetfb_swapdepth=2 CoreAnimation draws N+1 while N
+      setenv("CA_FORCE_TRIPLE_BUFFERING", "1", 1);     // is queued and N-1 is on the panel; with two buffers N+1 lands in the scanned one
+      ilog("backboardd: CA_FORCE_TRIPLE_BUFFERING=1");
+   }
    if (exists("/private/var/tmp/bgmtl-bb.full")) {     // experiment: full redraws (the first live run showed stale regions)
       setenv("CA_DISABLE_DIRTY_REGIONS", "1", 1);
       ilog("backboardd: CA_DISABLE_DIRTY_REGIONS=1");
