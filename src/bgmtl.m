@@ -1064,10 +1064,8 @@ bg_air_slice(NSData *d)
          if (w->depth) cl.depth = [(BGMTLTexture *)w->depth rwaTexture];
          if (w->clear_depth_set) cl.clear_depth = &w->clear_depth;
          if (w->clear_stencil_set) cl.clear_stencil = &w->clear_stencil;
-         if (rwa_render_clear([dev rwa], &cl, why, sizeof(why)) != 0) {
-            [self bgFailWith:[NSString stringWithUTF8String:why] code:5];
-            break;
-         }
+         if (rwa_render_clear([dev rwa], &cl, why, sizeof(why)) != 0)
+            BG_LOG("clear skipped: %s\n", why);   // one bad clear no longer drops the rest of the frame (see the draw below)
       } else if (w->kind == BG_WORK_DRAW) {
          BGMTLRenderPipeline *rp = (BGMTLRenderPipeline *)w->render;
          struct rwa_buffer *vb[BG_MAX_BINDINGS] = { NULL }, *fb[BG_MAX_BINDINGS] = { NULL };
@@ -1107,10 +1105,11 @@ bg_air_slice(NSData *d)
          dr.vertex_streams = streams; dr.vertex_stream_count = rp->_info.vertex_streams;
          dr.vertex_buffer_table = vt; dr.vertex_buffer_table_count = w->vcount;
          dr.fragment_buffer_table = ft; dr.fragment_buffer_table_count = w->count;
-         if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0) {
-            [self bgFailWith:[NSString stringWithUTF8String:why] code:4];
-            break;
-         }
+         /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
+          * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
+          * the poster editor) and counted towards the watchdog that switches Metal off. */
+         if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
+            BG_LOG("draw skipped: %s\n", why);
       } else if (w->kind == BG_WORK_TEXCOPY &&
                  rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
                                   (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },
@@ -1210,28 +1209,6 @@ bg_air_slice(NSData *d)
          IOSurfaceLock((IOSurfaceRef)surf, 0, NULL);
          IOSurfaceUnlock((IOSurfaceRef)surf, 0, NULL);
       }
-   }
-   /*
-    * The compositor: one texel of each IOSurface it drew into is read back once the work has completed (a CPU map of the
-    * surface through freedreno, which flushes and waits for whatever still writes it). Without it the wallpaper area of the
-    * lock and home screens stayed black or grey whenever this process committed without the trace (whose readback of every
-    * attachment is how the difference showed: IOSurface attachments alone were enough). Cheap next to the full cache clean
-    * skipped above: a 1x1 map of a surface whose fence is already paid.
-    */
-   static int noreadback = -1;
-   if (noreadback < 0) noreadback = getenv("BGMTL_NOREADBACK") != NULL;
-   if (_status == 4 && in_compositor && !noreadback) {
-      NSMutableSet *seen = nil;
-      for (BGWork *w in _work)
-         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
-            for (unsigned i = 0; i < w->color_count; i++) {
-               BGMTLTexture *t = (BGMTLTexture *)w->color[i];
-               if (!t || ![t iosurface] || [seen containsObject:t]) continue;
-               if (!seen) seen = [NSMutableSet set];
-               [seen addObject:t];
-               uint8_t px[16];
-               [t getBytes:px bytesPerRow:sizeof(px) fromRegion:MTLRegionMake2D([t width] / 2, [t height] / 2, 1, 1) mipmapLevel:0];
-            }
    }
    if (bg_trace() && _status == 4) {   // what each colour attachment holds now: five texels, centre and quarter points
       NSMutableArray *seen = [NSMutableArray array];
