@@ -2078,16 +2078,12 @@ sampler_state_from_air(const struct air_sampler_state *a, unsigned index,
       }
    }
 
-   /* Bicubic is a Metal filter with no MTLSamplerMinMagFilter and no Gallium
-    * equivalent. air_run samples it as linear and says so in its own line; a library
-    * hands a driver a result, so it refuses instead. No module of the corpus carries
-    * it (docs/air.md 3.3).
+   /* Bicubic is a Metal filter with no MTLSamplerMinMagFilter and no Gallium equivalent.
+    * Bergamota: it is sampled as linear (the table below). That is an approximation --
+    * smoother-edged magnification is lost -- and it is what Mercury's pro24 pass needs to
+    * run at all; a bit-exact B-spline/Catmull-Rom emulation needs Apple's exact kernel,
+    * which no module here attests. Recorded in docs/METAL_ADRENO630.md.
     */
-   if (a->mag_filter == AIR_SAMPLER_BICUBIC || a->min_filter == AIR_SAMPLER_BICUBIC) {
-      say(why, why_size, "the shader's own sampler at index %u asks for filter::bicubic, "
-                         "which neither MTLSamplerDescriptor nor this GPU has", index);
-      return false;
-   }
    if (a->mag_filter > AIR_SAMPLER_BICUBIC || a->min_filter > AIR_SAMPLER_BICUBIC ||
        a->mip_filter > AIR_SAMPLER_MIP_LINEAR) {
       say(why, why_size, "the shader's own sampler at index %u carries filters %u/%u/%u, "
@@ -2175,6 +2171,7 @@ sampler_state_from_air(const struct air_sampler_state *a, unsigned index,
    static const unsigned filter[] = {
       [AIR_SAMPLER_NEAREST] = RWA_FILTER_NEAREST,
       [AIR_SAMPLER_LINEAR] = RWA_FILTER_LINEAR,
+      [AIR_SAMPLER_BICUBIC] = RWA_FILTER_LINEAR,   /* approximation, see above */
    };
    /* AIR_SAMPLER_MIP_* and MTLSamplerMipFilter happen to be in the same order; said as
     * a table anyway, so that the next field someone adds is not cast through by habit.

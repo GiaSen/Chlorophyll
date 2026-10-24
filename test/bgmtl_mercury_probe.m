@@ -78,6 +78,7 @@ main(int argc, char **argv)
             fill_pattern([b contents], 65536, 5 + i);
             if ((!strcmp(vn, "fluidity::sdfVertexShader") || !strcmp(vn, "fluidity::vertexShader") || !strcmp(vn, "postVertex")) && i == 0) memcpy([b contents], quad, sizeof(quad));
             if (!strcmp(vn, "fluidity::sdfVertexShader") && i == 1) { float id4[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 }; memcpy([b contents], id4, sizeof(id4)); }
+            if (!strcmp(vn, "fluidity::sdfVertexShader") && i == 2) { memset([b contents], 0, 64); ((float *)[b contents])[1] = 1.0f; ((float *)[b contents])[0] = 0.5f; }
             [enc setVertexBuffer:b offset:0 atIndex:i];
          }
          for (unsigned i = 0; i < fb && i < 4; i++) {
@@ -114,10 +115,11 @@ main(int argc, char **argv)
          uint32_t first = 0;
          for (int i = 0; i < 128 * 128; i++) {
             uint32_t v; memcpy(&v, out + i * 4, 4);
-            if (v != 0 && !(out[i*4] == 191 && out[i*4+1] == 128 && out[i*4+2] == 64)) changed++;
+            if (!(out[i*4] == 191 && out[i*4+1] == 128 && out[i*4+2] == 64 && out[i*4+3] == 255)) changed++;
             if (i == 0) first = v;
             if (v != first) distinct++;
          }
+         printf("  pixel0 bgra=%02x%02x%02x%02x centre=%08x\n", out[0], out[1], out[2], out[3], *(uint32_t *)(out + (64*128+64)*4));
          printf("%s + %s: status %ld, vb=%u fb=%u tex=%u, %u of 16384 pixels differ from the clear colour, %u differ from pixel 0\n", vn, fn, (long)[cb status], vb, fb, ft, changed, distinct);
          char path[512];
          snprintf(path, sizeof(path), "%s/merc%u.ppm", argv[2], p);

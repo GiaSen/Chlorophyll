@@ -4682,6 +4682,91 @@ materialise_globals(struct air_ctx *c)
    }
 }
 
+
+/* Bergamota: the bytes of a constant initializer, laid out as memory holds them. A
+ * program-scope table (`constant [6 x <2 x float>] [...]`, how a Metal vertex shader
+ * spells its fixed quad) lives in scratch here and nothing else would ever fill it.
+ */
+static bool
+init_bytes(struct air_ctx *c, const struct air_value *v, const struct air_type *t, uint8_t *buf, uint64_t size)
+{
+   uint64_t asz = air_type_alloc_size(c->m, t);
+   if (asz > size)
+      return false;
+   const struct air_constant *k = air_value_as_constant(v);
+   if (!k)
+      return false;
+   if (k->ckind == AIR_CONST_NULL || k->ckind == AIR_CONST_UNDEF || k->ckind == AIR_CONST_POISON)
+      return true;   /* the buffer is zeroed */
+   if (t->kind == AIR_TYPE_INT || air_type_is_float(t)) {
+      if (k->ckind != AIR_CONST_INT && k->ckind != AIR_CONST_FLOAT)
+         return false;
+      unsigned n = asz > 8 ? 8 : asz;
+      for (unsigned i = 0; i < n; i++)
+         buf[i] = (k->u >> (8 * i)) & 0xff;
+      return true;
+   }
+   if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_VECTOR) {
+      const struct air_type *e = t->elem;
+      uint64_t es = air_type_alloc_size(c->m, e);
+      if (t->kind == AIR_TYPE_VECTOR && e->kind == AIR_TYPE_INT && e->bits == 1)
+         return false;
+      for (uint64_t i = 0; i < t->count; i++) {
+         if (k->ckind == AIR_CONST_DATA) {
+            if (i >= k->num_elems || es > 8)
+               return false;
+            for (unsigned b = 0; b < es; b++)
+               buf[i * es + b] = (k->data[i] >> (8 * b)) & 0xff;
+         } else if (k->ckind == AIR_CONST_AGGREGATE) {
+            if (i >= k->num_elems || !init_bytes(c, k->elems[i], e, buf + i * es, size - i * es))
+               return false;
+         } else {
+            return false;
+         }
+      }
+      return true;
+   }
+   if (t->kind == AIR_TYPE_STRUCT && k->ckind == AIR_CONST_AGGREGATE) {
+      for (unsigned i = 0; i < t->num_members && i < k->num_elems; i++) {
+         uint64_t off = air_struct_member_offset(c->m, t, i);
+         if (off > size || !init_bytes(c, k->elems[i], t->members[i], buf + off, size - off))
+            return false;
+      }
+      return true;
+   }
+   return false;
+}
+
+static void
+init_scratch_globals(struct air_ctx *c)
+{
+   for (unsigned i = 0; i < c->m->num_globals; i++) {
+      const struct air_global_plan *pl = &c->global_plan[i];
+      const struct air_global *g = c->m->globals[i];
+      if (pl->skip || pl->class != AIR_PTR_SCRATCH || !g->init)
+         continue;
+      const struct air_constant *k = air_value_as_constant(g->init);
+      if (!k || k->ckind == AIR_CONST_NULL || k->ckind == AIR_CONST_UNDEF || k->ckind == AIR_CONST_POISON)
+         continue;
+      uint64_t size = air_type_alloc_size(c->m, g->value_type);
+      uint8_t *buf = rzalloc_size(c->mem_ctx, size + 8);
+      if (!init_bytes(c, g->init, g->value_type, buf, size)) {
+         air_error(c, "interface: the initializer of a program-scope variable is not a plain constant");
+         return;
+      }
+      for (uint64_t o = 0; o < size;) {
+         unsigned n = (size - o >= 4 && ((pl->offset + o) % 4) == 0) ? 4 : 1;
+         uint32_t w = 0;
+         for (unsigned b = 0; b < n; b++)
+            w |= (uint32_t)buf[o + b] << (8 * b);
+         if (w)
+            nir_store_scratch(&c->b, nir_imm_intN_t(&c->b, w, n * 8), nir_imm_int(&c->b, pl->offset + o),
+                              .align_mul = n, .write_mask = 1);
+         o += n;
+      }
+   }
+}
+
 /* The functions of @llvm.global_ctors, inlined at the top of the entry point:
  * this is where a function constant turns into the program-scope variable the
  * body reads (AV1SW computes kPixelShift from kBitDepth that way).
@@ -4880,6 +4965,8 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       plan_globals(&c);
    if (!c.error[0])
       materialise_globals(&c);
+   if (!c.error[0])
+      init_scratch_globals(&c);
    if (!c.error[0])
       sc_run_static_init(&c);
    if (!c.error[0])
