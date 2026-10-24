@@ -5,13 +5,17 @@
 #   GPU_METAL_WORK=/scratch gpu/metal/build-ios.sh        (run build-host.sh first: it creates and patches the source tree)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# Bergamota's gpu/ (the libdrm stand-in freedreno-sweet/ and eagl/mesa/bergamota-mesa-25.0.7.patch): Chlorophyll is checked out
+# as Bergamota's gpu/metal submodule, so it is the parent directory; for a standalone checkout set BERGAMOTA_GPU.
+BG_GPU="${BERGAMOTA_GPU:-$HERE/..}"
+[ -d "$BG_GPU/freedreno-sweet" ] || { echo "no $BG_GPU/freedreno-sweet: set BERGAMOTA_GPU to a Bergamota checkout's gpu/" >&2; exit 1; }
 WORK="${GPU_METAL_WORK:?set GPU_METAL_WORK}"
-EAGL_LIBDRM="${GPU_EAGL_LIBDRM:?set GPU_EAGL_LIBDRM (libdrm 2.4.124 headers checkout)}"
+EAGL_LIBDRM="${GPU_EAGL_LIBDRM:-$HERE/libdrm}"               # the libdrm submodule (2.4.124 headers) unless set
 VENV="${GPU_EAGL_VENV:?set GPU_EAGL_VENV}"
 EAGL_CROSS="${GPU_EAGL_CROSS:?set GPU_EAGL_CROSS to gpu-eagl's ios-hw.cross}"
 export PATH="$(brew --prefix bison)/bin:$VENV/bin:$PATH"
 D="$WORK/mesa-air"; cd "$D"
-"$HERE/../freedreno-sweet/build.sh" "$D/drm-ios" >/dev/null           # the libdrm stand-in, arm64e, PAC-stripped and signed copy in libdrm.2.dylib
+"$BG_GPU/freedreno-sweet/build.sh" "$D/drm-ios" >/dev/null           # the libdrm stand-in, arm64e, PAC-stripped and signed copy in libdrm.2.dylib
 mkdir -p pc-ios drm-ios-link
 cp drm-ios/libdrm.2.arm64e.dylib drm-ios-link/libdrm.2.dylib; ln -sf libdrm.2.dylib drm-ios-link/libdrm.dylib
 cat > pc-ios/libdrm.pc <<EOP
