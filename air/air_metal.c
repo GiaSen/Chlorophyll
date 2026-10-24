@@ -1378,6 +1378,12 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       bind = PIPE_BIND_SAMPLER_VIEW;
       read = true;
    }
+   /* Chlorophyll: a texture that is only sampled is filled from the processor (-replaceRegion:), and freedreno uploads
+    * into a TILED texture through a staging buffer and a GPU blit every time (fd_resource_transfer_map: "we always need
+    * a staging texture for tiled buffers"), about a third of backboardd's time in this library during swipes. Linear,
+    * the upload is a write through the mapping. The GPU samples linear a little slower, and it is mostly idle. */
+   if (bind == PIPE_BIND_SAMPLER_VIEW && !depth_stencil && !multisample && !util_format_is_compressed(fmt->pipe))
+      bind |= PIPE_BIND_LINEAR;
 
    /* Gallium counts a texture that is not multisampled as zero samples, not one,
     * everywhere a sample count is asked for -- and the difference is not cosmetic here.
