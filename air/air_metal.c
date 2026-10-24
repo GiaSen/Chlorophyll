@@ -6753,21 +6753,27 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
       say(why, why_size, "a clear of %u colour attachments", clear->color_count);
       return -1;
    }
+   unsigned present = 0;
    for (unsigned i = 0; i < clear->color_count; i++) {
       struct rwa_texture *t = clear->color[i];
-      if (!t) { say(why, why_size, "a clear of a pass whose colour attachment %u is missing", i); goto fail; }
+      /* Chlorophyll: a slot without a texture is legal in Metal (the clear of that slot does nothing); the wallpaper
+       * poster's passes have one, and failing them tripped its watchdog (3 failed command buffers: Metal off) */
+      if (!t) continue;
       if (!(t->res->bind & PIPE_BIND_RENDER_TARGET)) {
          say(why, why_size, "colour attachment %u (%s) was made without MTLTextureUsageRenderTarget", i, t->format_name);
          goto fail;
       }
-      if (i == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
+      if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
       surf[i] = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
       if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
       fb.cbufs[i] = surf[i];
    }
+   if (present == 0 && !clear->depth) {
+      return 0;            /* only empty slots: nothing to clear */
+   }
    if (clear->depth) {
       struct rwa_texture *t = clear->depth;
-      if (clear->color_count == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
+      if (present == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
       zsurf = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
       if (!zsurf) { say(why, why_size, "no render surface for the depth attachment"); goto fail; }
       fb.zsbuf = zsurf;
@@ -6776,7 +6782,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
    fb.height = h;
    pipe->set_framebuffer_state(pipe, &fb);
    for (unsigned i = 0; i < clear->color_count; i++) {
-      if (!(clear->color_mask & (1u << i)))
+      if (!(clear->color_mask & (1u << i)) || !fb.cbufs[i])
          continue;
       union pipe_color_union cv;
       for (unsigned c = 0; c < 4; c++)

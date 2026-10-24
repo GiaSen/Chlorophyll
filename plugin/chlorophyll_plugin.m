@@ -115,7 +115,17 @@ chl_refusal(unsigned *minor)
       [self release];   /* fully initialized here: BGMTLDevice's own teardown, as bgmtl_create_device does */
       return nil;
    }
-   if (self) os_log(chl_log(), "%{public}s[%d]: Chlorophyll device made", name, getpid());
+   if (self) {
+      /*
+       * CoreImage, given a Metal device, translates CIKernel Language source into its Metal kernel graph
+       * (CI_USE_MTL_DAG_FOR_CIKL_SRC, read after it asked for the device) and merges that kernel's argument list
+       * with the CIKL parse; with Chlorophyll the translated list comes back empty and the merge writes through NULL
+       * (SBRendererService / PhotoImaging crashed in +[CIKernel kernelsWithString:]). Without the graph CoreImage
+       * builds those kernels as before and still renders on this device (its stitchable metallibs load and run).
+       */
+      setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
+      os_log(chl_log(), "%{public}s[%d]: Chlorophyll device made", name, getpid());
+   }
    return self;
 }
 @end
