@@ -475,6 +475,27 @@ ensure_protocol(Class cls, const char *proto)
    }
 }
 
+// traced pass-throughs of the capability queries CoreAnimation makes (what it chooses its renderer conventions from)
+- (BOOL)supportsFamily:(NSInteger)family
+{
+   // Apple1..Apple3 and Common1..Common2, as UniXNU's native device answers (Apple4+ promise tile shaders and imageblocks,
+   // which Chlorophyll does not run yet); everything else as _MTLDevice's tables say. BGMTL_FAMILY=N overrides the Apple ceiling.
+   static long apple_max = -1;
+   if (apple_max < 0) apple_max = getenv("BGMTL_FAMILY") ? atol(getenv("BGMTL_FAMILY")) : 3;
+   BOOL r;
+   if (family >= 1001 && family <= 1009) r = family - 1000 <= apple_max;          // MTLGPUFamilyApple1..9
+   else if (family == 3001 || family == 3002) r = YES;                            // MTLGPUFamilyCommon1, Common2
+   else r = ((BOOL (*)(struct objc_super *, SEL, NSInteger))objc_msgSendSuper)(&(struct objc_super){ self, [_MTLDevice class] }, _cmd, family);
+   BG_TRACE("supportsFamily %ld -> %d\n", (long)family, r);
+   return r;
+}
+- (BOOL)supportsFeatureSet:(NSUInteger)set
+{
+   BOOL r = ((BOOL (*)(struct objc_super *, SEL, NSUInteger))objc_msgSendSuper)(&(struct objc_super){ self, [_MTLDevice class] }, _cmd, set);
+   BG_TRACE("supportsFeatureSet %lu -> %d\n", (unsigned long)set, r);
+   return r;
+}
+
 - (BOOL)metalAssertionsEnabled { return _assertions; }
 - (void)setMetalAssertionsEnabled:(BOOL)enabled { _assertions = enabled; }
 
@@ -1417,7 +1438,11 @@ bg_air_slice(NSData *d)
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
 - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
-- (void)setViewport:(MTLViewport)v { _range[0] = (float)v.znear; _range[1] = (float)v.zfar; _have_range = YES; }
+- (void)setViewport:(MTLViewport)v
+{
+   BG_TRACE("setViewport %g %g %g %g z %g..%g\n", v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
+   _range[0] = (float)v.znear; _range[1] = (float)v.zfar; _have_range = YES;
+}
 - (void)setDepthStencilState:(id)state { [_depth_state release]; _depth_state = [state retain]; }
 - (void)setStencilReferenceValue:(uint32_t)v { _stencil_ref[0] = _stencil_ref[1] = v; }
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _stencil_ref[0] = f; _stencil_ref[1] = b; }

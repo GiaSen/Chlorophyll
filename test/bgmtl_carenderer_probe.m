@@ -180,10 +180,14 @@ main(int argc, char **argv)
          r.bounds = CGRectMake(0, 0, W, H);
          [CATransaction flush];      // the renderer draws the render tree, which only exists after a commit
          CFTimeInterval t = CACurrentMediaTime();
+         void (*msgs)(BOOL) = getenv("BG_MSGSENDS") ? (void (*)(BOOL))dlsym(RTLD_DEFAULT, "instrumentObjcMessageSends") : NULL;
+         if (getenv("BG_MSGSENDS")) printf("instrumentObjcMessageSends: %s\n", msgs ? "on (/tmp/msgSends-PID)" : "not exported");
+         if (msgs) msgs(YES);
          [r beginFrameAtTime:t timeStamp:NULL];
          [r addUpdateRect:r.bounds];
          [r render];
          [r endFrame];
+         if (msgs) msgs(NO);
          // CARenderer commits without waiting: a command buffer behind it on the same queue completes after its work
          id<MTLCommandBuffer> fence = [q commandBuffer];
          [fence commit];
