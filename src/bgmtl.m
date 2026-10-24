@@ -127,6 +127,7 @@ static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 __attribute__((weak)) void bgmtl_note_failure(const char *why) { (void)why; }   // overridden by the injection dylib
 __attribute__((weak)) void bgmtl_note_unimplemented(const char *sel) { (void)sel; }
 __attribute__((weak)) void bgmtl_note_completed(void) {}   // a command buffer finished without error (the injection's dead-man reset)
+__attribute__((weak)) void bgmtl_note_committed(void) {}   // a command buffer was committed (starts the injection's dead-man clock)
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib   // likewise: logged by the injection dylib
 
 @class BGMTLDevice;
@@ -1027,6 +1028,7 @@ bg_air_slice(NSData *d)
 
 - (void)commit
 {
+   bgmtl_note_committed();
    BG_TRACE("commit: %lu recorded commands\n", (unsigned long)[_work count]);
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];

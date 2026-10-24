@@ -18,7 +18,7 @@
 // (bgl-launch has already checked bgmtl-bb.arm, bgmtl-bb.off and that the previous Metal launch became healthy). Here: the device is
 // registered before QuartzCore creates its render server (which then builds CA::OGL::MetalContext itself), framebuffer and IOSurface
 // compression and deep framebuffers are turned off (Apple GPU layouts this GPU does not write), and a stricter watchdog runs: GPU
-// lost, 3 failed command buffers, or no completed command buffer within 60 s of launch write bgmtl-bb.off and _exit(0); launchd
+// lost, 3 failed command buffers, or no completed command buffer within 60 s of the first commit write bgmtl-bb.off and _exit(0); launchd
 // relaunches backboardd and bgl-launch starts it on the ES path. 10 s after the first completed command buffer with no failure the
 // launch is marked healthy in bgmtl-bb.state. "crashtest" in bgmtl-bb.arm crashes on purpose 5 s after registration (guard test).
 #import <Foundation/Foundation.h>
@@ -135,6 +135,16 @@ bgmtl_note_completed(void)
    }
 }
 
+// The first commit starts the backboardd watchdog's 60 s: a backboardd started while the display is off or idle has nothing
+// to draw, and counting from launch switched Metal off for good (bgmtl-bb.off) on every such restart.
+static volatile unsigned g_first_commit_t;
+static volatile unsigned g_watch_t;
+void
+bgmtl_note_committed(void)
+{
+   if (!g_first_commit_t) g_first_commit_t = g_watch_t ? g_watch_t : 1;
+}
+
 void
 bgmtl_note_unimplemented(const char *sel)
 {
@@ -165,8 +175,9 @@ watchdog_bb(void *arg)
          ilog("backboardd: crashtest armed: crashing on purpose");
          abort();
       }
-      if (!g_completed && t >= 60)
-         trip("no command buffer completed within 60 s of launch");
+      g_watch_t = t;
+      if (!g_completed && g_first_commit_t && t >= g_first_commit_t + 60)
+         trip("no command buffer completed within 60 s of the first commit");
       if (g_completed && !healthy_at)
          healthy_at = t + 10;
       if (healthy_at && t == healthy_at && g_failures == 0) {
