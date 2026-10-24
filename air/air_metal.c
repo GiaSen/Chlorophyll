@@ -117,6 +117,11 @@ struct rwa_device {
     * construction: a buffer joins only when something is encoded into it.
     */
    struct rwa_buffer *encoded;
+
+   /* Chlorophyll: the textures the context's framebuffer holds right now (no references: see fb_release). Draws and
+    * clears leave the framebuffer bound, so a pass's draws hand freedreno an EQUAL state and it keeps its batch and
+    * its emitted state; resetting it after every draw re-dirtied all state and switched batches twice per draw. */
+   struct rwa_texture *fb_color[PIPE_MAX_COLOR_BUFS], *fb_depth;
 };
 
 /*
@@ -202,6 +207,10 @@ struct rwa_texture {
    /* Bergamota: the kernel's BO handle when the memory is an IOSurface (rwa_texture_from_surface), for the clean+invalidate that makes the GPU's
     * pixels visible to whoever composites the surface (rwa_texture_flush_surface) */
    unsigned surface_handle;
+
+   /* Chlorophyll: its render surface (level 0, layer 0, its own format: the only one a pass makes), made when it is
+    * first an attachment and kept, so consecutive draws into it give the same pointer (see rwa_device.fb_color) */
+   struct pipe_surface *surface;
 };
 
 /* the libdrm stand-in's IOSurface calls (gpu/freedreno-sweet/sweet_drm.c); struct sweet_gpu_surface_bo, first 48 bytes (ABI minor 0 layout,
@@ -1663,11 +1672,53 @@ rwa_texture_generate_mipmaps(struct rwa_texture *texture)
                           PIPE_TEX_FILTER_LINEAR) ? 0 : -1;
 }
 
+/* Chlorophyll: the texture's cached render surface (see rwa_texture.surface). */
+static struct pipe_surface *
+texture_surface(struct rwa_texture *t)
+{
+   if (!t->surface)
+      t->surface = t->device->pipe->create_surface(t->device->pipe, t->res,
+                                                   &(struct pipe_surface){ .format = t->res->format });
+   return t->surface;
+}
+
+/* Bind a framebuffer of cached surfaces and remember which textures it holds. An equal state is a no-op in
+ * freedreno (util_framebuffer_state_equal compares the surface pointers), which is the point. */
+static void
+fb_bind(struct rwa_device *device, const struct pipe_framebuffer_state *fb, struct rwa_texture *const *color,
+        unsigned color_count, struct rwa_texture *depth)
+{
+   device->pipe->set_framebuffer_state(device->pipe, fb);
+   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
+      device->fb_color[i] = i < color_count ? color[i] : NULL;
+   device->fb_depth = depth;
+}
+
+/* Unbind the framebuffer if it holds this texture, before its surface (and the resource under it) goes. */
+static void
+fb_release_texture(struct rwa_device *device, struct rwa_texture *t)
+{
+   bool held = device->fb_depth == t;
+   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
+      held |= device->fb_color[i] == t;
+   if (!held)
+      return;
+   device->pipe->set_framebuffer_state(device->pipe, &(struct pipe_framebuffer_state){ 0 });
+   memset(device->fb_color, 0, sizeof(device->fb_color));
+   device->fb_depth = NULL;
+}
+
+
 void
 rwa_texture_destroy(struct rwa_texture *texture)
 {
    if (!texture)
       return;
+   /* The framebuffer may still hold its surface (draws leave it bound): let go of it first. */
+   if (texture->surface) {
+      fb_release_texture(texture->device, texture);
+      pipe_surface_reference(&texture->surface, NULL);
+   }
    argbuf_scrub(texture->device, NULL, texture, NULL);
    /* The view first: it holds a reference of its own on the resource. Nothing has to
     * be unbound here, because rwa_dispatch unbinds every texture it bound once its
@@ -6823,7 +6874,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
          goto fail;
       }
       if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
-      surf[i] = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
+      surf[i] = texture_surface(t);
       if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
       fb.cbufs[i] = surf[i];
    }
@@ -6833,13 +6884,13 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
    if (clear->depth) {
       struct rwa_texture *t = clear->depth;
       if (present == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
-      zsurf = pipe->create_surface(pipe, t->res, &(struct pipe_surface){ .format = t->res->format });
+      zsurf = texture_surface(t);
       if (!zsurf) { say(why, why_size, "no render surface for the depth attachment"); goto fail; }
       fb.zsbuf = zsurf;
    }
    fb.width = w;
    fb.height = h;
-   pipe->set_framebuffer_state(pipe, &fb);
+   fb_bind(device, &fb, clear->color, clear->color_count, clear->depth);
    for (unsigned i = 0; i < clear->color_count; i++) {
       if (!(clear->color_mask & (1u << i)) || !fb.cbufs[i])
          continue;
@@ -6860,14 +6911,8 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
                      clear->clear_stencil ? *clear->clear_stencil & 0xff : 0);
       }
    }
-   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-   for (unsigned i = 0; i < clear->color_count; i++)
-      if (surf[i]) pipe_surface_reference(&surf[i], NULL);
-   if (zsurf) pipe_surface_reference(&zsurf, NULL);
-   return 0;
+   return 0;     /* the framebuffer stays bound and the surfaces stay with their textures */
 fail:
-   for (unsigned i = 0; i < clear->color_count; i++)
-      if (surf[i]) pipe_surface_reference(&surf[i], NULL);
    return -1;
 }
 
@@ -7167,9 +7212,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
    }
 
-   /* The framebuffer, from the caller's own textures. create_surface wants a context,
-    * so it is a draw-time cost and not a pipeline one, and it is released again below
-    * before the caller may destroy the textures under it.
+   /* The framebuffer, from the caller's own textures: each texture's cached surface (texture_surface), so the
+    * draws of a pass bind an equal state, which freedreno takes as no change at all.
     */
    struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS] = { 0 };
    struct pipe_surface *zsurf = NULL;
@@ -7187,25 +7231,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    for (unsigned i = 0; i < draw->color_count; i++) {
       if (!draw->color[i])
          continue;
-      surf[i] = pipe->create_surface(pipe, draw->color[i]->res,
-         &(struct pipe_surface){ .format = draw->color[i]->res->format });
+      surf[i] = texture_surface(draw->color[i]);
       if (!surf[i]) {
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
-         for (unsigned j = 0; j < i; j++)
-            pipe_surface_reference(&surf[j], NULL);
          return -1;
       }
       fb.cbufs[i] = surf[i];
    }
    if (draw->depth) {
-      zsurf = pipe->create_surface(pipe, draw->depth->res,
-         &(struct pipe_surface){ .format = draw->depth->res->format });
+      zsurf = texture_surface(draw->depth);
       if (!zsurf) {
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
-         for (unsigned j = 0; j < draw->color_count; j++)
-            pipe_surface_reference(&surf[j], NULL);
          return -1;
       }
       fb.zsbuf = zsurf;
@@ -7225,7 +7263,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    if (render->finfo.fbfetch_targets && &fd_mesa_debug)
       fd_mesa_debug |= (1 << 9);
 
-   pipe->set_framebuffer_state(pipe, &fb);
+   fb_bind(device, &fb, draw->color, draw->color_count, draw->depth);
 
    /* Chlorophyll: Metal's framebuffer fetch is coherent -- a fetching draw sees what the draws before it in the pass wrote.
     * In sysmem freedreno reads the attachment through the texture path, so without a barrier the fetch saw memory the
@@ -7462,11 +7500,7 @@ unbind:
     * a context still holding a surface of a freed resource is the same trap as a bound
     * sampler state (rwa_sampler_destroy).
     */
-   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-   for (unsigned i = 0; i < draw->color_count; i++)
-      if (surf[i])
-         pipe_surface_reference(&surf[i], NULL);
-   if (zsurf)
-      pipe_surface_reference(&zsurf, NULL);
+   /* Chlorophyll: the framebuffer stays bound for the next draw of the pass (rwa_device.fb_color); the surfaces
+    * belong to their textures, and rwa_texture_destroy unbinds the framebuffer if it still holds one. */
    return rc;
 }
