@@ -17,6 +17,7 @@
 #import <Foundation/Foundation.h>
 #include <libkern/OSByteOrder.h>
 #include <os/lock.h>
+#include <Block.h>
 #include <sys/stat.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
@@ -236,8 +237,11 @@ bg_install_fallback(Class c)
    struct rwa_buffer *_buf;
    void *_contents;
    NSUInteger _length;
+   void *_mapped;                               // the GPU memory when _contents is a caller's (newBufferWithBytesNoCopy)
+   void (^_deallocator)(void *, NSUInteger);
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device length:(NSUInteger)length;
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device bytesNoCopy:(void *)p length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))dealloc;
 - (struct rwa_buffer *)rwaBuffer;
 - (void *)contents;
 @end
@@ -292,6 +296,9 @@ bg_install_fallback(Class c)
    struct rwa_texture_shape _shape;
    CFTypeRef _surface;   // retained IOSurface, when the memory is one
    NSUInteger _plane;
+   @public
+   id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
+   NSUInteger _linOff, _linBpr;
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
@@ -584,6 +591,12 @@ bg_air_slice(NSData *d)
    return [[BGMTLBuffer alloc] initWithBGDevice:self length:length];
 }
 
+- (id)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)length options:(NSUInteger)options deallocator:(void (^)(void *, NSUInteger))dealloc
+{
+   (void)options;
+   return [[BGMTLBuffer alloc] initWithBGDevice:self bytesNoCopy:p length:length deallocator:dealloc];
+}
+
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(NSUInteger)options
 {
    BGMTLBuffer *b = [self newBufferWithLength:length options:options];
@@ -618,6 +631,16 @@ bg_air_slice(NSData *d)
    if (!_rwa) return [self bgFail:error with:[NSString stringWithFormat:@"no GPU: %s", _why]];
    id vertex = [descriptor vertexFunction], fragment = [descriptor fragmentFunction];
    BG_TRACE("render pipeline: vertex %s fragment %s\n", vertex ? [[vertex name] UTF8String] : "-", fragment ? [[fragment name] UTF8String] : "-");
+   if (bg_trace()) {
+      for (unsigned i = 0; i < 8; i++) {
+         MTLRenderPipelineColorAttachmentDescriptor *ca = descriptor.colorAttachments[i];
+         if (ca.pixelFormat)
+            BG_LOG("  pipe color%u fmt %lu blend %d src %lu/%lu dst %lu/%lu mask %lu\n", i, (unsigned long)ca.pixelFormat, ca.blendingEnabled,
+                   (unsigned long)ca.sourceRGBBlendFactor, (unsigned long)ca.sourceAlphaBlendFactor, (unsigned long)ca.destinationRGBBlendFactor,
+                   (unsigned long)ca.destinationAlphaBlendFactor, (unsigned long)ca.writeMask);
+      }
+      BG_LOG("  pipe depth fmt %lu stencil fmt %lu\n", (unsigned long)descriptor.depthAttachmentPixelFormat, (unsigned long)descriptor.stencilAttachmentPixelFormat);
+   }
    if (!fragment) return [self bgFail:error with:@"a render pipeline needs a fragment function"];
    /* no vertex function: libbgair supplies a pass-through stage over the whole attachment (a quad, 4 vertices as a strip) --
     * the road the fragment shaders of a library are exercised by, as air_run did */
@@ -754,8 +777,26 @@ bg_air_slice(NSData *d)
    _contents = rwa_buffer_map(_buf);
    return self;
 }
-- (void)dealloc { if (_buf) rwa_buffer_destroy(_buf); [super dealloc]; }
-- (struct rwa_buffer *)rwaBuffer { return _buf; }
+// newBufferWithBytesNoCopy: contents is the caller's memory, as Metal promises; the GPU reads its own copy, refreshed from
+// the caller's bytes each time the buffer is handed to the GPU (rwaBuffer is asked for every binding at commit). A GPU write
+// into such a buffer does not reach the caller's memory; CoreAnimation's are vertex and glyph data it writes on the CPU.
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device bytesNoCopy:(void *)p length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))dealloc
+{
+   self = [self initWithBGDevice:device length:length];
+   if (!self) return nil;
+   _mapped = _contents;
+   _contents = p;
+   _deallocator = dealloc ? Block_copy(dealloc) : NULL;
+   memcpy(_mapped, p, length);
+   return self;
+}
+- (void)dealloc
+{
+   if (_buf) rwa_buffer_destroy(_buf);
+   if (_deallocator) { _deallocator(_contents, _length); Block_release(_deallocator); }
+   [super dealloc];
+}
+- (struct rwa_buffer *)rwaBuffer { if (_mapped && _contents) memcpy(_mapped, _contents, _length); return _buf; }
 - (void *)contents { return _contents; }
 - (NSUInteger)length { return _length; }
 - (id)device { return _owner; }
@@ -775,6 +816,16 @@ bg_air_slice(NSData *d)
 - (void)waitUntilComplete {}
 - (BOOL)isPurgeable { return NO; }
 - (NSUInteger)protectionOptions { return 0; }
+- (id)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
+{
+   (void)bpi;
+   BGMTLTexture *t = [[BGMTLTexture alloc] initWithBGDevice:_owner descriptor:d];
+   if (!t) return nil;
+   t->_linSrc = [self retain];
+   t->_linOff = offset;
+   t->_linBpr = bpr;
+   return t;
+}
 @end
 
 // ---- pipeline --------------------------------------------------------------------------------------------------------
@@ -995,6 +1046,24 @@ bg_air_slice(NSData *d)
          IOSurfaceUnlock((IOSurfaceRef)surf, 0, NULL);
       }
    }
+   if (bg_trace() && _status == 4) {   // what each colour attachment holds now: five texels, centre and quarter points
+      NSMutableArray *seen = [NSMutableArray array];
+      for (BGWork *w in _work)
+         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
+            for (unsigned i = 0; i < w->color_count; i++)
+               if (w->color[i] && ![seen containsObject:w->color[i]]) [seen addObject:w->color[i]];
+      for (BGMTLTexture *t in seen) {
+         unsigned wd = (unsigned)[t width], ht = (unsigned)[t height];
+         const unsigned pts[5][2] = { { wd / 2, ht / 2 }, { wd / 4, ht / 4 }, { 3 * wd / 4, ht / 4 }, { wd / 4, 3 * ht / 4 }, { 3 * wd / 4, 3 * ht / 4 } };
+         char line[256]; size_t n = 0;
+         for (unsigned k = 0; k < 5; k++) {
+            uint8_t px[4] = { 0 };
+            [t getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(pts[k][0], pts[k][1], 1, 1) mipmapLevel:0];
+            n += snprintf(line + n, sizeof(line) - n, " (%u,%u,%u,%u)", px[0], px[1], px[2], px[3]);
+         }
+         BG_LOG("  attachment %p %ux%u:%s\n", t, wd, ht, line);
+      }
+   }
    for (void (^h)(id) in _scheduled) h(self);
    [_scheduled removeAllObjects];
    if (_status == 4 && [_presents count]) {
@@ -1059,6 +1128,16 @@ bg_air_slice(NSData *d)
    id<MTLTexture> t = d.colorAttachments[0].texture;
    BG_TRACE("render pass: color0 %lux%lu fmt %lu load %lu store %lu\n", (unsigned long)t.width, (unsigned long)t.height,
             (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction);
+   if (bg_trace()) {
+      for (unsigned i = 1; i < 8; i++)
+         if (d.colorAttachments[i].texture)
+            BG_LOG("  color%u %lux%lu fmt %lu load %lu store %lu\n", i, (unsigned long)d.colorAttachments[i].texture.width,
+                   (unsigned long)d.colorAttachments[i].texture.height, (unsigned long)d.colorAttachments[i].texture.pixelFormat,
+                   (unsigned long)d.colorAttachments[i].loadAction, (unsigned long)d.colorAttachments[i].storeAction);
+      if (d.depthAttachment.texture) BG_LOG("  depth fmt %lu load %lu\n", (unsigned long)d.depthAttachment.texture.pixelFormat, (unsigned long)d.depthAttachment.loadAction);
+      if (d.stencilAttachment.texture) BG_LOG("  stencil fmt %lu load %lu clear %u\n", (unsigned long)d.stencilAttachment.texture.pixelFormat,
+                                             (unsigned long)d.stencilAttachment.loadAction, d.stencilAttachment.clearStencil);
+   }
    return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
 }
 - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
@@ -1236,11 +1315,23 @@ bg_air_slice(NSData *d)
    _owner = device;
    return self;
 }
-- (void)dealloc { if (_tex) rwa_texture_destroy(_tex); if (_surface) CFRelease(_surface); [super dealloc]; }
+- (void)dealloc { if (_tex) rwa_texture_destroy(_tex); if (_surface) CFRelease(_surface); [_linSrc release]; [super dealloc]; }
 - (void *)iosurface { return (void *)_surface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isDrawable { return _surface != NULL; }
-- (struct rwa_texture *)rwaTexture { return _tex; }
+// A linear texture over a buffer reads the buffer's current bytes each time it is handed to the GPU (at commit), so CPU
+// writes into the buffer after the texture was made still show, as with Apple's aliasing.
+- (struct rwa_texture *)rwaTexture
+{
+   if (_linSrc && _tex) {
+      char why[256] = { 0 };
+      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
+      if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff, (unsigned)_linBpr,
+                            why, sizeof(why)) != 0)
+         BG_LOG("linear texture refresh: %s\n", why);
+   }
+   return _tex;
+}
 - (id)device { return _owner; }
 - (NSUInteger)width { return _shape.width; }
 - (NSUInteger)height { return _shape.height; }
@@ -1443,8 +1534,8 @@ bg_air_slice(NSData *d)
    BG_TRACE("setViewport %g %g %g %g z %g..%g\n", v.originX, v.originY, v.width, v.height, v.znear, v.zfar);
    _range[0] = (float)v.znear; _range[1] = (float)v.zfar; _have_range = YES;
 }
-- (void)setDepthStencilState:(id)state { [_depth_state release]; _depth_state = [state retain]; }
-- (void)setStencilReferenceValue:(uint32_t)v { _stencil_ref[0] = _stencil_ref[1] = v; }
+- (void)setDepthStencilState:(id)state { BG_TRACE("setDepthStencilState %p\n", state); [_depth_state release]; _depth_state = [state retain]; }
+- (void)setStencilReferenceValue:(uint32_t)v { BG_TRACE("setStencilReference %u\n", v); _stencil_ref[0] = _stencil_ref[1] = v; }
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _stencil_ref[0] = f; _stencil_ref[1] = b; }
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp { (void)bias; (void)slope; (void)clamp; }
 - (void)setDepthClipMode:(NSUInteger)m { (void)m; }

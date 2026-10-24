@@ -6408,7 +6408,12 @@ rwa_render_create(struct rwa_device *device,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .multisample = samples > 1 });
+         .multisample = samples > 1,
+         /* Metal's lines and points are one pixel; Gallium's zero default draws nothing.
+          * CoreAnimation fills a mask's coverage with line primitives (TcmaA2S1LlnXhf into
+          * the second attachment), and with a width of 0 every mask came out empty. A
+          * [[point_size]] the vertex stage writes still wins (point_size_per_vertex). */
+         .line_width = 1.0f, .point_size = 1.0f, .point_size_per_vertex = 1 });
    if (!render->blend || !render->dsa || !render->rast) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
       goto fail;
