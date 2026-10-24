@@ -14,6 +14,7 @@ Metal API (`MTLDevice`, command buffers, encoders, textures, IOSurfaces) over Me
 | Mesa patches (ir3 fixes, the AIR frontend hook) | `patches/` |
 | Probes and tests (CoreAnimation renderer harness, kernel tests) | `test/` |
 | Corpus and comparison tools | `tools/`, `results/` |
+| Rendering bugs fixed so far: symptom, cause, fix, how to check | `docs/FIXES.md` |
 
 ## Checkout and build
 
