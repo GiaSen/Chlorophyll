@@ -124,6 +124,13 @@ chl_refusal(unsigned *minor)
        * builds those kernels as before and still renders on this device (its stitchable metallibs load and run).
        */
       setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
+      /*
+       * QuartzCore uploads asset-catalog images straight from CGImageTextureData, asking CoreGraphics for Apple's GPU
+       * tiled layout of the compressed data; that layout is padded and CoreGraphics read past the mapped file
+       * (SpringBoard crash-looped in CGImageTextureDataGetOffsetWithBlock), and an Adreno could not sample it anyway.
+       * Off: those images are decoded and uploaded as ordinary textures.
+       */
+      setenv("CA_USE_CGTEXTUREDATA", "0", 0);
       os_log(chl_log(), "%{public}s[%d]: Chlorophyll device made", name, getpid());
    }
    return self;

@@ -16,7 +16,12 @@ B="$OUT/Chlorophyll.bundle"
 rm -rf "$B"; mkdir -p "$B"
 cp -f "$OUT/libbgair.dylib" "$B/libbgair.dylib"
 cp -f "$DRM" "$B/libdrm.2.dylib"
-$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -I"$HERE/../air" -c "$HERE/chlorophyll_plugin.m" -o "$OUT/chlorophyll_plugin.o"
+# The bundle's copy of the Chlorophyll classes gets its own names: processes that also load the bgmtl inject (backboardd, the
+# wallpaper poster) would otherwise hold two classes of each name, and a texture of one copy fails the other's class
+# checks ("colour attachment 0 is not a texture": the poster's watchdog switched Metal off).
+RENAME=""
+for c in $(grep -oE '^@interface (BG[A-Za-z0-9_]+)' "$HERE/../src/bgmtl.m" | sed 's/@interface //' | sort -u); do RENAME="$RENAME -D$c=CHL_$c"; done
+$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations $RENAME -I"$HERE/../air" -c "$HERE/chlorophyll_plugin.m" -o "$OUT/chlorophyll_plugin.o"
 $CC -bundle -o "$B/Chlorophyll" "$OUT/chlorophyll_plugin.o" "$B/libbgair.dylib" "$B/libdrm.2.dylib" \
     -framework Foundation -framework Metal -framework IOSurface -framework IOKit -Wl,-rpath,@loader_path
 cat > "$B/Info.plist" <<'EOP'

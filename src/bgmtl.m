@@ -416,11 +416,13 @@ ensure_protocol(Class cls, const char *proto)
    // to be a device has to conform, and the whole SPI surface is answered by _MTLDevice's own defaults or by methods below.
    ensure_protocol(self, "MTLDeviceSPI");
    ensure_protocol(self, "MTLDevice");
-   const char *fb[] = { "BGMTLCommandQueue", "BGMTLCommandBuffer", "BGMTLRenderEncoder", "BGMTLComputeEncoder", "BGMTLBlitEncoder",
-                        "BGMTLBuffer", "BGMTLTexture", "BGMTLRenderPipeline", "BGMTLComputePipeline", "BGMTLSampler", "BGMTLDepthStencil" };
+   // by class object, not by name: Chlorophyll.bundle builds this file with every class renamed (CHL_...), and a name
+   // lookup there would patch the inject's copy instead of its own
+   Class fb[] = { [BGMTLCommandQueue class], [BGMTLCommandBuffer class], [BGMTLRenderEncoder class], [BGMTLComputeEncoder class],
+                  [BGMTLBlitEncoder class], [BGMTLBuffer class], [BGMTLTexture class], [BGMTLRenderPipeline class],
+                  [BGMTLComputePipeline class], [BGMTLSampler class], [BGMTLDepthStencil class] };
    for (unsigned i = 0; i < sizeof(fb) / sizeof(fb[0]); i++) {
-      Class c = objc_getClass(fb[i]);
-      if (c) bg_install_fallback(c);
+      if (fb[i]) bg_install_fallback(fb[i]);
    }
 }
 
@@ -501,6 +503,27 @@ ensure_protocol(Class cls, const char *proto)
 - (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1 || count == 4; }
 - (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format { (void)format; return 64; }
+// Linear textures (and the buffers clients size for them, CoreGraphics' CGImageTextureData among them) have rows
+// aligned to 64 bytes here (freedreno a6xx pitch alignment). The fallback answered 0 and SpringBoard's image upload
+// wrote past an ImageIO buffer into its guard page (KERN_PROTECTION_FAILURE in CGImageTextureDataGetOffsetWithBlock).
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(NSUInteger)format { (void)format; return 64; }
+// Heap sizing queries: page-aligned, and for textures an upper bound (16 bytes a texel, every mip level), never zero.
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+   (void)options;
+   return (MTLSizeAndAlign){ (length + 0x3fff) & ~(NSUInteger)0x3fff, 0x4000 };
+}
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d
+{
+   NSUInteger w = d.width ? d.width : 1, h = d.height ? d.height : 1, z = d.depth ? d.depth : 1;
+   NSUInteger layers = (d.arrayLength ? d.arrayLength : 1) * (d.textureType == MTLTextureTypeCube || d.textureType == MTLTextureTypeCubeArray ? 6 : 1);
+   NSUInteger total = 0;
+   for (NSUInteger l = 0; l < (d.mipmapLevelCount ? d.mipmapLevelCount : 1); l++) {
+      NSUInteger lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1, lz = z >> l ? z >> l : 1;
+      total += ((lw * 16 + 63) & ~(NSUInteger)63) * lh * lz * layers * (d.sampleCount ? d.sampleCount : 1);
+   }
+   return (MTLSizeAndAlign){ (total + 0x3fff) & ~(NSUInteger)0x3fff, 0x4000 };
+}
 - (uint64_t)sharedMemorySize { return 2048ULL << 20; }
 - (uint64_t)dedicatedMemorySize { return 0; }
 

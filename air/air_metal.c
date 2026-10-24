@@ -7018,14 +7018,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * pipeline was compiled for, and all the same size -- one render pass has one size.
     */
    unsigned samples = render->shape.sample_count ? render->shape.sample_count : 1;
-   unsigned w = 0, h = 0;
+   unsigned w = 0, h = 0, present = 0;
    for (unsigned i = 0; i < draw->color_count; i++) {
       struct rwa_texture *t = draw->color ? draw->color[i] : NULL;
       char what[48];
-      if (!t) {
-         say(why, why_size, "colour attachment %u is not a texture", i);
-         return -1;
-      }
+      /* Chlorophyll: a slot without a texture is legal in Metal; what the pipeline writes there is discarded (a NULL
+       * cbuf). The wallpaper poster's passes have one, and failing them tripped its watchdog. */
+      if (!t)
+         continue;
       snprintf(what, sizeof(what), "colour attachment %u", i);
       if (!attachment_shape_fits(t, samples, what, why, why_size))
          return -1;
@@ -7042,11 +7042,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       unsigned tw = t->shape.width;
       unsigned th = t->shape.height ? t->shape.height : 1;
-      if (i == 0) {
+      if (present++ == 0) {
          w = tw;
          h = th;
       } else if (tw != w || th != h) {
-         say(why, why_size, "colour attachment %u is %ux%u and attachment 0 is %ux%u", i,
+         say(why, why_size, "colour attachment %u is %ux%u and the first one is %ux%u", i,
              tw, th, w, h);
          return -1;
       }
@@ -7079,7 +7079,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       unsigned tw = t->shape.width;
       unsigned th = t->shape.height ? t->shape.height : 1;
-      if (draw->color_count == 0) {
+      if (present == 0) {
          w = tw;        /* a depth-only pass: the depth attachment is the pass's size */
          h = th;
       } else if (tw != w || th != h) {
@@ -7119,7 +7119,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    struct pipe_framebuffer_state fb = { .width = w, .height = h,
                                         .nr_cbufs = draw->color_count,
                                         .samples = samples };
+   if (present == 0 && !draw->depth)
+      return 0;         /* every slot empty and no depth: the draw writes nothing */
    for (unsigned i = 0; i < draw->color_count; i++) {
+      if (!draw->color[i])
+         continue;
       surf[i] = pipe->create_surface(pipe, draw->color[i]->res,
          &(struct pipe_surface){ .format = draw->color[i]->res->format });
       if (!surf[i]) {
