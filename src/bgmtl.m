@@ -128,6 +128,7 @@ __attribute__((weak)) void bgmtl_note_failure(const char *why) { (void)why; }   
 __attribute__((weak)) void bgmtl_note_unimplemented(const char *sel) { (void)sel; }
 __attribute__((weak)) void bgmtl_note_completed(void) {}   // a command buffer finished without error (the injection's dead-man reset)
 __attribute__((weak)) void bgmtl_note_committed(void) {}   // a command buffer was committed (starts the injection's dead-man clock)
+__attribute__((weak)) void bgmtl_note_line(const char *line) { (void)line; }   // one diagnostic line, logged by the injection dylib
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib   // likewise: logged by the injection dylib
 
 @class BGMTLDevice;
@@ -995,6 +996,31 @@ bg_air_slice(NSData *d)
 }
 - (void)waitUntilScheduled { if (_status >= 2 && getenv("BGMTL_BB")) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }
 
+// The fence wait of a commit. A failed wait is not yet a failed command buffer: backboardd's CoreAnimation exits on the
+// first failed one (one "fence timeout" and the compositor restarted, while the kernel counted every submission completed
+// and no hang), so the wait is repeated twice, each failure logged with what the kernel answered (sweet_drm's WAIT_FENCE
+// record: a fence it refuses as never submitted, a GPU not ready, or a real timeout), before the command buffer fails.
+extern void sweet_drm_take_wait_error(char *buf, size_t size) __attribute__((weak_import));
+static int
+bg_fence_wait(BGMTLDevice *dev, struct rwa_fence *fence, char *why, size_t why_size)
+{
+   int rc = rwa_fence_wait([dev rwa], fence, why, why_size);
+   for (int again = 1; rc != 0 && again <= 2; again++) {
+      char k[192] = "", line[512];
+      if (sweet_drm_take_wait_error)
+         sweet_drm_take_wait_error(k, sizeof(k));
+      snprintf(line, sizeof(line), "fence wait failed (%s) [%s]: waiting again (%d of 2)", why, k[0] ? k : "no WAIT_FENCE failed", again);
+      BG_LOG("%s\n", line);
+      bgmtl_note_line(line);
+      rc = rwa_fence_wait([dev rwa], fence, why, why_size);
+      if (rc == 0) {
+         snprintf(line, sizeof(line), "fence wait succeeded on try %d", again + 1);
+         bgmtl_note_line(line);
+      }
+   }
+   return rc;
+}
+
 - (void)bgFailWith:(NSString *)why code:(NSInteger)code
 {
    BG_LOG("command buffer failed: %s\n", [why UTF8String]);
@@ -1151,7 +1177,7 @@ bg_air_slice(NSData *d)
    if (sync_commit < 0)   // or /private/var/tmp/bgmtl.sync for every process (posters, plugin clients) launchd starts
       sync_commit = (getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1') || access("/private/var/tmp/bgmtl.sync", F_OK) == 0;
    if (bg_trace() || sync_commit || _status == 5) {
-      if (_status != 5 && rwa_fence_wait([dev rwa], fence, why, sizeof(why)) != 0)
+      if (_status != 5 && bg_fence_wait(dev, fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)
          _status = 4;
@@ -1166,7 +1192,7 @@ bg_air_slice(NSData *d)
    [self retain];
    dispatch_async(completion, ^{
       char w2[512] = { 0 };
-      if (rwa_fence_wait([dev rwa], fence, w2, sizeof(w2)) != 0)
+      if (bg_fence_wait(dev, fence, w2, sizeof(w2)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:w2] code:3];
       else
          _status = 4;   // Completed: the fence has been paid

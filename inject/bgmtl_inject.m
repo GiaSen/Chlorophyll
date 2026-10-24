@@ -24,7 +24,10 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,6 +146,59 @@ void
 bgmtl_note_committed(void)
 {
    if (!g_first_commit_t) g_first_commit_t = g_watch_t ? g_watch_t : 1;
+}
+
+void
+bgmtl_note_line(const char *line)
+{
+   ilog("%s", line);
+}
+
+// How backboardd ends (it restarted after one failed command buffer and left no crash report): exit() runs the atexit
+// line, a fatal signal writes its name and a backtrace (async-signal-safe: write and backtrace_symbols_fd to an fd opened
+// up front) and is re-raised with the default action. A restart with neither line was a SIGKILL from outside.
+static int g_exit_fd = -1;
+static void
+bb_atexit(void)
+{
+   char m[96];
+   int n = snprintf(m, sizeof(m), "[%d] backboardd: exit() called\n", getpid());
+   if (g_exit_fd >= 0) {
+      write(g_exit_fd, m, n);
+      void *bt[32];
+      backtrace_symbols_fd(bt, backtrace(bt, 32), g_exit_fd);
+   }
+}
+static void
+bb_fatal(int sig)
+{
+   if (g_exit_fd >= 0) {
+      char m[64] = "[";
+      char num[16];
+      int p = getpid(), k = 0;
+      do { num[k++] = '0' + p % 10; p /= 10; } while (p);
+      size_t n = 1;
+      while (k) m[n++] = num[--k];
+      const char *s = "] backboardd: fatal signal ";
+      while (*s) m[n++] = *s++;
+      const char *name = sys_signame[sig];
+      while (*name && n < sizeof(m) - 2) m[n++] = *name++;
+      m[n++] = '\n';
+      write(g_exit_fd, m, n);
+      void *bt[32];
+      backtrace_symbols_fd(bt, backtrace(bt, 32), g_exit_fd);
+   }
+   signal(sig, SIG_DFL);
+   raise(sig);
+}
+static void
+bb_watch_exit(void)
+{
+   g_exit_fd = open(F_LOG, O_WRONLY | O_APPEND | O_CREAT, 0644);
+   atexit(bb_atexit);
+   const int sigs[] = { SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGTERM, SIGFPE };
+   for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
+      signal(sigs[i], bb_fatal);
 }
 
 void
@@ -270,6 +326,7 @@ bb_init(void)
    if (!add || !all) { ilog("backboardd: Metal registration entry points missing: stock"); return; }
    ilog("backboardd: devices before registration: %lu", (unsigned long)[all() count]);
    install_diag();
+   bb_watch_exit();
    add(dev);
    g_registered = 1;
    ilog("backboardd: Chlorophyll device registered (kernel ABI minor %u)%s", minor, crashtest ? ", CRASHTEST armed" : "");
