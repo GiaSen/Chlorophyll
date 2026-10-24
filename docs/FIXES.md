@@ -22,6 +22,21 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
 
 ## Fixes
 
+### Frame time: what helped and what did not (2026-10-24)
+
+- **Framebuffer kept bound per pass (31e727e).** Every draw used to make new `pipe_surface`s, set the framebuffer, and
+  reset it to empty: two framebuffer changes per draw, each switching freedreno's batch and re-dirtying all state. Each
+  texture now keeps one surface, and a pass's draws bind an equal state. Correct, but frame time did not move.
+  A profile showed why: about 2/3 of backboardd's CPU is CoreAnimation's own work, and in libbgair the main cost is
+  uploads.
+- **Linear sampled textures: reverted (5eb3387).** freedreno uploads into a tiled texture through a staging buffer and
+  a GPU blit. Making sampled-only textures linear blanked the home screen (only the widget placeholders drew), with
+  nothing refused in the log, so it was reverted. The cause is not yet found.
+- **ASTC LDR textures (fce9d47).** App snapshots and wallpapers are ASTC 4x4. The Adreno samples ASTC natively; uploads
+  count rows of blocks.
+- **What did move frame time:** the kernel's GPU scan-out copy (0240) and async commits (no `bgmtl-bb.sync`): 20.8 to
+  28.4 fps in the same swipe test. See Bergamota's `docs/FIXES_KERNEL_SYSTEM.md`.
+
 ### Control Center blur: half of every blurred area missing along a diagonal
 
 - **Symptom.** Control Center's backdrop showed only its lower-left triangle; the upper-right was black or stale, with a
