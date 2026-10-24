@@ -133,3 +133,15 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
   stage boundary as 32 bits (afb033a).
 - **~120 ms per frame.** Fixed by uploading at most 4 KB for unsized constant pointers, caching IOSurface imports, and
   dropping the per-draw GPU waits (8eede6f). Asynchronous commit took it to ~20 ms (4762d9d).
+
+## Texture pool and bounded constant uploads (2026-10-24)
+
+- **Why.** In a home-screen swipe, backboardd spent ~9 % creating GPU resources: CoreAnimation makes a new MTLTexture
+  for a backing store each time it is redrawn, and every one was a fresh freedreno resource (a kernel BO, madvise/close
+  on the way out, a new sampler view). Another ~7.6 % went to copying constants bound at offsets the Adreno cannot
+  fetch from: a pointer read at a computed offset still uploaded the 4 KB cap on every draw.
+- **Fix.** Destroyed non-imported textures leave their resource and view in a small pool (24 entries, 48 MB, 2 s); a
+  texture of the same template takes one back (`RWA_TEX_POOL=0` turns it off). Computed constant offsets are bounded
+  with NIR's range analysis where possible, so those bindings copy up to the bound. With the current libdrm stand-in
+  (madvise answered locally) installed too, the swipe test went from ~30 fps (300 frames / 10 s, backboardd at 93-98 %
+  of a core) to ~41 fps (403-429 frames).

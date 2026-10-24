@@ -60,6 +60,9 @@
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/u_gen_mipmap.h"
+#include "util/simple_mtx.h"
+#include "util/os_time.h"
+#include "util/hash_table.h"
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
@@ -1103,6 +1106,131 @@ struct rwa_surface_import {
    unsigned offset, row_bytes;
 };
 
+/*
+ * Chlorophyll: a pool of the GPU resources of textures just destroyed. CoreAnimation makes a new MTLTexture for a
+ * backing store every time one is redrawn, and each was a fresh freedreno resource: a BO from the kernel, its
+ * madvise/close round trips when it went, and a sampler view -- ~9 % of backboardd during a home-screen swipe. A texture
+ * of the same template now takes one back (with its view). New Metal textures have undefined contents, and freedreno
+ * orders work on a reused resource exactly as on a long-lived one. Imported surfaces are never pooled. Entries go after
+ * 2 s; at most TEX_POOL_N of them and TEX_POOL_BYTES in all. RWA_TEX_POOL=0 turns it off.
+ */
+#define TEX_POOL_N 24
+#define TEX_POOL_BYTES (48ull << 20)
+#define TEX_POOL_AGE_NS 2000000000ll
+static struct {
+   struct rwa_device *dev;
+   struct pipe_resource *res;
+   struct pipe_sampler_view *view;
+   uint64_t bytes;
+   int64_t t;
+} tex_pool[TEX_POOL_N];
+static uint64_t tex_pool_total;
+static simple_mtx_t tex_pool_mtx = SIMPLE_MTX_INITIALIZER;
+
+static bool
+tex_pool_on(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = !(getenv("RWA_TEX_POOL") && getenv("RWA_TEX_POOL")[0] == '0');
+   return on;
+}
+
+static uint64_t
+tex_pool_size(const struct pipe_resource *r)
+{
+   uint64_t b = (uint64_t)util_format_get_stride(r->format, r->width0) *
+                util_format_get_nblocksy(r->format, r->height0) * r->depth0 * r->array_size * MAX2(r->nr_samples, 1);
+   return r->last_level ? b + b / 3 : b;
+}
+
+/* Called with tex_pool_mtx held: drop slot k (its view on the device's context, then the resource). */
+static void
+tex_pool_drop(unsigned k)
+{
+   if (tex_pool[k].view)
+      tex_pool[k].dev->pipe->sampler_view_destroy(tex_pool[k].dev->pipe, tex_pool[k].view);
+   pipe_resource_reference(&tex_pool[k].res, NULL);
+   tex_pool_total -= tex_pool[k].bytes;
+   memset(&tex_pool[k], 0, sizeof(tex_pool[k]));
+}
+
+static void
+tex_pool_expire(int64_t now)
+{
+   for (unsigned k = 0; k < TEX_POOL_N; k++)
+      if (tex_pool[k].res && now - tex_pool[k].t > TEX_POOL_AGE_NS)
+         tex_pool_drop(k);
+}
+
+/* A pooled resource made from this template, with its view (NULL when it had none), or NULL. */
+static struct pipe_resource *
+tex_pool_take(struct rwa_device *device, const struct pipe_resource *t, struct pipe_sampler_view **view)
+{
+   if (!tex_pool_on())
+      return NULL;
+   struct pipe_resource *res = NULL;
+   simple_mtx_lock(&tex_pool_mtx);
+   tex_pool_expire(os_time_get_nano());
+   for (unsigned k = 0; k < TEX_POOL_N; k++) {
+      const struct pipe_resource *r = tex_pool[k].res;
+      if (r && tex_pool[k].dev == device && r->target == t->target && r->format == t->format &&
+          r->width0 == t->width0 && r->height0 == t->height0 && r->depth0 == t->depth0 &&
+          r->array_size == t->array_size && r->last_level == t->last_level && r->nr_samples == t->nr_samples &&
+          r->bind == t->bind && r->usage == t->usage) {
+         res = tex_pool[k].res;
+         *view = tex_pool[k].view;
+         tex_pool_total -= tex_pool[k].bytes;
+         memset(&tex_pool[k], 0, sizeof(tex_pool[k]));
+         break;
+      }
+   }
+   simple_mtx_unlock(&tex_pool_mtx);
+   return res;
+}
+
+/* Keep a destroyed texture's resource and view (the reference is the pool's now); false: the caller frees them. */
+static bool
+tex_pool_put(struct rwa_device *device, struct pipe_resource *res, struct pipe_sampler_view *view)
+{
+   uint64_t bytes = tex_pool_size(res);
+   if (!tex_pool_on() || bytes > TEX_POOL_BYTES / 4)
+      return false;
+   int64_t now = os_time_get_nano();
+   simple_mtx_lock(&tex_pool_mtx);
+   tex_pool_expire(now);
+   int free_k = -1, old_k = -1;
+   for (unsigned k = 0; k < TEX_POOL_N; k++) {
+      if (!tex_pool[k].res) {
+         if (free_k < 0)
+            free_k = k;
+      } else if (old_k < 0 || tex_pool[k].t < tex_pool[old_k].t) {
+         old_k = k;
+      }
+   }
+   while (tex_pool_total + bytes > TEX_POOL_BYTES || free_k < 0) {
+      if (old_k < 0)
+         break;
+      tex_pool_drop(old_k);
+      free_k = free_k < 0 ? old_k : free_k;
+      old_k = -1;
+      for (unsigned k = 0; k < TEX_POOL_N; k++)
+         if (tex_pool[k].res && (old_k < 0 || tex_pool[k].t < tex_pool[old_k].t))
+            old_k = k;
+   }
+   bool kept = free_k >= 0 && tex_pool_total + bytes <= TEX_POOL_BYTES;
+   if (kept) {
+      tex_pool[free_k].dev = device;
+      tex_pool[free_k].res = res;
+      tex_pool[free_k].view = view;
+      tex_pool[free_k].bytes = bytes;
+      tex_pool[free_k].t = now;
+      tex_pool_total += bytes;
+   }
+   simple_mtx_unlock(&tex_pool_mtx);
+   return kept;
+}
+
 static struct rwa_texture *
 texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shape,
                  const struct rwa_surface_import *import, char *why, size_t why_size)
@@ -1586,7 +1714,9 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       return texture;
    }
 
-   texture->res = device->screen->resource_create(device->screen, &templ);
+   texture->res = tex_pool_take(device, &templ, &texture->view);
+   if (!texture->res)
+      texture->res = device->screen->resource_create(device->screen, &templ);
    if (!texture->res) {
       say(why, why_size, "the GPU driver would not allocate a %ux%ux%u %s of %s. After a few "
                          "dozen allocations in one boot this driver starts refusing outright "
@@ -1726,6 +1856,11 @@ rwa_texture_destroy(struct rwa_texture *texture)
     * the moment the last reference went, which is the same trap delete_compute_state
     * below is about.
     */
+   if (!texture->surface_handle && texture->res &&
+       tex_pool_put(texture->device, texture->res, texture->view)) {
+      free(texture);          /* the pool holds the resource's reference and the view now */
+      return;
+   }
    if (texture->view)
       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
    pipe_resource_reference(&texture->res, NULL);
@@ -6172,6 +6307,14 @@ blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen 
 static void
 size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
 {
+   /* Chlorophyll: a computed offset is bounded with NIR's range analysis where it can be (an index clamped or masked
+    * by the shader, a loop counter): the binding then uploads up to that bound instead of the 4 KB cap. */
+   static const nir_unsigned_upper_bound_config ub_cfg = {
+      .min_subgroup_size = 1, .max_subgroup_size = 128, .max_workgroup_invocations = 1024,
+      .max_workgroup_count = { 65535, 65535, 65535 }, .max_workgroup_size = { 1024, 1024, 64 },
+      .vertex_attrib_max = { [0 ... 31] = UINT32_MAX },
+   };
+   struct hash_table *range_ht = NULL;
    for (unsigned i = 0; i < info->num_resources; i++) {
       struct air_resource *r = &info->resources[i];
       if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER || r->size)
@@ -6187,11 +6330,19 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
                if (in->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(in->src[0]) ||
                    nir_src_as_uint(in->src[0]) != r->index)
                   continue;
+               unsigned bytes = in->def.num_components * in->def.bit_size / 8;
                if (!nir_src_is_const(in->src[1])) {
-                  bounded = false;
+                  if (!range_ht)
+                     range_ht = _mesa_pointer_hash_table_create(NULL);
+                  uint32_t ub = nir_unsigned_upper_bound(nir, range_ht, nir_get_scalar(in->src[1].ssa, 0), &ub_cfg);
+                  if (ub >= 65536) {
+                     bounded = false;
+                     continue;
+                  }
+                  end = MAX2(end, ub + bytes);
                   continue;
                }
-               unsigned e = (unsigned)nir_src_as_uint(in->src[1]) + in->def.num_components * in->def.bit_size / 8;
+               unsigned e = (unsigned)nir_src_as_uint(in->src[1]) + bytes;
                end = MAX2(end, e);
             }
          }
@@ -6199,6 +6350,8 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
       if (bounded && end)
          r->size = end;
    }
+   if (range_ht)
+      _mesa_hash_table_destroy(range_ht, NULL);
 }
 
 struct rwa_render *
