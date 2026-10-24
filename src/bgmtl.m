@@ -1094,7 +1094,9 @@ bg_air_slice(NSData *d)
       for (void (^h)(id) in _scheduled) h(self);
       [_scheduled removeAllObjects];
    }
-   if (bg_trace() || _status == 5) {
+   static int sync_commit = -1;     // BGMTL_SYNC=1 (the inject sets it when /private/var/tmp/bgmtl-bb.sync exists): wait inline, as before
+   if (sync_commit < 0) sync_commit = getenv("BGMTL_SYNC") && getenv("BGMTL_SYNC")[0] == '1';
+   if (bg_trace() || sync_commit || _status == 5) {
       if (_status != 5 && rwa_fence_wait([dev rwa], fence, why, sizeof(why)) != 0)
          [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5)

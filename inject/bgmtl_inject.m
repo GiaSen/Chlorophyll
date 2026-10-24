@@ -239,6 +239,10 @@ bb_init(void)
    if (st != 1) { ilog("backboardd: GPU state %d (1 = ready): stock", st); return; }
    // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+   if (exists("/private/var/tmp/bgmtl-bb.sync")) {     // A/B: synchronous commits (the frame-order glitches after the async change)
+      setenv("BGMTL_SYNC", "1", 1);
+      ilog("backboardd: BGMTL_SYNC=1 (synchronous commits)");
+   }
    if (exists("/private/var/tmp/bgmtl-bb.full")) {     // experiment: full redraws (the first live run showed stale regions)
       setenv("CA_DISABLE_DIRTY_REGIONS", "1", 1);
       ilog("backboardd: CA_DISABLE_DIRTY_REGIONS=1");
