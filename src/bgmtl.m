@@ -503,6 +503,13 @@ ensure_protocol(Class cls, const char *proto)
    return r;
 }
 
+// No extended-range (XR) formats: the Adreno renders BGRA8, R8 and RGBA16Float natively and no 10-bit XR layout. With YES (the
+// default tables of the profile) QuartzCore's render server built its deep-colour pipelines in RGB10A8_2P_XR10 (550), which
+// Chlorophyll refuses, and aborted "Metal failed to build render pipeline" (first backboardd run). With NO it renders the SDR
+// path only (air2ir3's FORMATS.md: WindowServer decides the same way).
+- (BOOL)supportsExtendedXR10Formats { BG_TRACE("supportsExtendedXR10Formats -> NO\n"); return NO; }
+- (BOOL)supportsExtendedColors { BG_TRACE("supportsExtendedColors -> NO\n"); return NO; }
+
 - (BOOL)metalAssertionsEnabled { return _assertions; }
 - (void)setMetalAssertionsEnabled:(BOOL)enabled { _assertions = enabled; }
 
