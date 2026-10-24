@@ -47,6 +47,7 @@ main(int argc, char **argv)
          MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
          pd.vertexFunction = vf; pd.fragmentFunction = ff;
          pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+         pd.colorAttachments[1].pixelFormat = MTLPixelFormatBGRA8Unorm;   // fluidity writes [[color(1)]] too (sdf only that)
          int wantdepth = !strcmp(fn, "pro24MainFragment");
          if (wantdepth) pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
          NSError *err = nil;
@@ -57,7 +58,11 @@ main(int argc, char **argv)
          MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:128 height:128 mipmapped:NO];
          td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
          id rt = [dev newTextureWithDescriptor:td];
+         id rt1 = [dev newTextureWithDescriptor:td];
          MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+         rp.colorAttachments[1].texture = rt1;
+         rp.colorAttachments[1].loadAction = MTLLoadActionClear;
+         rp.colorAttachments[1].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1);
          rp.colorAttachments[0].texture = rt;
          rp.colorAttachments[0].loadAction = MTLLoadActionClear;
          rp.colorAttachments[0].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1);
@@ -110,6 +115,7 @@ main(int argc, char **argv)
          [cb commit];
          [cb waitUntilCompleted];
          uint8_t out[128 * 128 * 4];
+         if (!strcmp(fn, "fluidity::sdfFragmentShader")) rt = rt1;   // this one writes only [[color(1)]]
          [rt getBytes:out bytesPerRow:512 fromRegion:MTLRegionMake2D(0, 0, 128, 128) mipmapLevel:0];
          unsigned changed = 0, distinct = 0;
          uint32_t first = 0;
