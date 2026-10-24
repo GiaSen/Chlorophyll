@@ -1,0 +1,24 @@
+diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
+index 1f99f36..df8a7b1 100644
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -142,6 +142,19 @@ bo_new(struct fd_device *dev, uint32_t size, uint32_t flags,
+       return bo;
+ 
+    bo = dev->funcs->bo_new(dev, size, flags);
++#ifdef __APPLE__
++   /* Chlorophyll: the kernel gives each client 4096 GEM handles and refuses the next one silently. The BO caches
++    * (kept 15 s, see freedreno_bo_cache.c) hold handles of freed buffers: on a refusal, empty both and ask once
++    * more (a NULL here was dereferenced by every caller: the compositor crashed in upload_shader_variant). */
++   if (!bo) {
++      dev->bo_cache.time = (time_t)-1;
++      fd_bo_cache_cleanup(&dev->bo_cache, 0);
++      dev->ring_cache.time = (time_t)-1;
++      fd_bo_cache_cleanup(&dev->ring_cache, 0);
++      bo = dev->funcs->bo_new(dev, size, flags);
++      mesa_logw("bo_new(%u): kernel refused; caches emptied, retry %s", size, bo ? "succeeded" : "failed");
++   }
++#endif
+    if (!bo)
+       return NULL;
+ 

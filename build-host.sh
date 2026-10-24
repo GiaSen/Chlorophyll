@@ -26,7 +26,7 @@ if [ ! -d mesa ]; then
   # the freedreno msm backend over the libdrm stand-in is enabled for iOS only by that patch; here the host is macOS
   sed -i.bak "s/host_machine.system() == 'darwin' and host_machine.subsystem() == 'ios' and get_option/host_machine.system() == 'darwin' and get_option/" mesa/meson.build
   rm -f mesa/meson.build.bak
-  for p in air-frontend air-ir3 ir3-round-default ir3-shift-split ir3-ssbo-subdword fd-bo-cache-keep; do
+  for p in air-frontend air-ir3 ir3-round-default ir3-shift-split ir3-ssbo-subdword fd-bo-cache-keep fd-bo-new-purge-retry; do
     git -C mesa apply "$HERE/patches/$p.patch"
   done
   mkdir -p mesa/src/compiler/air
