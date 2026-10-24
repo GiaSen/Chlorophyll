@@ -27,6 +27,10 @@ $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -I"$HERE/air" -c "$H
 $CC -o "$OUT/bgmtl_ca_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_ca_probe.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@executable_path
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_layer_probe.m" -o "$OUT/bgmtl_layer_probe.o"
 $CC -o "$OUT/bgmtl_layer_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_layer_probe.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -framework QuartzCore -Wl,-rpath,@executable_path
+# phase (j)(b): CoreAnimation's Metal renderer offscreen over BGMTLDevice, against its CPU renderer
+$CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_carenderer_probe.m" -o "$OUT/bgmtl_carenderer_probe.o"
+$CC -o "$OUT/bgmtl_carenderer_probe" "$OUT/bgmtl.o" "$OUT/bgmtl_carenderer_probe.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation \
+    -framework Metal -framework IOSurface -framework QuartzCore -framework CoreGraphics -Wl,-rpath,@executable_path
 $CC -O1 -g -fno-objc-arc -Wall -Wno-deprecated-declarations -c "$HERE/test/bgmtl_adddev.m" -o "$OUT/bgmtl_adddev.o"
 $CC -o "$OUT/bgmtl_adddev" "$OUT/bgmtl.o" "$OUT/bgmtl_adddev.o" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -framework Foundation -framework Metal -framework IOSurface -Wl,-rpath,@executable_path
 $CC -O1 -g -Wall -I"$HERE/air" "$HERE/test/bgair_vertex_test.c" -o "$OUT/bgair_vertex_test" "$OUT/libbgair.dylib" "$OUT/libdrm.2.dylib" -Wl,-rpath,@executable_path

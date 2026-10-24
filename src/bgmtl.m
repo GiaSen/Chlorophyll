@@ -15,6 +15,8 @@
 // Scope: command queue, command buffer, compute encoder (setBuffer/setBytes/dispatch), a CPU blit encoder (copy/fill on shared
 // buffers), buffers, libraries/functions through Metal's own _MTLLibrary, compute pipelines. No textures, render, heaps, events.
 #import <Foundation/Foundation.h>
+#include <libkern/OSByteOrder.h>
+#include <os/lock.h>
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -71,6 +73,16 @@ bg_log(const char *fmt, ...)
    va_end(ap);
 }
 
+// BGMTL_TRACE=1: one line per command buffer, render pass, pipeline build and commit (what a client such as CoreAnimation sends)
+static int
+bg_trace(void)
+{
+   static int t = -1;
+   if (t < 0) t = getenv("BGMTL_TRACE") != NULL;
+   return t;
+}
+#define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
+
 #define BG_MAX_BINDINGS 16
 
 // provided by the injection dylib (gpu/metal/inject), absent in the test tools
@@ -126,6 +138,72 @@ enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCO
    NSUInteger t_sslice, t_slevel, t_dslice, t_dlevel, t_sorg[3], t_dorg[3], t_size[3], t_bpr, t_bpi;
 }
 @end
+// Unknown selectors on the queue, command buffers, encoders and resources: logged once each and answered with zero / a no-op,
+// as the device does, so a client (CoreAnimation) shows every gap in one run instead of dying on the first. The signature comes
+// from Metal's protocols (MTL*), where every such selector is declared.
+static NSMethodSignature *
+bg_proto_signature(SEL sel)
+{
+   unsigned n = 0;
+   Protocol *__unsafe_unretained *all = objc_copyProtocolList(&n);
+   NSMethodSignature *sig = nil;
+   for (unsigned i = 0; i < n && !sig; i++) {
+      if (strncmp(protocol_getName(all[i]), "MTL", 3) != 0) continue;
+      for (int req = 0; req < 2 && !sig; req++) {
+         struct objc_method_description d = protocol_getMethodDescription(all[i], sel, req, YES);
+         if (d.name && d.types) sig = [NSMethodSignature signatureWithObjCTypes:d.types];
+      }
+   }
+   free(all);
+   if (!sig) {     // SPI declared nowhere at run time (setResponsibleTaskIDs:count:): void, one pointer-sized argument per colon
+      char types[64] = "v@:";
+      for (const char *c = sel_getName(sel); *c && strlen(types) < sizeof(types) - 1; c++)
+         if (*c == ':') strcat(types, "Q");
+      sig = [NSMethodSignature signatureWithObjCTypes:types];
+   }
+   return sig;
+}
+
+static NSMethodSignature *
+bg_fwd_sig(id self, SEL _cmd, SEL sel)
+{
+   (void)_cmd;
+   Method m = class_getInstanceMethod(object_getClass(self), sel);     // implemented somewhere up the chain
+   if (m) return [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(m)];
+   return bg_proto_signature(sel);   // the base classes' own -methodSignatureForSelector: is not asked: it may throw
+}
+
+static void
+bg_fwd_inv(id self, SEL _cmd, NSInvocation *inv)
+{
+   (void)_cmd;
+   static NSMutableSet *seen;
+   static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+   NSString *key = [NSString stringWithFormat:@"%s %s", class_getName(object_getClass(self)), sel_getName([inv selector])];
+   os_unfair_lock_lock(&lk);
+   if (!seen) seen = [[NSMutableSet alloc] init];
+   BOOL fresh = ![seen containsObject:key];
+   if (fresh) [seen addObject:key];
+   os_unfair_lock_unlock(&lk);
+   if (fresh) {
+      BG_LOG("%s: unimplemented, answered with zero\n", key.UTF8String);
+      bgmtl_note_unimplemented(sel_getName([inv selector]));
+   }
+   NSUInteger len = [[inv methodSignature] methodReturnLength];
+   if (len) {
+      void *z = calloc(1, len);
+      [inv setReturnValue:z];
+      free(z);
+   }
+}
+
+static void
+bg_install_fallback(Class c)
+{
+   class_addMethod(c, @selector(methodSignatureForSelector:), (IMP)bg_fwd_sig, "@@::");
+   class_addMethod(c, @selector(forwardInvocation:), (IMP)bg_fwd_inv, "v@:@");
+}
+
 @implementation BGWork
 - (void)dealloc
 {
@@ -289,6 +367,12 @@ ensure_protocol(Class cls, const char *proto)
    // to be a device has to conform, and the whole SPI surface is answered by _MTLDevice's own defaults or by methods below.
    ensure_protocol(self, "MTLDeviceSPI");
    ensure_protocol(self, "MTLDevice");
+   const char *fb[] = { "BGMTLCommandQueue", "BGMTLCommandBuffer", "BGMTLRenderEncoder", "BGMTLComputeEncoder", "BGMTLBlitEncoder",
+                        "BGMTLBuffer", "BGMTLTexture", "BGMTLRenderPipeline", "BGMTLComputePipeline", "BGMTLSampler", "BGMTLDepthStencil" };
+   for (unsigned i = 0; i < sizeof(fb) / sizeof(fb[0]); i++) {
+      Class c = objc_getClass(fb[i]);
+      if (c) bg_install_fallback(c);
+   }
 }
 
 - (instancetype)initWithAcceleratorPort:(uint32_t)port
@@ -399,6 +483,79 @@ ensure_protocol(Class cls, const char *proto)
    return [[BGMTLCommandQueue alloc] initWithBGDevice:self descriptor:use];
 }
 
+// -- libraries from files: system metallibs (QuartzCore's default.metallib) are fat wrappers, slice 0 the AIR container
+// ("MTLB"), slice 1 precompiled Apple GPU code. _MTLDevice's own URL/bundle loaders pick the slice through MTLLoader by the
+// device's target architecture, which this device does not have (assertion "Target device architecture is nil"), so the
+// AIR slice is taken here and loaded with -newLibraryWithData:, the path every other library of this device takes --
+static NSData *
+bg_air_slice(NSData *d)
+{
+   const uint8_t *b = d.bytes;
+   NSUInteger n = d.length;
+   if (n >= 4 && memcmp(b, "MTLB", 4) == 0) return d;
+   if (n < 8 || OSReadBigInt32(b, 0) != 0xcafebabeu) return nil;
+   uint32_t count = OSReadBigInt32(b, 4);
+   for (uint32_t i = 0; i < count && 8 + 20 * (NSUInteger)(i + 1) <= n; i++) {
+      uint32_t off = OSReadBigInt32(b, 8 + 20 * i + 8), size = OSReadBigInt32(b, 8 + 20 * i + 12);
+      if ((NSUInteger)off + size <= n && size >= 4 && memcmp(b + off, "MTLB", 4) == 0)
+         return [d subdataWithRange:NSMakeRange(off, size)];
+   }
+   return nil;
+}
+
+- (id)newLibraryWithURL:(NSURL *)url error:(NSError **)error
+{
+   NSData *d = [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:error];
+   NSData *air = d ? bg_air_slice(d) : nil;
+   if (!air) {
+      BG_LOG("library %s: %s\n", url.path.UTF8String, d ? "no AIR (MTLB) slice" : "unreadable");
+      if (error && d)
+         *error = [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:1
+                                  userInfo:@{ NSLocalizedDescriptionKey : @"no AIR slice in the metallib" }];
+      return nil;
+   }
+   [air retain];
+   dispatch_data_t dd = dispatch_data_create(air.bytes, air.length, NULL, ^{ [air release]; });
+   id lib = ((id (*)(id, SEL, dispatch_data_t, NSError **))objc_msgSend)(self, @selector(newLibraryWithData:error:), dd, error);
+   dispatch_release(dd);
+   BG_LOG("library %s: AIR slice %lu bytes -> %s\n", url.path.UTF8String, (unsigned long)air.length, lib ? "loaded" : "refused");
+   return lib;
+}
+
+- (id)newLibraryWithFile:(NSString *)path error:(NSError **)error
+{
+   return [self newLibraryWithURL:[NSURL fileURLWithPath:path] error:error];
+}
+
+- (id)newDefaultLibraryWithBundle:(NSBundle *)bundle error:(NSError **)error
+{
+   NSURL *url = [bundle URLForResource:@"default" withExtension:@"metallib"];
+   if (!url) {
+      if (error)
+         *error = [NSError errorWithDomain:@"MTLLibraryErrorDomain" code:1
+                                  userInfo:@{ NSLocalizedDescriptionKey : @"no default.metallib in the bundle" }];
+      return nil;
+   }
+   return [self newLibraryWithURL:url error:error];
+}
+
+// Binary archives (QuartzCore opens one with a URL: pipelines precompiled for Apple GPUs). Reading it asserts in MTLLoader for
+// want of a target architecture, and nothing in it runs on an Adreno: the archive is created empty (no URL), so it only
+// serves as the cache object the caller expects; pipelines are built from AIR as always.
+- (id)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)descriptor error:(NSError **)error
+{
+   MTLBinaryArchiveDescriptor *d = [[descriptor copy] autorelease];
+   if (d.url)
+      BG_LOG("binary archive %s: opened empty (precompiled Apple GPU code)\n", d.url.path.UTF8String);
+   d.url = nil;
+   return [super newBinaryArchiveWithDescriptor:d error:error];
+}
+
+- (id)newDefaultLibrary
+{
+   return [self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:NULL];
+}
+
 - (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options
 {
    (void)options;
@@ -438,6 +595,7 @@ ensure_protocol(Class cls, const char *proto)
    if (!bitcode) bitcode = sel_getUid("bitcodeData");
    if (!_rwa) return [self bgFail:error with:[NSString stringWithFormat:@"no GPU: %s", _why]];
    id vertex = [descriptor vertexFunction], fragment = [descriptor fragmentFunction];
+   BG_TRACE("render pipeline: vertex %s fragment %s\n", vertex ? [[vertex name] UTF8String] : "-", fragment ? [[fragment name] UTF8String] : "-");
    if (!fragment) return [self bgFail:error with:@"a render pipeline needs a fragment function"];
    /* no vertex function: libbgair supplies a pass-through stage over the whole attachment (a quad, 4 vertices as a strip) --
     * the road the fragment shaders of a library are exercised by, as air_run did */
@@ -610,6 +768,8 @@ ensure_protocol(Class cls, const char *proto)
 - (id)device { return _owner; }
 - (id)commandBuffer { return [[[BGMTLCommandBuffer alloc] initWithBGQueue:self] autorelease]; }
 - (id)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
+// CoreAnimation asks with a descriptor; _MTLCommandQueue's default would hand back a generic command buffer that never reaches the GPU
+- (id)commandBufferWithDescriptor:(id)d { (void)d; return [self commandBuffer]; }
 - (void)insertDebugCaptureBoundary {}
 @end
 
@@ -684,6 +844,7 @@ ensure_protocol(Class cls, const char *proto)
 
 - (void)commit
 {
+   BG_TRACE("commit: %lu recorded commands\n", (unsigned long)[_work count]);
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    _status = 2;   // Committed
@@ -841,8 +1002,19 @@ ensure_protocol(Class cls, const char *proto)
 - (id)computeCommandEncoder { return [[[BGMTLComputeEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
 - (id)computeCommandEncoderWithDescriptor:(id)d { (void)d; return [self computeCommandEncoder]; }
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { (void)t; return [self computeCommandEncoder]; }
+// SPI hints CoreAnimation sets on every command buffer (QuartzCore checks for them and raises if absent): which tasks the work is
+// accounted to, and the protection class of the content. Neither changes what this GPU does.
+- (void)setResponsibleTaskIDs:(const int *)ids count:(NSUInteger)count { (void)ids; (void)count; }
+- (void)setProtectionOptions:(uint64_t)options { (void)options; }
+- (uint64_t)protectionOptions { return 0; }
+
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
-{ return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease]; }
+{
+   id<MTLTexture> t = d.colorAttachments[0].texture;
+   BG_TRACE("render pass: color0 %lux%lu fmt %lu load %lu store %lu\n", (unsigned long)t.width, (unsigned long)t.height,
+            (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction);
+   return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
+}
 - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
 - (id)blitCommandEncoderWithDescriptor:(id)d { (void)d; return [self blitCommandEncoder]; }
 @end
@@ -1191,6 +1363,13 @@ ensure_protocol(Class cls, const char *proto)
 { if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 { if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
+// CoreAnimation binds a buffer once per pass and then only moves the offset between draws
+- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _voff[i] = o; }
+- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _foff[i] = o; }
+- (void)setVertexBuffers:(const id *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
+{ for (NSUInteger k = 0; k < r.length; k++) [self setVertexBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
+- (void)setFragmentBuffers:(const id *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
+{ for (NSUInteger k = 0; k < r.length; k++) [self setFragmentBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
@@ -1218,6 +1397,16 @@ ensure_protocol(Class cls, const char *proto)
         indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
 {
    if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }
+   if (bg_trace()) {
+      BG_LOG("draw: prim %lu start %lu count %lu inst %lu index %s type %lu off %lu\n", (unsigned long)prim, (unsigned long)start,
+             (unsigned long)count, (unsigned long)inst, ib ? "yes" : "no", (unsigned long)it, (unsigned long)io);
+      for (unsigned i = 0; i < _vhigh; i++) {
+         if (!_vbuf[i]) continue;
+         const float *f = (const float *)((const uint8_t *)[(BGMTLBuffer *)_vbuf[i] contents] + _voff[i]);
+         BG_LOG("  vbuf[%u] len %lu off %lu: %g %g %g %g %g %g %g %g\n", i, (unsigned long)[(BGMTLBuffer *)_vbuf[i] length],
+                (unsigned long)_voff[i], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+      }
+   }
    BGWork *w = [[[BGWork alloc] init] autorelease];
    w->kind = BG_WORK_DRAW;
    w->render = [_pipeline retain];

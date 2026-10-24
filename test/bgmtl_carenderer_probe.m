@@ -127,6 +127,32 @@ main(int argc, char **argv)
       void (*add)(id) = (void (*)(id))dlsym(RTLD_DEFAULT, "MTLAddDevice");
       if (!all || !add) { printf("no Metal registration entry points\n"); return 2; }
       printf("devices before: %lu\n", (unsigned long)[all() count]);
+      if (getenv("BG_IMP_FIND")) {   // which ObjC methods live at these Metal.framework offsets (crash report frames)
+         char *list = strdup(getenv("BG_IMP_FIND"));
+         unsigned long want[16]; int nw = 0;
+         for (char *t = strtok(list, ","); t && nw < 16; t = strtok(NULL, ",")) want[nw++] = strtoul(t, NULL, 16);
+         unsigned nc = 0;
+         Class *cls = objc_copyClassList(&nc);
+         for (unsigned c = 0; c < nc; c++) {
+            for (int meta = 0; meta < 2; meta++) {
+               Class k = meta ? object_getClass((id)cls[c]) : cls[c];
+               unsigned nm = 0;
+               Method *ms = class_copyMethodList(k, &nm);
+               for (unsigned m = 0; m < nm; m++) {
+                  Dl_info di;
+                  IMP imp = method_getImplementation(ms[m]);
+                  if (!dladdr((void *)imp, &di) || !strstr(di.dli_fname, "/Metal.framework/")) continue;
+                  unsigned long off = (unsigned long)imp - (unsigned long)di.dli_fbase;
+                  for (int w = 0; w < nw; w++)
+                     if (off <= want[w] && want[w] - off < 0x400)
+                        printf("0x%lx: %c[%s %s] +0x%lx\n", want[w], meta ? '+' : '-', class_getName(cls[c]),
+                               sel_getName(method_getName(ms[m])), want[w] - off);
+               }
+               free(ms);
+            }
+         }
+         return 0;
+      }
       id dev = bgmtl_create_device();
       if (!dev) { printf("no BGMTL device (GPU not ready?)\n"); return 2; }
       add(dev);
@@ -152,11 +178,16 @@ main(int argc, char **argv)
          if (!r) { printf("scene %d: CARenderer refused the texture\n", n); bad++; continue; }
          r.layer = scene;
          r.bounds = CGRectMake(0, 0, W, H);
+         [CATransaction flush];      // the renderer draws the render tree, which only exists after a commit
          CFTimeInterval t = CACurrentMediaTime();
          [r beginFrameAtTime:t timeStamp:NULL];
          [r addUpdateRect:r.bounds];
          [r render];
          [r endFrame];
+         // CARenderer commits without waiting: a command buffer behind it on the same queue completes after its work
+         id<MTLCommandBuffer> fence = [q commandBuffer];
+         [fence commit];
+         [fence waitUntilCompleted];
          uint8_t *out = calloc(W * H, 4);
          [tex getBytes:out bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
          double sum = 0; unsigned nonzero = 0;
