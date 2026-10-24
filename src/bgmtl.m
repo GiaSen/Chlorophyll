@@ -1218,7 +1218,9 @@ bg_air_slice(NSData *d)
     * attachment is how the difference showed: IOSurface attachments alone were enough). Cheap next to the full cache clean
     * skipped above: a 1x1 map of a surface whose fence is already paid.
     */
-   if (_status == 4 && in_compositor) {
+   static int noreadback = -1;
+   if (noreadback < 0) noreadback = getenv("BGMTL_NOREADBACK") != NULL;
+   if (_status == 4 && in_compositor && !noreadback) {
       NSMutableSet *seen = nil;
       for (BGWork *w in _work)
          if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)

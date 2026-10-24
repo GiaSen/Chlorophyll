@@ -1,0 +1,16 @@
+diff --git a/src/freedreno/drm/freedreno_bo_cache.c b/src/freedreno/drm/freedreno_bo_cache.c
+index a656267..46c6ffb 100644
+--- a/src/freedreno/drm/freedreno_bo_cache.c
++++ b/src/freedreno/drm/freedreno_bo_cache.c
+@@ -142,8 +142,9 @@ fd_bo_cache_cleanup(struct fd_bo_cache *cache, time_t time)
+       while (!list_is_empty(&bucket->list)) {
+          bo = first_bo(&bucket->list);
+ 
+-         /* keep things in cache for at least 1 second: */
+-         if (time && ((time - bo->free_time) <= 1))
++         /* keep things in cache for at least 1 second (Chlorophyll: 15; CoreAnimation frees and re-creates full-screen
++          * render targets every few seconds, and a new 12 MB buffer costs the compositor ~18 ms in the kernel): */
++         if (time && ((time - bo->free_time) <= 15))
+             break;
+ 
+          if (cnt == 0) {

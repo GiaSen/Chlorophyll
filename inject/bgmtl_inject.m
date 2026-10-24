@@ -248,6 +248,9 @@ bb_init(void)
    unsigned minor = 0;
    int st = bgmtl_gpu_state(&minor);
    if (st != 1) { ilog("backboardd: GPU state %d (1 = ready): stock", st); return; }
+   // A/B switches for the wallpaper readback investigation: freedreno without batch reordering, and no per-frame readback
+   if (exists("/private/var/tmp/bgmtl-bb.inorder")) { setenv("FD_MESA_DEBUG", "inorder", 1); ilog("backboardd: FD_MESA_DEBUG=inorder"); }
+   if (exists("/private/var/tmp/bgmtl-bb.noreadback")) { setenv("BGMTL_NOREADBACK", "1", 1); ilog("backboardd: BGMTL_NOREADBACK=1"); }
    // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
    if (exists("/private/var/tmp/bgmtl-bb.sync")) {     // A/B: synchronous commits (the frame-order glitches after the async change)
