@@ -422,6 +422,16 @@ ensure_protocol(Class cls, const char *proto)
 }
 
 - (struct rwa_device *)rwa { return _rwa; }
+
+// Metal's private -targetDeviceInfo: a pointer to {u64, u32, const char *name at +0x10}, read when a library is loaded or
+// compiled (Metal+0x24888, iOS 18.7.8: it dereferences +0x10 without a check). The fallback forwarding answered NULL and
+// SpringBoard's Siri orb (SiriUICore) crashed there. The values are what Metal builds itself for a device that does not
+// answer: zeros and the device name.
+- (const void *)targetDeviceInfo
+{
+   static const struct { uint64_t a; uint32_t b; const char *name; } info = { 0, 0, "Chlorophyll" };
+   return &info;
+}
 - (NSString *)bgWhy { return [NSString stringWithUTF8String:_why]; }
 - (id)bgFail:(NSError **)error with:(NSString *)reason
 {

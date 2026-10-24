@@ -71,30 +71,51 @@ chl_inject_loaded(void)
 @interface CHLDevice : BGMTLDevice
 @end
 
+/* NULL when this process may have a device, else why not (logged once per process) */
+static const char *
+chl_refusal(unsigned *minor)
+{
+   const char *name = getprogname() ? getprogname() : "?";
+   if (chl_exists("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.off")) return "chlorophyll.off exists";
+   if (chl_listed("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.deny", name) == 1) return "listed in chlorophyll.deny";
+   if (chl_listed("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.allow", name) == 0) return "chlorophyll.allow exists and does not list it";
+   if (chl_inject_loaded()) return "the bgmtl inject owns this process's device";
+   if (bgmtl_gpu_state(minor) != 1) return "the kernel reports the GPU not ready";
+   return NULL;
+}
+
 @implementation CHLDevice
+/*
+ * Refused here, before an object exists: Metal does [[class alloc] initWithAcceleratorPort:], and an object released
+ * before _MTLDevice's -init ran crashes in its -dealloc (dispatch_release(NULL); backboardd crash-looped, 2026-10-24).
+ * nil from +alloc makes the init a message to nil, and Metal skips a nil device.
+ */
++ (instancetype)allocWithZone:(struct _NSZone *)zone
+{
+   unsigned minor = 0;
+   const char *why = chl_refusal(&minor);
+   if (why) {
+      os_log(chl_log(), "%{public}s[%d]: no device: %{public}s", getprogname() ? getprogname() : "?", getpid(), why);
+      return nil;
+   }
+   return [super allocWithZone:zone];
+}
+
++ (instancetype)alloc
+{
+   return [self allocWithZone:NULL];
+}
+
 - (instancetype)initWithAcceleratorPort:(uint32_t)port
 {
    const char *name = getprogname() ? getprogname() : "?";
-   const char *why = NULL;
-   unsigned minor = 0;
-
-   if (chl_exists("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.off")) why = "chlorophyll.off exists";
-   else if (chl_listed("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.deny", name) == 1) why = "listed in chlorophyll.deny";
-   else if (chl_listed("/System/Library/Extensions/Chlorophyll.bundle/chlorophyll.allow", name) == 0) why = "chlorophyll.allow exists and does not list it";
-   else if (chl_inject_loaded()) why = "the bgmtl inject owns this process's device";
-   else if (bgmtl_gpu_state(&minor) != 1) why = "the kernel reports the GPU not ready";
-   if (why) {
-      os_log(chl_log(), "%{public}s[%d]: no device: %{public}s", name, getpid(), why);
-      [self release];
-      return nil;
-   }
    self = [super initWithAcceleratorPort:port];
    if (self && ![self rwa]) {
       os_log(chl_log(), "%{public}s[%d]: no device: the GPU user client could not be opened (sandbox?)", name, getpid());
-      [self release];
+      [self release];   /* fully initialized here: BGMTLDevice's own teardown, as bgmtl_create_device does */
       return nil;
    }
-   if (self) os_log(chl_log(), "%{public}s[%d]: Chlorophyll device made (kernel ABI minor %u)", name, getpid(), minor);
+   if (self) os_log(chl_log(), "%{public}s[%d]: Chlorophyll device made", name, getpid());
    return self;
 }
 @end
