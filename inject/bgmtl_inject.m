@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 extern id bgmtl_create_device(void);
@@ -56,12 +57,25 @@ exists(const char *p)
    return stat(p, &st) == 0;
 }
 
+// The boot the state was written in (kern.bootsessionuuid; kern.boottime moves when the RTC is set, bgl-launch found): a launch that
+// never reached "alive" in an EARLIER boot was ended by the reboot (or by RunningBoard suspending the extension, which stops the
+// watchdog's clock), not by a crash, and does not count.
+static const char *
+boot_id(void)
+{
+   static char u[64];
+   size_t len = sizeof u - 1;
+   if (!u[0] && sysctlbyname("kern.bootsessionuuid", u, &len, NULL, 0) != 0) u[0] = 0;
+   u[sizeof u - 1] = 0;
+   return u[0] ? u : "-";
+}
+
 static void
 write_state(int unclean, int alive)
 {
    FILE *f = fopen(F_STATE, "w");
    if (!f) return;
-   fprintf(f, "unclean=%d alive=%d\n", unclean, alive);
+   fprintf(f, "unclean=%d alive=%d boot=%s\n", unclean, alive, boot_id());
    fclose(f);
 }
 
@@ -84,6 +98,18 @@ bgmtl_note_present(const char *line)
    int black = strstr(line, "mean texel value 0.0") != NULL;
    if (k <= 120 || k % 30 == 0 || black)
       ilog("#%u %s%s", k, line, black ? "  <-- BLACK" : "");
+}
+
+// A command buffer finished without error: this launch draws, whatever the watchdog's clock says (RunningBoard suspends the
+// extension while the wallpaper is hidden, so a suspended watchdog never reaches its 15 s, and a static wallpaper draws once).
+void
+bgmtl_note_completed(void)
+{
+   static volatile unsigned n;
+   if (__sync_add_and_fetch(&n, 1) == 1) {
+      write_state(0, 1);
+      ilog("first command buffer completed: dead-man counter reset");
+   }
 }
 
 void
@@ -160,8 +186,10 @@ bgmtl_inject_init(void)
       if (!exists(F_ARM)) { ilog("%s: not armed, stock", [bid UTF8String]); return; }
       // gate 3: the dead-man
       int unclean = 0, alive = 1;
+      char boot[64] = "";
       FILE *f = fopen(F_STATE, "r");
-      if (f) { if (fscanf(f, "unclean=%d alive=%d", &unclean, &alive) != 2) { unclean = 0; alive = 1; } fclose(f); }
+      if (f) { if (fscanf(f, "unclean=%d alive=%d boot=%63s", &unclean, &alive, boot) < 2) { unclean = 0; alive = 1; } fclose(f); }
+      if (!alive && strcmp(boot, boot_id()) != 0) { ilog("last launch was in an earlier boot: not counted as unclean"); alive = 1; }
       if (!alive) unclean++;
       if (unclean >= 2) trip("two unclean launches in a row");
       write_state(unclean, 0);

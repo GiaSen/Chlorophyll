@@ -6582,12 +6582,12 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
    }
    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
    for (unsigned i = 0; i < clear->color_count; i++)
-      if (surf[i]) pipe->surface_destroy(pipe, surf[i]);
-   if (zsurf) pipe->surface_destroy(pipe, zsurf);
+      if (surf[i]) pipe_surface_reference(&surf[i], NULL);
+   if (zsurf) pipe_surface_reference(&zsurf, NULL);
    return 0;
 fail:
    for (unsigned i = 0; i < clear->color_count; i++)
-      if (surf[i]) pipe->surface_destroy(pipe, surf[i]);
+      if (surf[i]) pipe_surface_reference(&surf[i], NULL);
    return -1;
 }
 
@@ -6905,7 +6905,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          say(why, why_size, "%s would not make a render surface of colour attachment %u",
              rwa_device_name(device), i);
          for (unsigned j = 0; j < i; j++)
-            pipe->surface_destroy(pipe, surf[j]);
+            pipe_surface_reference(&surf[j], NULL);
          return -1;
       }
       fb.cbufs[i] = surf[i];
@@ -6917,7 +6917,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          say(why, why_size, "%s would not make a render surface of the depth attachment",
              rwa_device_name(device));
          for (unsigned j = 0; j < draw->color_count; j++)
-            pipe->surface_destroy(pipe, surf[j]);
+            pipe_surface_reference(&surf[j], NULL);
          return -1;
       }
       fb.zsbuf = zsurf;
@@ -7137,8 +7137,8 @@ unbind:
    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
    for (unsigned i = 0; i < draw->color_count; i++)
       if (surf[i])
-         pipe->surface_destroy(pipe, surf[i]);
+         pipe_surface_reference(&surf[i], NULL);
    if (zsurf)
-      pipe->surface_destroy(pipe, zsurf);
+      pipe_surface_reference(&zsurf, NULL);
    return rc;
 }

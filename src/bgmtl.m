@@ -76,6 +76,7 @@ bg_log(const char *fmt, ...)
 // provided by the injection dylib (gpu/metal/inject), absent in the test tools
 __attribute__((weak)) void bgmtl_note_failure(const char *why) { (void)why; }   // overridden by the injection dylib
 __attribute__((weak)) void bgmtl_note_unimplemented(const char *sel) { (void)sel; }
+__attribute__((weak)) void bgmtl_note_completed(void) {}   // a command buffer finished without error (the injection's dead-man reset)
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib   // likewise: logged by the injection dylib
 
 @class BGMTLDevice;
@@ -819,6 +820,8 @@ ensure_protocol(Class cls, const char *proto)
                (unsigned)[_presents count], ndraw, nclear, npass_att, wd, ht, luma, (t_end - t_begin) / 1e6, t_end / 1e9);
       bgmtl_note_present(line);
    }
+   if (_status == 4)
+      bgmtl_note_completed();
    if (_status == 4) {
       for (NSArray *p in _presents) {
          id dr = p[0];
