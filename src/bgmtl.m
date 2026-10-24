@@ -69,19 +69,38 @@
 static void
 bg_log(const char *fmt, ...)
 {
+   static FILE *tf;
+   static int tf_tried;
    va_list ap;
    va_start(ap, fmt);
    fprintf(stderr, "bgmtl[%d]: ", getpid());
    vfprintf(stderr, fmt, ap);
    va_end(ap);
+   // /private/var/tmp/bgmtl.trace: the log also goes to bgmtl-trace-<pid>.txt there (daemons and extensions whose stderr
+   // nobody reads and whose environment launchd sets, such as the wallpaper poster)
+   if (!tf_tried) {
+      tf_tried = 1;
+      if (access("/private/var/tmp/bgmtl.trace", F_OK) == 0) {
+         char path[96];
+         snprintf(path, sizeof(path), "/private/var/tmp/bgmtl-trace-%d.txt", getpid());
+         tf = fopen(path, "a");
+      }
+   }
+   if (tf) {
+      va_start(ap, fmt);
+      vfprintf(tf, fmt, ap);
+      va_end(ap);
+      fflush(tf);
+   }
 }
 
-// BGMTL_TRACE=1: one line per command buffer, render pass, pipeline build and commit (what a client such as CoreAnimation sends)
+// BGMTL_TRACE=1 or /private/var/tmp/bgmtl.trace: one line per command buffer, render pass, pipeline build and commit
+// (what a client such as CoreAnimation sends)
 static int
 bg_trace(void)
 {
    static int t = -1;
-   if (t < 0) t = getenv("BGMTL_TRACE") != NULL;
+   if (t < 0) t = getenv("BGMTL_TRACE") != NULL || access("/private/var/tmp/bgmtl.trace", F_OK) == 0;
    return t;
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
