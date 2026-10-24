@@ -1186,6 +1186,9 @@ bg_air_slice(NSData *d)
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane
 {
+   BG_TRACE("texture %lux%lu fmt %lu type %lu usage %lu storage %lu %s\n", (unsigned long)d.width, (unsigned long)d.height,
+            (unsigned long)d.pixelFormat, (unsigned long)d.textureType, (unsigned long)d.usage, (unsigned long)d.storageMode,
+            surface ? "iosurface" : "own memory");
    self = [super init];
    if (!self) return nil;
    if (![device rwa] || !d) { [self release]; return nil; }
@@ -1244,6 +1247,12 @@ bg_air_slice(NSData *d)
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
           bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi
 {
+   BG_TRACE("replaceRegion %lu,%lu %lux%lu level %lu bpr %lu\n", (unsigned long)r.origin.x, (unsigned long)r.origin.y,
+            (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)level, (unsigned long)bpr);
+   if (bg_trace() && bytes && r.size.height > 1) {
+      const uint8_t *a = (const uint8_t *)bytes, *z = a + bpr * (r.size.height - 1);
+      BG_LOG("  first row px0 %u %u %u %u, last row px0 %u %u %u %u\n", a[0], a[1], a[2], a[3], z[0], z[1], z[2], z[3]);
+   }
    (void)bpi;
    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
    unsigned sz[3] = { (unsigned)r.size.width, (unsigned)r.size.height, (unsigned)r.size.depth };

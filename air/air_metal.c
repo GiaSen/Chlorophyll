@@ -5265,6 +5265,37 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, char *why, size_t why
  * might write and only its stores say what it does -- air_run makes the same walk for
  * the colour side and refuses to read back an attachment nothing stored to.
  */
+/* Removes every store to [[depth]] (and the variable) and says how many colour stores remain. */
+static unsigned
+strip_depth_stores(nir_shader *fs)
+{
+   unsigned colour = 0;
+   nir_foreach_function_impl(impl, fs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+            if (!d || d->deref_type != nir_deref_type_var || d->var->data.mode != nir_var_shader_out)
+               continue;
+            if (d->var->data.location == FRAG_RESULT_DEPTH)
+               nir_instr_remove(instr);
+            else if (d->var->data.location >= FRAG_RESULT_DATA0)
+               colour++;
+         }
+      }
+      nir_metadata_preserve(impl, nir_metadata_control_flow);
+   }
+   nir_foreach_shader_out_variable_safe(var, fs)
+      if (var->data.location == FRAG_RESULT_DEPTH)
+         exec_node_remove(&var->node);
+   NIR_PASS(_, fs, nir_opt_dce);
+   return colour;
+}
+
 static bool
 fragment_writes_depth(nir_shader *fs)
 {
@@ -6141,6 +6172,12 @@ rwa_render_create(struct rwa_device *device,
     * writes depth needs a depthAttachmentPixelFormat -- so refusing is both what the API
     * says and what keeps a GPU answering.
     */
+   /* Except QuartzCore's image shaders (TimgA2Xhf_Isrc, ...), which store a colour AND a depth and are drawn into passes
+    * with no depth attachment, where Apple's GPU discards the depth. With a colour store left the stage is an ordinary
+    * colour shader after the depth store is removed, which is what a pass with no depth buffer does with it anyway; a
+    * shader that would store nothing else (texturedFragment2DDepth) is still refused below. */
+   if (out.fragment_writes_depth && !shape->depth_format && strip_depth_stores(fs) != 0)
+      out.fragment_writes_depth = 0;
    if (out.fragment_writes_depth && !shape->depth_format) {
       say(why, why_size, "%s stores to [[depth]] and this pipeline has no depth attachment, "
                          "so there is nowhere for that store to go",
