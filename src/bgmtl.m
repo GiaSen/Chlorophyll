@@ -1171,6 +1171,26 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           * the poster editor) and counted towards the watchdog that switches Metal off. */
          if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
             BG_LOG("draw skipped: %s\n", why);
+         // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
+         // later draw of the pass touches it
+         if (bg_trace() && w->color_count && w->color[0] && access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0 &&
+             (strstr(rp->_names, "downsample") || strstr(rp->_names, "_Idst"))) {
+            static unsigned pseq;
+            BGMTLTexture *t = (BGMTLTexture *)w->color[0];
+            unsigned wd = MIN((unsigned)[t width], 256u), ht = MIN((unsigned)[t height], 256u);   // the top-left corner of big targets
+            if (pseq < 80 && [t width] >= 1000 && rwa_finish([dev rwa], why, sizeof(why)) == 0) {
+               uint8_t *buf = malloc((size_t)wd * ht * 4);
+               if (buf) {
+                  [t getBytes:buf bytesPerRow:wd * 4 fromRegion:MTLRegionMake2D(0, 0, wd, ht) mipmapLevel:0];
+                  char path[128];
+                  snprintf(path, sizeof(path), "/private/var/tmp/att/post-%04u-%s-%ux%u.raw", pseq++,
+                           strstr(rp->_names, "_Idst") ? "fetch" : "ds", wd, ht);
+                  FILE *f = fopen(path, "wb");
+                  if (f) { fwrite(buf, 1, (size_t)wd * ht * 4, f); fclose(f); BG_LOG("  after-draw dump %s\n", path); }
+                  free(buf);
+               }
+            }
+         }
       } else if (w->kind == BG_WORK_MIPMAPS) {
          if (rwa_texture_generate_mipmaps([(BGMTLTexture *)w->dst rwaTexture]) != 0)
             BG_LOG("blit: generateMipmapsForTexture: no mip chain made\n");
@@ -1279,6 +1299,38 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       for (id surf in written) {
          IOSurfaceLock((IOSurfaceRef)surf, 0, NULL);
          IOSurfaceUnlock((IOSurfaceRef)surf, 0, NULL);
+      }
+   }
+   // Chlorophyll debugging (/private/var/tmp/bgmtl.dumpatt with the trace): the textures that "downsample" draws sample, read
+   // sparsely (every Nth row and column, so the long side is ~256) into /private/var/tmp/att/src-SEQ-WxH-fmt.raw (BGRA).
+   if (bg_trace() && _status == 4 && access("/private/var/tmp/bgmtl.dumpatt", F_OK) == 0) {
+      static unsigned sseq;
+      NSMutableArray *srcs = [NSMutableArray array];
+      for (BGWork *w in _work) {
+         if (w->kind != BG_WORK_DRAW || !w->render || !strstr(((BGMTLRenderPipeline *)w->render)->_names, "downsample")) continue;
+         for (unsigned i = 0; i < w->texture_count; i++)
+            if (w->textures[i] && ![srcs containsObject:w->textures[i]]) [srcs addObject:w->textures[i]];
+      }
+      for (BGMTLTexture *t in srcs) {
+         unsigned wd = (unsigned)[t width], ht = (unsigned)[t height];
+         NSUInteger pf = [t pixelFormat];
+         if (sseq >= 60 || wd == 0 || ht == 0 || (pf != MTLPixelFormatBGRA8Unorm && pf != MTLPixelFormatBGRA8Unorm_sRGB && pf != MTLPixelFormatRGBA8Unorm)) {
+            BG_LOG("  source %p %ux%u fmt %lu not dumped\n", t, wd, ht, (unsigned long)pf);
+            continue;
+         }
+         unsigned step = (wd > ht ? wd : ht) / 256 + 1, ow = (wd + step - 1) / step, oh = (ht + step - 1) / step;
+         uint32_t *row = malloc((size_t)wd * 4), *out = malloc((size_t)ow * oh * 4);
+         if (row && out) {
+            for (unsigned y = 0; y < oh; y++) {
+               [t getBytes:row bytesPerRow:wd * 4 fromRegion:MTLRegionMake2D(0, y * step, wd, 1) mipmapLevel:0];
+               for (unsigned x = 0; x < ow; x++) out[y * ow + x] = row[x * step];
+            }
+            char path[128];
+            snprintf(path, sizeof(path), "/private/var/tmp/att/src-%04u-%ux%u-of-%ux%u.raw", sseq++, ow, oh, wd, ht);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(out, 4, (size_t)ow * oh, f); fclose(f); BG_LOG("  source %p %ux%u dumped %s\n", t, wd, ht, path); }
+         }
+         free(row); free(out);
       }
    }
    if (bg_trace() && _status == 4) {   // what each colour attachment holds now: five texels, centre and quarter points

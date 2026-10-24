@@ -7193,6 +7193,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    pipe->set_framebuffer_state(pipe, &fb);
 
+   /* Chlorophyll: Metal's framebuffer fetch is coherent -- a fetching draw sees what the draws before it in the pass wrote.
+    * In sysmem freedreno reads the attachment through the texture path, so without a barrier the fetch saw memory the
+    * colour cache had not written back yet (the pass's clear colour): Control Center's blur passes came out with one
+    * triangle of each quad white (CoreAnimation's Tc3sA2Xhf_Idst after the downsample draw), and which half depended on
+    * timing. FRAMEBUFFER: wait for idle, flush CCU colour/depth, flush and invalidate the texture cache. */
+   if (render->finfo.fbfetch_targets)
+      pipe->texture_barrier(pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
+
    /* The viewport, and now its z as well. Gallium's window depth is
     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
     * above) the depth range [znear, zfar] is scale = zfar - znear, translate = znear --

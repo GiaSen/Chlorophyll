@@ -1,0 +1,23 @@
+diff --git a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
+index bdf0502..8a108ce 100644
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
+@@ -113,6 +113,18 @@ fd6_texture_barrier(struct pipe_context *pctx, unsigned flags)
+       flushes |= FD6_WAIT_FOR_IDLE | FD6_WAIT_FOR_ME |
+             FD6_FLUSH_CCU_COLOR | FD6_FLUSH_CCU_DEPTH |
+             FD6_FLUSH_CACHE | FD6_INVALIDATE_CACHE;
++
++      /* Chlorophyll: with batch reordering, set_framebuffer_state() leaves no current batch, and add_flushes() then
++       * drops the barrier as if a batch switch were one. It is not: the next draw goes back into the cached batch
++       * for this framebuffer, behind the draws that wrote what it is about to read. Bind that batch now so the
++       * barrier lands between them (a framebuffer-fetch draw read half-written memory: one triangle of each of
++       * Control Center's blur quads came out stale).
++       */
++      struct fd_context *ctx = fd_context(pctx);
++      if (ctx->screen->reorder && !ctx->batch && !ctx->batch_nondraw) {
++         struct fd_batch *batch = fd_context_batch(ctx);
++         fd_batch_reference(&batch, NULL);
++      }
+    }
+ 
+    add_flushes(pctx, flushes);
