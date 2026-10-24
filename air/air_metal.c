@@ -865,6 +865,15 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    {  74, "MTLPixelFormatRGBA8Sint",       PIPE_FORMAT_R8G8B8A8_SINT },
    {  80, "MTLPixelFormatBGRA8Unorm",      PIPE_FORMAT_B8G8R8A8_UNORM },
    {  81, "MTLPixelFormatBGRA8Unorm_sRGB", PIPE_FORMAT_B8G8R8A8_SRGB },
+   /* Chlorophyll: Apple's extended-range (XR) formats, stood in for by a native format of the SAME size so layouts stay
+    * consistent (the XR encoding itself is not reproduced: SDR content comes out close, extended values do not). QuartzCore's
+    * render server builds its deep-colour pipelines in these whatever the device answers, and a refusal aborts the server
+    * ("Metal failed to build render pipeline", the first live backboardd runs). */
+   { 550, "MTLPixelFormatRGB10A8_2P_XR10 (as BGRA8)",  PIPE_FORMAT_B8G8R8A8_UNORM },
+   { 552, "MTLPixelFormatBGRA10_XR (as RGBA16Float)",   PIPE_FORMAT_R16G16B16A16_FLOAT },
+   { 553, "MTLPixelFormatBGRA10_XR_sRGB (as RGBA16Float)", PIPE_FORMAT_R16G16B16A16_FLOAT },
+   { 554, "MTLPixelFormatBGR10_XR (as BGRA8)",         PIPE_FORMAT_B8G8R8A8_UNORM },
+   { 555, "MTLPixelFormatBGR10_XR_sRGB (as BGRA8 sRGB)", PIPE_FORMAT_B8G8R8A8_SRGB },
    { 103, "MTLPixelFormatRG32Uint",        PIPE_FORMAT_R32G32_UINT },
    { 104, "MTLPixelFormatRG32Sint",        PIPE_FORMAT_R32G32_SINT },
    { 105, "MTLPixelFormatRG32Float",       PIPE_FORMAT_R32G32_FLOAT },

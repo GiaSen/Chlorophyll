@@ -239,6 +239,10 @@ bb_init(void)
    if (st != 1) { ilog("backboardd: GPU state %d (1 = ready): stock", st); return; }
    // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+   if (exists("/private/var/tmp/bgmtl-bb.full")) {     // experiment: full redraws (the first live run showed stale regions)
+      setenv("CA_DISABLE_DIRTY_REGIONS", "1", 1);
+      ilog("backboardd: CA_DISABLE_DIRTY_REGIONS=1");
+   }
    CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
    CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
