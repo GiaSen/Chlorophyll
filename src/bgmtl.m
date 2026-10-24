@@ -1716,6 +1716,13 @@ bg_air_slice(NSData *d)
          MTLClearColor c = [a clearColor];
          _clear_mask |= 1u << i;
          _clear_vals[i][0] = (float)c.red; _clear_vals[i][1] = (float)c.green; _clear_vals[i][2] = (float)c.blue; _clear_vals[i][3] = (float)c.alpha;
+      } else if ([a loadAction] == MTLLoadActionDontCare && ![(BGMTLTexture *)[a texture] iosurface]) {
+         // DontCare promises undefined contents, and CoreAnimation then blends into them: its rounded-corner masks are built in
+         // a DontCare attachment whose untouched texels are meant to be zero (Apple GPUs start tiles cleared). Here they kept
+         // whatever the memory held: dark wedges and specks at widget and dock corners. Private textures only (masks,
+         // intermediates); IOSurface framebuffers are fully redrawn and a full-screen clear would cost every frame.
+         _clear_mask |= 1u << i;
+         _clear_vals[i][0] = _clear_vals[i][1] = _clear_vals[i][2] = _clear_vals[i][3] = 0.0f;
       }
    }
    MTLRenderPassDepthAttachmentDescriptor *da = [d depthAttachment];
