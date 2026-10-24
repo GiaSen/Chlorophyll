@@ -306,6 +306,16 @@ bb_init(void)
    if (st != 1) { ilog("backboardd: GPU state %d (1 = ready): stock", st); return; }
    // A/B switch: freedreno without batch reordering (FD_MESA_DEBUG=inorder)
    if (exists("/private/var/tmp/bgmtl-bb.inorder")) { setenv("FD_MESA_DEBUG", "inorder", 1); ilog("backboardd: FD_MESA_DEBUG=inorder"); }
+   // A/B switch: any FD_MESA_DEBUG flags (e.g. "sysmem", "nobin", "nolrz"), one word per line or comma-separated
+   FILE *fd = fopen("/private/var/tmp/bgmtl-bb.fddebug", "r");
+   if (fd) {
+      char flags[128] = "";
+      if (fgets(flags, sizeof(flags), fd)) {
+         flags[strcspn(flags, "\r\n")] = 0;
+         if (flags[0]) { setenv("FD_MESA_DEBUG", flags, 1); ilog("backboardd: FD_MESA_DEBUG=%s", flags); }
+      }
+      fclose(fd);
+   }
    // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
    if (exists("/private/var/tmp/bgmtl-bb.sync")) {     // A/B: synchronous commits (the frame-order glitches after the async change)

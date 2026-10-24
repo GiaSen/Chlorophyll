@@ -585,6 +585,8 @@ int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence, char *why
 void rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence);
 int rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, const unsigned so[3],
                      struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3], const unsigned size[3]);
+/* Chlorophyll: generateMipmapsForTexture on the GPU, levels 1..last from level 0 (0 or -1). */
+int rwa_texture_generate_mipmaps(struct rwa_texture *texture);
 
 /*
  * ---------------------------------------------------------------------------------------

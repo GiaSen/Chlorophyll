@@ -135,7 +135,7 @@ __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; } 
 @class BGMTLComputePipeline;
 
 // ---- recorded work ---------------------------------------------------------------------------------------------------
-enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR };
+enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR, BG_WORK_MIPMAPS };
 #define BG_MAX_TEX 16
 @interface BGWork : NSObject {
  @public
@@ -1171,6 +1171,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
           * the poster editor) and counted towards the watchdog that switches Metal off. */
          if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
             BG_LOG("draw skipped: %s\n", why);
+      } else if (w->kind == BG_WORK_MIPMAPS) {
+         if (rwa_texture_generate_mipmaps([(BGMTLTexture *)w->dst rwaTexture]) != 0)
+            BG_LOG("blit: generateMipmapsForTexture: no mip chain made\n");
       } else if (w->kind == BG_WORK_TEXCOPY &&
                  rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
                                   (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },
@@ -1500,7 +1503,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 // shared memory: nothing to flush
 - (void)synchronizeResource:(id)r { (void)r; }
 - (void)synchronizeTexture:(id)t slice:(NSUInteger)s level:(NSUInteger)l { (void)t; (void)s; (void)l; }
-- (void)generateMipmapsForTexture:(id)t { BG_LOG("blit: generateMipmapsForTexture ignored\n"); (void)t; }
+- (void)generateMipmapsForTexture:(id)t
+{
+   BGWork *w = [[[BGWork alloc] init] autorelease];
+   w->kind = BG_WORK_MIPMAPS; w->dst = [t retain];
+   [_cb bgRecord:w];
+}
 - (void)optimizeContentsForGPUAccess:(id)t { (void)t; }
 - (void)optimizeContentsForCPUAccess:(id)t { (void)t; }
 - (void)endEncoding { [super endEncoding]; }

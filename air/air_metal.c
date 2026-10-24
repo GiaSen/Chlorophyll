@@ -59,6 +59,7 @@
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
+#include "util/u_gen_mipmap.h"
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
@@ -1613,6 +1614,20 @@ rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, cons
    struct pipe_context *pipe = src->device->pipe;
    pipe->resource_copy_region(pipe, dst->res, dlevel, dorg[0], dorg[1], dorg[2] + dslice, src->res, slevel, &box);
    return 0;
+}
+
+/* Chlorophyll: -[MTLBlitCommandEncoder generateMipmapsForTexture:], on the GPU and in order with the draws: each level a
+ * linear-filtered blit of the one above (util_gen_mipmap), every slice. CoreAnimation's blurs downsample through a mip chain
+ * and sample its lower levels; with the call ignored those levels kept whatever the allocation held (blocky, oversaturated
+ * material backgrounds in Control Center). -1: nothing to do (one level) or the driver could not blit this format. */
+int
+rwa_texture_generate_mipmaps(struct rwa_texture *texture)
+{
+   if (!texture || !texture->res || texture->res->last_level == 0)
+      return -1;
+   struct pipe_resource *res = texture->res;
+   return util_gen_mipmap(texture->device->pipe, res, res->format, 0, res->last_level, 0, util_max_layer(res, 0),
+                          PIPE_TEX_FILTER_LINEAR) ? 0 : -1;
 }
 
 void
