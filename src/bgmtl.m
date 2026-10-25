@@ -2140,6 +2140,18 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 @end
 
 @implementation BGMTLRenderEncoder
+// An attachment at a mip level or slice other than the first is rendered into a one-level, one-slice view of it. CoreAnimation 26
+// renders its blur downsamples into levels 1, 2, ... of one texture (the backdrop Liquid Glass refracts): with the level ignored
+// they landed in the corner of level 0, cleared it on the way (load Clear), and the glass shaded over an empty backdrop (grey).
+static id
+bg_attachment_view(id tex, NSUInteger level, NSUInteger slice)
+{
+   if (!tex || (level == 0 && slice == 0)) return tex;
+   NSUInteger type = [(id<MTLTexture>)tex sampleCount] > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
+   id v = [(BGMTLTexture *)tex newTextureViewWithPixelFormat:[(id<MTLTexture>)tex pixelFormat] textureType:type
+                                                       levels:NSMakeRange(level, 1) slices:NSMakeRange(slice, 1)];
+   return v ? [v autorelease] : tex;
+}
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d
 {
    self = [super initWithCommandBuffer:cb];
@@ -2149,7 +2161,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    for (unsigned i = 0; i < 8; i++) {
       MTLRenderPassColorAttachmentDescriptor *a = [[d colorAttachments] objectAtIndexedSubscript:i];
       if (!a || ![a texture]) continue;
-      _color[i] = [[a texture] retain];
+      _color[i] = [bg_attachment_view([a texture], [a level], [a slice] + [a depthPlane]) retain];
       _ncolor = i + 1;
       if (([a storeAction] == MTLStoreActionMultisampleResolve || [a storeAction] == MTLStoreActionStoreAndMultisampleResolve) &&
           [a resolveTexture]) {
@@ -2172,12 +2184,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    }
    MTLRenderPassDepthAttachmentDescriptor *da = [d depthAttachment];
    if (da && [da texture]) {
-      _depth = [[da texture] retain];
+      _depth = [bg_attachment_view([da texture], [da level], [da slice] + [da depthPlane]) retain];
       if ([da loadAction] == MTLLoadActionClear) { _clear_depth_v = (float)[da clearDepth]; _clear_depth_pending = YES; }
    }
    MTLRenderPassStencilAttachmentDescriptor *sa = [d stencilAttachment];
    if (sa && [sa texture]) {
-      if (!_depth) _depth = [[sa texture] retain];
+      if (!_depth) _depth = [bg_attachment_view([sa texture], [sa level], [sa slice] + [sa depthPlane]) retain];
       if ([sa loadAction] == MTLLoadActionClear) { _clear_stencil_v = (unsigned)[sa clearStencil]; _clear_stencil_pending = YES; }
    }
    // The pass's clears happen HERE, at the start of the pass, as one piece of work of their own -- not inside the first draw. A pass that

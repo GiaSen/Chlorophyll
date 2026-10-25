@@ -550,6 +550,31 @@ main(int argc, char **argv)
       CHECK(ok && po[0] == 0 && po[1] == 1, "bg_is_null: %u %u want 0 1%s%s", po ? po[0] : 9, po ? po[1] : 9, ok ? "" : ": ", ok ? "" : why2);
       printf("  bg_is_null: bound %u unbound %u (want 0 1)%s%s\n", po ? po[0] : 9, po ? po[1] : 9, ok ? "" : ": ", ok ? "" : why2);
    }
+   { // render into mip level 1 through a view (CoreAnimation's blur pyramid): level 1 gets the colour, level 0 stays as it was
+      char why2[512] = { 0 };
+      struct rwa_texture_shape sh = { .pixel_format = 80, .type = 2, .width = 32, .height = 16, .depth = 1, .array_length = 1,
+                                      .mip_levels = 3, .sample_count = 1, .usage = 5 };
+      struct rwa_texture *t = rwa_texture_create(dev, &sh, why2, sizeof(why2));
+      static uint8_t buf0[32 * 16 * 4];
+      memset(buf0, 0x11, sizeof(buf0));
+      unsigned o[3] = { 0, 0, 0 }, s0[3] = { 32, 16, 1 }, s1[3] = { 16, 8, 1 };
+      bool ok = t && rwa_texture_write(t, 0, 0, o, s0, buf0, 0, why2, sizeof(why2)) == 0 &&
+                rwa_texture_write(t, 1, 0, o, s1, buf0, 0, why2, sizeof(why2)) == 0;
+      struct rwa_texture *v = ok ? rwa_texture_view(t, 80, 2, 1, 1, 0, 1, NULL, why2, sizeof(why2)) : NULL;
+      ok = v != NULL;
+      if (ok) {
+         struct rwa_texture *col[1] = { v };
+         struct rwa_clear cl = { .color = col, .color_count = 1, .color_mask = 1, .color_value = { { 1.0f, 0.0f, 0.0f, 1.0f } } };
+         ok = rwa_render_clear(dev, &cl, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
+      }
+      static uint8_t l0[32 * 16 * 4], l1[16 * 8 * 4];
+      ok = ok && rwa_texture_read(t, 0, 0, o, s0, l0, 0, why2, sizeof(why2)) == 0 && rwa_texture_read(t, 1, 0, o, s1, l1, 0, why2, sizeof(why2)) == 0;
+      unsigned bad1 = 0, bad0 = 0;
+      for (unsigned i = 0; ok && i < 16 * 8; i++) if (l1[4*i+2] != 255 || l1[4*i] != 0 || l1[4*i+3] != 255) bad1++;   /* BGRA: red */
+      for (unsigned i = 0; ok && i < 32 * 16 * 4; i++) if (l0[i] != 0x11) bad0++;
+      CHECK(ok && !bad1 && !bad0, "render into level 1: %u wrong in level 1, %u changed in level 0%s%s", bad1, bad0, ok ? "" : ": ", ok ? "" : why2);
+      printf("  render into level 1 via a view: %u wrong in level 1, %u changed in level 0%s%s\n", bad1, bad0, ok ? "" : ": ", ok ? "" : why2);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;
