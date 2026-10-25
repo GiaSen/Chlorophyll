@@ -9,6 +9,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,14 @@
 extern id bgmtl_create_device(void);
 #define W 256
 #define H 256
+
+static void
+dump_layers(CALayer *l, int depth)
+{
+   printf("%*s%s %.0fx%.0f filters=%lu%s\n", depth * 2, "", class_getName([l class]), l.bounds.size.width, l.bounds.size.height,
+          (unsigned long)l.filters.count, l.hidden ? " hidden" : "");
+   for (CALayer *c in l.sublayers) dump_layers(c, depth + 1);
+}
 
 static CALayer *
 make_scene(int n)
@@ -126,6 +135,27 @@ make_scene(int n)
       }
       break;
    }
+   case 7: {   // iOS 26 Liquid Glass: UIKit's own UIGlassEffect (CASDFLayer + glass displacement/highlight) over the stripes
+      for (int i = 0; i < 8; i++) {
+         CALayer *l = [CALayer layer];
+         l.frame = CGRectMake(i * 32, 0, 16, H);
+         l.backgroundColor = CGColorCreateGenericRGB(i & 1 ? 1 : 0.1, i & 2 ? 0.8 : 0.2, i & 4 ? 0.9 : 0.1, 1);
+         [root addSublayer:l];
+      }
+      if (!dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_NOW)) break;
+      Class ge = NSClassFromString(@"UIGlassEffect"), ve = NSClassFromString(@"UIVisualEffectView");
+      id effect = ge ? [ge performSelector:NSSelectorFromString(@"effectWithStyle:") withObject:nil] : nil;   // style 0: regular
+      if (!effect || !ve) { printf("scene 7: no UIGlassEffect\n"); break; }
+      id v = [[ve alloc] initWithEffect:effect];
+      CGRect fr = CGRectMake(32, 64, 192, 128);
+      ((void (*)(id, SEL, CGRect))objc_msgSend)(v, NSSelectorFromString(@"setFrame:"), fr);
+      [v layoutIfNeeded];
+      CALayer *gl = [v layer];
+      gl.cornerRadius = 40;
+      [root addSublayer:gl];
+      dump_layers(gl, 1);
+      break;
+   }
    }
    return root;
 }
@@ -184,7 +214,7 @@ main(int argc, char **argv)
       printf("default device: %s\n", d ? [[d name] UTF8String] : "nil");
       if (!d) return 2;
       int bad = 0, done = 0;
-      for (int n = 0; n < 7; n++) {
+      for (int n = 0; n < 8; n++) {
          if (only >= 0 && n != only) continue;
          CALayer *scene = make_scene(n);
          // the reference: CoreAnimation's CPU path into a bitmap
