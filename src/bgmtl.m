@@ -233,13 +233,52 @@ bg_proto_signature(SEL sel)
    return sig;
 }
 
+// Chlorophyll: a forwarded selector's signature, worked out once per selector. bg_proto_signature walks every protocol in
+// the process (objc_copyProtocolList), and CoreAnimation sends a few unimplemented selectors every frame
+// (setResponsibleProcess: on each command buffer): with that walk per call, forwarding was 57 % of backboardd's CPU
+// while swiping.
+static NSMethodSignature *
+bg_cached_signature(SEL sel, NSMethodSignature *(^make)(void))
+{
+   static CFMutableDictionaryRef cache;   // SEL -> NSMethodSignature (retained)
+   static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+   os_unfair_lock_lock(&lk);
+   if (!cache) cache = CFDictionaryCreateMutable(NULL, 0, NULL, &kCFTypeDictionaryValueCallBacks);
+   NSMethodSignature *sig = (NSMethodSignature *)CFDictionaryGetValue(cache, sel);
+   os_unfair_lock_unlock(&lk);
+   if (sig) return sig;
+   sig = make();
+   if (!sig) return nil;
+   os_unfair_lock_lock(&lk);
+   CFDictionarySetValue(cache, sel, sig);
+   os_unfair_lock_unlock(&lk);
+   return sig;
+}
+
+// The answer to a forwarded selector whose result comes back in x0 (nothing, an integer, a BOOL, an object or a pointer):
+// zero. Installed on the class after the first forwarded call, so later calls are ordinary method calls and skip the
+// NSInvocation altogether; selectors returning floats or structs keep going through forwardInvocation:.
+static void *bg_zero_imp(id self, SEL _cmd) { (void)self; (void)_cmd; return NULL; }
+
+static void
+bg_install_zero(Class c, SEL sel, NSMethodSignature *sig)
+{
+   const char *r = [sig methodReturnType];
+   while (*r && strchr("rnNoORV", *r)) r++;           // type qualifiers (const, in, out, oneway ...)
+   if (!*r || strchr("vcCsSiIlLqQB@#:*^", *r) == NULL) return;
+   char types[8] = "^v@:";                            // a pointer result
+   if (*r != '^' && *r != '*') snprintf(types, sizeof(types), "%c@:", *r);
+   class_addMethod(c, sel, (IMP)bg_zero_imp, types);
+}
+
 static NSMethodSignature *
 bg_fwd_sig(id self, SEL _cmd, SEL sel)
 {
    (void)_cmd;
    Method m = class_getInstanceMethod(object_getClass(self), sel);     // implemented somewhere up the chain
    if (m) return [NSMethodSignature signatureWithObjCTypes:method_getTypeEncoding(m)];
-   return bg_proto_signature(sel);   // the base classes' own -methodSignatureForSelector: is not asked: it may throw
+   // the base classes' own -methodSignatureForSelector: is not asked: it may throw
+   return bg_cached_signature(sel, ^NSMethodSignature *(void) { return bg_proto_signature(sel); });
 }
 
 static void
@@ -257,6 +296,7 @@ bg_fwd_inv(id self, SEL _cmd, NSInvocation *inv)
    if (fresh) {
       BG_LOG("%s: unimplemented, answered with zero\n", key.UTF8String);
       bgmtl_note_unimplemented(sel_getName([inv selector]));
+      bg_install_zero(object_getClass(self), [inv selector], [inv methodSignature]);
    }
    NSUInteger len = [[inv methodSignature] methodReturnLength];
    if (len) {
@@ -587,16 +627,18 @@ ensure_protocol(Class cls, const char *proto)
 {
    NSMethodSignature *sig = [super methodSignatureForSelector:sel];
    if (sig) return sig;
-   const char *names[] = { "MTLDevice", "MTLDeviceSPI" };
-   for (unsigned i = 0; i < 2; i++) {
-      Protocol *pr = objc_getProtocol(names[i]);
-      if (!pr) continue;
-      for (int req = 0; req < 2; req++) {
-         struct objc_method_description d = protocol_getMethodDescription(pr, sel, req, YES);
-         if (d.name && d.types) return [NSMethodSignature signatureWithObjCTypes:d.types];
+   return bg_cached_signature(sel, ^NSMethodSignature *(void) {
+      const char *names[] = { "MTLDevice", "MTLDeviceSPI" };
+      for (unsigned i = 0; i < 2; i++) {
+         Protocol *pr = objc_getProtocol(names[i]);
+         if (!pr) continue;
+         for (int req = 0; req < 2; req++) {
+            struct objc_method_description d = protocol_getMethodDescription(pr, sel, req, YES);
+            if (d.name && d.types) return [NSMethodSignature signatureWithObjCTypes:d.types];
+         }
       }
-   }
-   return nil;
+      return (NSMethodSignature *)nil;
+   });
 }
 
 - (void)forwardInvocation:(NSInvocation *)inv
@@ -604,6 +646,7 @@ ensure_protocol(Class cls, const char *proto)
    SEL sel = [inv selector];
    BG_LOG("device: unimplemented %s answered with zero\n", sel_getName(sel));
    bgmtl_note_unimplemented(sel_getName(sel));
+   bg_install_zero(object_getClass(self), sel, [inv methodSignature]);
    NSUInteger len = [[inv methodSignature] methodReturnLength];
    if (len) {
       void *z = calloc(1, len);
