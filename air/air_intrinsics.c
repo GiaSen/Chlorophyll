@@ -2146,6 +2146,24 @@ texture_op_on(struct air_ctx *c, const struct air_inst *in, const struct air_nam
                              "do not have one shape", n->part[0]);
       return true;
    }
+   if (which && which->kind == AIR_VAL_PTR && which->ptr.class == AIR_PTR_NONE) {
+      /* Chlorophyll: a NULL texture (air.get_null_texture: Mercury's space::rasterizeMeshVertex samples one in a light
+       * it has no gobo for) reads as zero, a query answers zero and a write goes nowhere */
+      const struct air_type *rt = in->base.type;
+      *out = NULL;
+      if (!rt || rt->kind == AIR_TYPE_VOID)
+         return true;
+      const struct air_type *vt = rt->kind == AIR_TYPE_STRUCT ? rt->members[0] : rt;
+      nir_def *zero = nir_imm_zero(&c->b, air_nir_components(vt), air_nir_bit_size(c, vt));
+      _mesa_hash_table_remove_key(c->values, &in->base);
+      if (rt->kind == AIR_TYPE_STRUCT)
+         set_tex_result(c, in, zero);
+      else
+         air_set(c, &in->base, air_val_ssa(c, zero));
+      struct hash_entry *e = _mesa_hash_table_search(c->values, &in->base);
+      *out = e ? e->data : NULL;
+      return true;
+   }
    struct air_val *chosen = air_get(c, in->operands[1]);
    air_set(c, in->operands[1], which);
    _mesa_hash_table_remove_key(c->values, &in->base);
@@ -2162,9 +2180,10 @@ static bool
 texture_op_chosen(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
    struct air_val *v = in->num_operands > 1 ? air_get(c, in->operands[1]) : NULL;
-   if (!v || v->kind != AIR_VAL_PTR_SELECT)
+   bool null_tex = v && v->kind == AIR_VAL_PTR && v->ptr.class == AIR_PTR_NONE;
+   if (!v || (v->kind != AIR_VAL_PTR_SELECT && !null_tex))
       return texture_op(c, in, n);
-   if (strstr(n->part[0], "write") || strstr(n->part[0], "atomic"))
+   if (!null_tex && (strstr(n->part[0], "write") || strstr(n->part[0], "atomic")))
       return air_error(c, "intrinsic: air.%s to a texture chosen at run time", n->part[0]);
    struct air_val *res;
    if (!texture_op_on(c, in, n, v, &res))
@@ -2183,8 +2202,8 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (strncmp(name, "air.", 4))
       return air_call_in_module(c, in, name);
 
-   /* Bergamota: a null texture is a pointer that names nothing (AIR_PTR_NONE); a shader that selects it only
-    * ever tests it or has the branch removed by function-constant folding. Sampling it is refused where it happens. */
+   /* Bergamota: a null texture is a pointer that names nothing (AIR_PTR_NONE); a shader tests it, has the branch removed by
+    * function-constant folding, or reads it, which answers zero (Chlorophyll: texture_op_on). */
    if (!strncmp(name, "air.get_null_texture", 20)) {
       struct air_ptr np = { .class = AIR_PTR_NONE };
       air_set(c, &in->base, air_val_ptr(c, np));
