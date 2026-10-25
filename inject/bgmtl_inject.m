@@ -43,6 +43,10 @@ extern int bgmtl_gpu_state(unsigned *abi_minor);
 #define F_OFF "/private/var/tmp/bgmtl.off"
 #define F_ARM "/private/var/tmp/bgmtl.arm"
 #define F_STATE "/private/var/tmp/bgmtl.state"
+// The dead-man's state and its trip file are per extension (F_STATE / F_OFF + "." + bundle id): with two poster extensions on the
+// allow-list (Mercury, Photos) starting together at boot, one shared state file counted each one's launch as the other's unclean
+// one and wrote the global kill switch (iOS 26, boot 33b). F_OFF itself stays the manual switch for all of them.
+static char g_state[192] = F_STATE, g_off[192] = F_OFF;
 #define F_LOG "/private/var/tmp/bgmtl.log"
 
 #define F_BB_OFF "/private/var/tmp/bgmtl-bb.off"
@@ -90,7 +94,7 @@ boot_id(void)
 static void
 write_state(int unclean, int alive)
 {
-   FILE *f = fopen(F_STATE, "w");
+   FILE *f = fopen(g_state, "w");
    if (!f) return;
    fprintf(f, "unclean=%d alive=%d boot=%s\n", unclean, alive, boot_id());
    fclose(f);
@@ -108,7 +112,7 @@ bb_state(int alive)
 static void
 trip(const char *why)
 {
-   const char *off = g_bb ? F_BB_OFF : F_OFF;
+   const char *off = g_bb ? F_BB_OFF : g_off;
    ilog("DEAD-MAN%s: %s: writing %s and exiting", g_bb ? " (backboardd)" : "", why, off);
    FILE *f = fopen(off, "w");
    if (f) { fprintf(f, "%s\n", why); fclose(f); }
@@ -368,12 +372,14 @@ bgmtl_inject_init(void)
       for (const char *const *a = kAllow; *a; a++)
          if (bid && !strcmp([bid UTF8String], *a)) allowed = 1;
       if (!allowed) return;                                   // gate 1: silent in every other process
-      if (exists(F_OFF)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }
+      snprintf(g_state, sizeof(g_state), "%s.%s", F_STATE, [bid UTF8String]);
+      snprintf(g_off, sizeof(g_off), "%s.%s", F_OFF, [bid UTF8String]);
+      if (exists(F_OFF) || exists(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }
       if (!exists(F_ARM)) { ilog("%s: not armed, stock", [bid UTF8String]); return; }
       // gate 3: the dead-man
       int unclean = 0, alive = 1;
       char boot[64] = "";
-      FILE *f = fopen(F_STATE, "r");
+      FILE *f = fopen(g_state, "r");
       if (f) { if (fscanf(f, "unclean=%d alive=%d boot=%63s", &unclean, &alive, boot) < 2) { unclean = 0; alive = 1; } fclose(f); }
       if (!alive && strcmp(boot, boot_id()) != 0) { ilog("last launch was in an earlier boot: not counted as unclean"); alive = 1; }
       if (!alive) unclean++;
