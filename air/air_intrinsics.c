@@ -1014,6 +1014,29 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       return true;
    }
 
+   if (!strcmp(op, "simd_shuffle_and_fill_down")) {
+      /* Bergamota (iOS 26 QuartzCore, tile_simd_blur_*: the backdrop blur under Liquid Glass).
+       * simd_shuffle_and_fill_down(data, filling, delta, modulo): the lanes are taken in windows of `modulo`; lane i reads
+       * `data` from lane i + delta while that stays inside its window, and past the window's end `filling` from the lane
+       * that many places into the NEXT window's start (i + delta - modulo). Both shuffles run on every lane, as a shuffle
+       * must, and the window decides which value is kept. Over this implementation's 64- or 128-lane groups a window is
+       * still `modulo` lanes, which is what the kernel asks for. */
+      nir_def *fill = air_get_ssa(c, in->operands[2]);
+      nir_def *delta = in->num_operands > 3 ? air_get_ssa(c, in->operands[3]) : NULL;
+      nir_def *mod = in->num_operands > 4 ? air_get_ssa(c, in->operands[4]) : NULL;
+      if (!fill || !delta)
+         return false;
+      nir_def *lane = nir_load_subgroup_invocation(&c->b);
+      nir_def *m = mod ? nir_u2u32(&c->b, mod) : nir_load_subgroup_size(&c->b);
+      nir_def *d = nir_u2u32(&c->b, delta);
+      nir_def *pos = nir_umod(&c->b, lane, m);
+      nir_def *inside = nir_ult(&c->b, nir_iadd(&c->b, pos, d), m);
+      nir_def *from_data = nir_shuffle(&c->b, a0, nir_iadd(&c->b, lane, d));
+      nir_def *from_fill = nir_shuffle(&c->b, fill, nir_isub(&c->b, nir_iadd(&c->b, lane, d), m));
+      air_set(c, &in->base, air_val_ssa(c, nir_bcsel(&c->b, inside, from_data, from_fill)));
+      return true;
+   }
+
    if (!strcmp(op, "quad_shuffle_xor")) {
       /* quad_shuffle_xor(data, mask) hands each lane the value of the lane
        * whose number is its own exclusive-ored with the mask. Within a quad
