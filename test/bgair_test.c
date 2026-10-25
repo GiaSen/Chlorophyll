@@ -296,6 +296,38 @@ main(int argc, char **argv)
       CHECK(ok && bad == 0, "bg_tex_choice %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
       printf("  bg_tex_choice: %u wrong\n", bad);
    }
+   { // bg_tex_choice3: the nested form, a select between b and c merged with a by a phi (which: 0 a, 1 b, 2 c)
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_tex_choice3", &info);
+      struct rwa_texture_shape shape = { .pixel_format = 125, .type = 2, .width = 16, .height = 1, .depth = 1, .array_length = 1,
+                                         .mip_levels = 1, .sample_count = 1, .usage = 1 };
+      char why2[512] = { 0 };
+      struct rwa_texture *tx[3] = { NULL, NULL, NULL };
+      float d[3][16 * 4];
+      unsigned origin[3] = { 0, 0, 0 }, size[3] = { 16, 1, 1 };
+      bool ok = c != NULL;
+      for (unsigned t = 0; ok && t < 3; t++) {
+         for (unsigned i = 0; i < 16 * 4; i++) d[t][i] = 1000.0f * t + i;
+         ok = (tx[t] = rwa_texture_create(dev, &shape, why2, sizeof(why2))) &&
+              rwa_texture_write(tx[t], 0, 0, origin, size, d[t], 0, why2, sizeof(why2)) == 0;
+      }
+      struct rwa_buffer *k = ok ? buf(16) : NULL, *o = k ? buf(32 * 16) : NULL;
+      ok = ok && o;
+      unsigned bad = 0;
+      for (unsigned which = 0; ok && which < 3; which++) {
+         *(uint32_t *)rwa_buffer_map(k) = which;
+         memset(rwa_buffer_map(o), 0, 32 * 16);
+         struct rwa_buffer *bufs[2] = { k, o };
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = 2, .textures = tx, .texture_count = 3 };
+         unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 16, 1, 1 };
+         ok = rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
+         const float *po = rwa_buffer_map(o);
+         for (unsigned i = 0; ok && i < 16 * 4; i++)
+            if (po[i] != d[which][i]) { if (bad++ < 3) printf("    which=%u out[%u]=%g want %g\n", which, i, po[i], d[which][i]); }
+      }
+      CHECK(ok && bad == 0, "bg_tex_choice3 %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
+      printf("  bg_tex_choice3: %u wrong\n", bad);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;

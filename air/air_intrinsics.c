@@ -2123,34 +2123,54 @@ select_vals(struct air_ctx *c, nir_def *cond, struct air_val *a, struct air_val 
  * implicit derivatives. A write is refused: it would need an if, and this CFG is unstructured
  * (nir_goto) until nir_lower_goto_ifs.
  */
+/* the operation on `which` (a texture, or a choice of them, which nests: a select of selects
+ * merged by a phi), answered in *out (NULL for an operation with no answer)
+ */
+static bool
+texture_op_on(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
+              struct air_val *which, struct air_val **out)
+{
+   if (which && which->kind == AIR_VAL_PTR_SELECT) {
+      if (which->num_elems != 2)
+         return air_error(c, "intrinsic: air.%s on a texture chosen between %u", n->part[0],
+                          which->num_elems);
+      struct air_val *res[2];
+      for (unsigned s = 0; s < 2; s++)
+         if (!texture_op_on(c, in, n, which->elems[s], &res[s]))
+            return false;
+      *out = NULL;
+      if (!res[0] && !res[1])
+         return true;
+      if (!(*out = select_vals(c, which->def, res[0], res[1])))
+         return air_error(c, "intrinsic: air.%s on a texture chosen at run time, whose answers "
+                             "do not have one shape", n->part[0]);
+      return true;
+   }
+   struct air_val *chosen = air_get(c, in->operands[1]);
+   air_set(c, in->operands[1], which);
+   _mesa_hash_table_remove_key(c->values, &in->base);
+   bool ok = texture_op(c, in, n);
+   air_set(c, in->operands[1], chosen);
+   if (!ok)
+      return false;
+   struct hash_entry *e = _mesa_hash_table_search(c->values, &in->base);
+   *out = e ? e->data : NULL;
+   return true;
+}
+
 static bool
 texture_op_chosen(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
    struct air_val *v = in->num_operands > 1 ? air_get(c, in->operands[1]) : NULL;
    if (!v || v->kind != AIR_VAL_PTR_SELECT)
       return texture_op(c, in, n);
-   if (v->num_elems != 2 || !v->elems[0] || !v->elems[1] ||
-       v->elems[0]->kind != AIR_VAL_PTR || v->elems[1]->kind != AIR_VAL_PTR)
-      return air_error(c, "intrinsic: air.%s on a texture chosen between more than two", n->part[0]);
    if (strstr(n->part[0], "write") || strstr(n->part[0], "atomic"))
       return air_error(c, "intrinsic: air.%s to a texture chosen at run time", n->part[0]);
-   struct air_val *res[2] = { NULL, NULL };
-   for (unsigned s = 0; s < 2; s++) {
-      air_set(c, in->operands[1], v->elems[s]);
-      bool ok = texture_op(c, in, n);
-      air_set(c, in->operands[1], v);
-      if (!ok)
-         return false;
-      struct hash_entry *e = _mesa_hash_table_search(c->values, &in->base);
-      res[s] = e ? e->data : NULL;
-   }
-   if (!res[0] && !res[1])
-      return true;
-   struct air_val *sel = select_vals(c, v->def, res[0], res[1]);
-   if (!sel)
-      return air_error(c, "intrinsic: air.%s on a texture chosen at run time, whose two answers "
-                          "do not have one shape", n->part[0]);
-   air_set(c, &in->base, sel);
+   struct air_val *res;
+   if (!texture_op_on(c, in, n, v, &res))
+      return false;
+   if (res)
+      air_set(c, &in->base, res);
    return true;
 }
 

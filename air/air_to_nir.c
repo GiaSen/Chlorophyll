@@ -120,10 +120,35 @@ same_ptr(const struct air_ptr *a, const struct air_ptr *b)
  * time (resolve_pointer_phi), the operation on it being made on both (texture_op_chosen).
  */
 static bool
-is_texture_choice(const struct air_ptr *a, const struct air_ptr *b)
+is_texture_val(const struct air_val *v, bool is_image)
 {
-   return a->class == AIR_PTR_TEXTURE && b->class == AIR_PTR_TEXTURE &&
-          a->is_image == b->is_image && !a->offset && !b->offset;
+   if (v && v->kind == AIR_VAL_PTR)
+      return v->ptr.class == AIR_PTR_TEXTURE && v->ptr.is_image == is_image && !v->ptr.offset;
+   return v && v->kind == AIR_VAL_PTR_SELECT && v->num_elems == 2 &&
+          is_texture_val(v->elems[0], is_image) && is_texture_val(v->elems[1], is_image);
+}
+
+/* the image-ness of a texture value's first leaf, which is_texture_val then asks of all */
+static bool
+texture_val_is_image(const struct air_val *v)
+{
+   while (v && v->kind == AIR_VAL_PTR_SELECT && v->num_elems)
+      v = v->elems[0];
+   return v && v->kind == AIR_VAL_PTR && v->ptr.is_image;
+}
+
+static bool
+is_texture_choice(const struct air_val *a, const struct air_val *b)
+{
+   bool img = texture_val_is_image(a);
+   return is_texture_val(a, img) && is_texture_val(b, img);
+}
+
+/* one value, for a phi: the same resolution, or the very same chosen pointer */
+static bool
+same_val(const struct air_val *a, const struct air_val *b)
+{
+   return a == b || (a->kind == AIR_VAL_PTR && b->kind == AIR_VAL_PTR && same_ptr(&a->ptr, &b->ptr));
 }
 
 /* ... and the register that says which one came in, true for `first` */
@@ -4366,16 +4391,17 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
                              "a loop edge, so which resource it is depends on the "
                              "iteration");
       struct air_val *v = e->data;
-      if (!v || v->kind != AIR_VAL_PTR)
+      /* Chlorophyll: a texture chosen at run time is an operand too (its choice nests) */
+      if (!v || (v->kind != AIR_VAL_PTR && !is_texture_val(v, texture_val_is_image(v))))
          return air_error(c, "instruction: a phi of pointers one of whose operands is "
                              "%s", v && v->kind == AIR_VAL_PTR_SELECT
                                       ? "itself a pointer chosen at run time"
                                       : "not a resolved pointer");
       if (!first)
          first = v;
-      else if (same_ptr(&first->ptr, &v->ptr) || (second && same_ptr(&second->ptr, &v->ptr)))
+      else if (same_val(first, v) || (second && same_val(second, v)))
          continue;
-      else if (!second && is_texture_choice(&first->ptr, &v->ptr))
+      else if (!second && is_texture_choice(first, v))
          second = v;
       else
          return air_error(c, "instruction: a phi between pointers that name different "
@@ -4634,10 +4660,10 @@ translate_body(struct air_ctx *c)
                if (fold[in->targets[k]->index] >= 0 && (unsigned)fold[in->targets[k]->index] != bi)
                   continue;
                struct air_val *av = air_get(c, in->operands[k]);
-               if (!av || av->kind != AIR_VAL_PTR)
+               if (!av || !val_is_pointerish(av))
                   return air_error(c, "instruction: a phi of two textures with an operand that is not one");
                c->b.cursor = *(nir_cursor *)ce->data;
-               nir_store_reg(&c->b, nir_imm_bool(&c->b, same_ptr(&tp->first->ptr, &av->ptr)), tp->reg);
+               nir_store_reg(&c->b, nir_imm_bool(&c->b, same_val(tp->first, av)), tp->reg);
                *(nir_cursor *)ce->data = c->b.cursor;
             }
             continue;

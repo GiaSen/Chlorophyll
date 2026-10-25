@@ -80,3 +80,16 @@ kernel void bg_tex_choice(texture2d<float, access::read> a [[texture(0)]], textu
    }
    out[gid] = t.read(uint2(gid, 0));
 }
+
+// the nested form (Mercury's other variant): a select between b and c, merged with a by a phi; which picks a, b or c
+kernel void bg_tex_choice3(texture2d<float, access::read> a [[texture(0)]], texture2d<float, access::read> b [[texture(1)]],
+                           texture2d<float, access::read> c [[texture(2)]], constant uint &which [[buffer(0)]],
+                           device float4 *out [[buffer(1)]], uint gid [[thread_position_in_grid]])
+{
+   texture2d<float, access::read> t = which == 2 ? c : b;
+   if (which == 0) {
+      t = a;
+      out[16 + gid] = float4(1.0);
+   }
+   out[gid] = t.read(uint2(gid, 0));
+}
