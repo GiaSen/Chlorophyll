@@ -356,10 +356,31 @@ bb_init(void)
    pthread_detach(th);
 }
 
+// Environment for backboardd's own frameworks (QuartzCore's CA_* switches: CA_DISABLE_DISPLAY_EDR_SCALING, CA_COLOR_EDR_PIXELS, ...):
+// /private/var/tmp/bgmtl-bb.env, one KEY=VALUE per line ('#' starts a comment), set here before main starts the render server.
+// launchd's plist cannot be edited on the sealed root and dyld ignores the environment of a platform binary, so this is the way in.
+static void
+bb_env(void)
+{
+   FILE *f = fopen("/private/var/tmp/bgmtl-bb.env", "r");
+   if (!f) return;
+   char line[512];
+   while (fgets(line, sizeof(line), f)) {
+      line[strcspn(line, "\r\n")] = 0;
+      char *eq = strchr(line, '=');
+      if (line[0] == '#' || !eq || eq == line) continue;
+      *eq = 0;
+      setenv(line, eq + 1, 1);
+      ilog("backboardd: %s=%s (bgmtl-bb.env)", line, eq + 1);
+   }
+   fclose(f);
+}
+
 __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
    @autoreleasepool {
+      if (!strcmp(getprogname(), "backboardd")) bb_env();
       // bgl-launch chose Metal for this launch; on iOS 26 there is no bgl-launch (and dyld ignores DYLD_* for backboardd), so the
       // inject is weakly linked into a re-signed backboardd and /private/var/tmp/bgmtl-bb.direct stands in for BGMTL_BB=1
       // (bgmtl-bb.arm, bgmtl-bb.off, the GPU state and the watchdog still apply in bb_init)
