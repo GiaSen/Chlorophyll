@@ -328,6 +328,33 @@ main(int argc, char **argv)
       CHECK(ok && bad == 0, "bg_tex_choice3 %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
       printf("  bg_tex_choice3: %u wrong\n", bad);
    }
+   { // multisample resolve (Mercury's wallpaper: a 4x pass resolved into its drawable): clear a 4x BGRA8 target, resolve, read back
+      char why2[512] = { 0 };
+      struct rwa_texture_shape ms = { .pixel_format = 80, .type = 4 /* 2DMultisample */, .width = 64, .height = 32, .depth = 1,
+                                      .array_length = 1, .mip_levels = 1, .sample_count = 4, .usage = 4 /* RenderTarget */ };
+      struct rwa_texture_shape ss = ms;
+      ss.type = 2; ss.sample_count = 1; ss.usage = 5;
+      struct rwa_texture *tm = rwa_texture_create(dev, &ms, why2, sizeof(why2));
+      struct rwa_texture *ts = tm ? rwa_texture_create(dev, &ss, why2, sizeof(why2)) : NULL;
+      bool ok = ts != NULL;
+      if (ok) {
+         struct rwa_texture *col[1] = { tm };
+         struct rwa_clear cl = { .color = col, .color_count = 1, .color_mask = 1, .color_value = { { 1.0f, 0.5f, 0.25f, 1.0f } } };
+         if (getenv("RESOLVE_CONTROL")) col[0] = ts;   /* control: clear the single-sample target itself, no resolve */
+         ok = rwa_render_clear(dev, &cl, why2, sizeof(why2)) == 0 &&
+              (getenv("RESOLVE_CONTROL") || rwa_texture_resolve(tm, ts, 0, 0) == 0) && rwa_finish(dev, why2, sizeof(why2)) == 0;
+      }
+      unsigned bad = 0;
+      uint8_t got[64 * 32 * 4];
+      unsigned origin[3] = { 0, 0, 0 }, size[3] = { 64, 32, 1 };
+      ok = ok && rwa_texture_read(ts, 0, 0, origin, size, got, 0, why2, sizeof(why2)) == 0;
+      for (unsigned i = 0; ok && i < 64 * 32; i++) {
+         const uint8_t *q = got + 4 * i;   /* BGRA */
+         if (q[2] != 255 || q[1] < 126 || q[1] > 129 || q[0] < 62 || q[0] > 65 || q[3] != 255) { if (bad++ < 3) printf("    texel %u = B%u G%u R%u A%u\n", i, q[0], q[1], q[2], q[3]); }
+      }
+      CHECK(ok && bad == 0, "multisample resolve: %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
+      printf("  multisample resolve: %u wrong%s%s\n", bad, ok ? "" : ": ", ok ? "" : why2);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;

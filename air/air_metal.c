@@ -1612,6 +1612,9 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       .target = target, .format = fmt->pipe,
       .width0 = width, .height0 = height, .depth0 = depth,
       .array_size = array_size, .last_level = mips - 1, .nr_samples = query_samples,
+      /* Chlorophyll: as many stored samples as samples. Left at zero, freedreno's is_format_supported (samples must equal
+       * storage samples) refused a 4x texture as a blit source, so u_blitter dropped every multisample resolve in silence */
+      .nr_storage_samples = query_samples,
       .bind = bind, .usage = PIPE_USAGE_DEFAULT };
 
    if (import) {
@@ -1848,6 +1851,33 @@ rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, cons
    u_box_3d((int)so[0], (int)so[1], (int)(so[2] + sslice), (int)size[0], (int)size[1], (int)(size[2] ? size[2] : 1), &box);
    struct pipe_context *pipe = src->device->pipe;
    pipe->resource_copy_region(pipe, dst->res, dlevel, dorg[0], dorg[1], dorg[2] + dslice, src->res, slevel, &box);
+   return 0;
+}
+
+/* Chlorophyll: a render pass's multisample resolve (MTLStoreActionMultisampleResolve / StoreAndMultisampleResolve): the samples of
+ * `src` averaged into level `dlevel`, slice `dslice` of the single-sample `dst`, on the GPU and in order with the draws (pipe->blit,
+ * which freedreno resolves through its blitter). Mercury draws its wallpaper into a 4x attachment and resolves it into the drawable;
+ * with the resolve ignored the drawable stayed empty and the wallpaper black. -1: the source is not multisample. */
+int
+rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst, unsigned dlevel, unsigned dslice)
+{
+   if (!src || !dst || !src->res || !dst->res || src->device != dst->device || src->res->nr_samples <= 1)
+      return -1;
+   struct pipe_blit_info b;
+   memset(&b, 0, sizeof(b));
+   unsigned w = MIN2(u_minify(dst->res->width0, dlevel), src->res->width0);
+   unsigned h = MIN2(u_minify(dst->res->height0, dlevel), src->res->height0);
+   b.src.resource = src->res;
+   b.src.format = src->res->format;
+   b.src.level = 0;
+   u_box_3d(0, 0, 0, (int)w, (int)h, 1, &b.src.box);
+   b.dst.resource = dst->res;
+   b.dst.format = dst->res->format;
+   b.dst.level = dlevel;
+   u_box_3d(0, 0, (int)dslice, (int)w, (int)h, 1, &b.dst.box);
+   b.mask = PIPE_MASK_RGBA;
+   b.filter = PIPE_TEX_FILTER_NEAREST;
+   src->device->pipe->blit(src->device->pipe, &b);
    return 0;
 }
 

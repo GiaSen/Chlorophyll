@@ -153,7 +153,8 @@ __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; } 
 @class BGMTLComputePipeline;
 
 // ---- recorded work ---------------------------------------------------------------------------------------------------
-enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR, BG_WORK_MIPMAPS };
+enum { BG_WORK_DISPATCH, BG_WORK_COPY, BG_WORK_FILL, BG_WORK_DRAW, BG_WORK_TEXCOPY, BG_WORK_BUF2TEX, BG_WORK_TEX2BUF, BG_WORK_CLEAR, BG_WORK_MIPMAPS,
+       BG_WORK_RESOLVE };
 #define BG_MAX_TEX 16
 @interface BGWork : NSObject {
  @public
@@ -410,6 +411,8 @@ bg_install_fallback(Class c)
    unsigned _thigh, _shigh;
    id _color[8];
    unsigned _ncolor;
+   id _resolve[8];                 // MTLStoreActionMultisampleResolve targets, resolved at endEncoding (BG_WORK_RESOLVE)
+   NSUInteger _resolve_level[8], _resolve_slice[8];
    unsigned _clear_mask;           // colour attachments cleared at the start of the pass
    float _clear_vals[8][4];
    NSMutableArray *_scratch;
@@ -1309,6 +1312,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       } else if (w->kind == BG_WORK_MIPMAPS) {
          if (rwa_texture_generate_mipmaps([(BGMTLTexture *)w->dst rwaTexture]) != 0)
             BG_LOG("blit: generateMipmapsForTexture: no mip chain made\n");
+      } else if (w->kind == BG_WORK_RESOLVE) {
+         if (rwa_texture_resolve([(BGMTLTexture *)w->src rwaTexture], [(BGMTLTexture *)w->dst rwaTexture], (unsigned)w->t_dlevel,
+                                 (unsigned)w->t_dslice) != 0)
+            BG_LOG("render pass: multisample resolve refused (the attachment is not multisample)\n");
       } else if (w->kind == BG_WORK_TEXCOPY &&
                  rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
                                   (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },
@@ -1404,9 +1411,9 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    if (_status == 4 && !in_compositor) {
       NSMutableSet *written = nil;
       for (BGWork *w in _work)
-         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
-            for (unsigned i = 0; i < w->color_count; i++) {
-               BGMTLTexture *t = (BGMTLTexture *)w->color[i];
+         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR || w->kind == BG_WORK_RESOLVE)
+            for (unsigned i = 0; i < (w->kind == BG_WORK_RESOLVE ? 1 : w->color_count); i++) {
+               BGMTLTexture *t = (BGMTLTexture *)(w->kind == BG_WORK_RESOLVE ? w->dst : w->color[i]);
                rwa_texture_flush_surface([t rwaTexture]);
                if ([t iosurface]) {
                   if (!written) written = [NSMutableSet set];
@@ -1456,9 +1463,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    if (bg_trace() && _status == 4) {   // what each colour attachment holds now: five texels, centre and quarter points
       NSMutableArray *seen = [NSMutableArray array];
       for (BGWork *w in _work)
-         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
+         if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR) {
             for (unsigned i = 0; i < w->color_count; i++)
-               if (w->color[i] && ![seen containsObject:w->color[i]]) [seen addObject:w->color[i]];
+               if (w->color[i] && [(id<MTLTexture>)w->color[i] sampleCount] <= 1 && ![seen containsObject:w->color[i]])
+                  [seen addObject:w->color[i]];
+         } else if (w->kind == BG_WORK_RESOLVE && w->dst && ![seen containsObject:w->dst])
+            [seen addObject:w->dst];   // a multisample attachment cannot be read back; what it resolved into can
       for (BGMTLTexture *t in seen) {
          unsigned wd = (unsigned)[t width], ht = (unsigned)[t height];
          const unsigned pts[5][2] = { { wd / 2, ht / 2 }, { wd / 4, ht / 4 }, { 3 * wd / 4, ht / 4 }, { wd / 4, 3 * ht / 4 }, { 3 * wd / 4, 3 * ht / 4 } };
@@ -1669,6 +1679,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                      toTexture:dst destinationSlice:s destinationLevel:l destinationOrigin:MTLOriginMake(0, 0, 0)];
    }
 }
+// whole levels of some slices (Mercury on iOS 26); each level is the source level's size
+- (void)copyFromTexture:(id)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id)dst destinationSlice:(NSUInteger)ds
+       destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)sc levelCount:(NSUInteger)lc
+{
+   for (NSUInteger l = 0; l < lc; l++) {
+      NSUInteger lvl = sl + l;
+      MTLSize sz = MTLSizeMake(MAX(1, [(id<MTLTexture>)src width] >> lvl), MAX(1, [(id<MTLTexture>)src height] >> lvl),
+                               MAX(1, [(id<MTLTexture>)src depth] >> lvl));
+      for (NSUInteger s = 0; s < sc; s++)
+         [self copyFromTexture:src sourceSlice:ss + s sourceLevel:lvl sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:sz
+                     toTexture:dst destinationSlice:ds + s destinationLevel:dl + l destinationOrigin:MTLOriginMake(0, 0, 0)];
+   }
+}
 - (void)copyFromBuffer:(id)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size
              toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg
 {
@@ -1872,9 +1895,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 {
    BG_TRACE("replaceRegion %lu,%lu %lux%lu level %lu bpr %lu\n", (unsigned long)r.origin.x, (unsigned long)r.origin.y,
             (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)level, (unsigned long)bpr);
-   if (bg_trace() && bytes && r.size.height > 1) {
-      const uint8_t *a = (const uint8_t *)bytes, *z = a + bpr * (r.size.height - 1);
-      BG_LOG("  first row px0 %u %u %u %u, last row px0 %u %u %u %u\n", a[0], a[1], a[2], a[3], z[0], z[1], z[2], z[3]);
+   /* the first row only: a compressed format's rows are blocks (ASTC 6x6: a sixth of the height), so bpr * (height - 1) read
+    * past Mercury's buffer and crashed it under the trace */
+   if (bg_trace() && bytes) {
+      const uint8_t *a = (const uint8_t *)bytes;
+      BG_LOG("  first row px0 %u %u %u %u\n", a[0], a[1], a[2], a[3]);
    }
    (void)bpi;
    unsigned o[3] = { (unsigned)r.origin.x, (unsigned)r.origin.y, (unsigned)r.origin.z };
@@ -1987,6 +2012,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       if (!a || ![a texture]) continue;
       _color[i] = [[a texture] retain];
       _ncolor = i + 1;
+      if (([a storeAction] == MTLStoreActionMultisampleResolve || [a storeAction] == MTLStoreActionStoreAndMultisampleResolve) &&
+          [a resolveTexture]) {
+         _resolve[i] = [[a resolveTexture] retain];
+         _resolve_level[i] = [a resolveLevel];
+         _resolve_slice[i] = [a resolveSlice] + [a resolveDepthPlane];
+      }
       if ([a loadAction] == MTLLoadActionClear) {
          MTLClearColor c = [a clearColor];
          _clear_mask |= 1u << i;
@@ -2028,7 +2059,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    }
    return self;
 }
-- (void)dealloc { for (unsigned i = 0; i < 8; i++) [_color[i] release]; [_scratch release]; [_depth release]; [_depth_state release]; [super dealloc]; }
+- (void)dealloc { for (unsigned i = 0; i < 8; i++) { [_color[i] release]; [_resolve[i] release]; } [_scratch release]; [_depth release]; [_depth_state release]; [super dealloc]; }
 - (id)device { return [_cb device]; }
 - (void)setRenderPipelineState:(id)s { _pipeline = s; BG_TRACE("setPipeline %s\n", ((BGMTLRenderPipeline *)s)->_names); }
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
@@ -2141,7 +2172,20 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 - (void)drawIndexedPrimitives:(NSUInteger)p indexCount:(NSUInteger)c indexType:(NSUInteger)t indexBuffer:(id)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)n
 { [self bgRecordDraw:p start:0 count:c instances:n indexBuffer:b indexType:t indexOffset:o baseVertex:0 baseInstance:0]; }
-- (void)endEncoding { [super endEncoding]; }
+// the pass's multisample resolves, after its draws (Mercury renders 4x and resolves into its drawable)
+- (void)endEncoding
+{
+   for (unsigned i = 0; i < _ncolor; i++) {
+      if (!_resolve[i]) continue;
+      BGWork *w = [[[BGWork alloc] init] autorelease];
+      w->kind = BG_WORK_RESOLVE; w->src = [_color[i] retain]; w->dst = [_resolve[i] retain];
+      w->t_dlevel = _resolve_level[i]; w->t_dslice = _resolve_slice[i];
+      [_cb bgRecord:w];
+      [_resolve[i] release];
+      _resolve[i] = nil;
+   }
+   [super endEncoding];
+}
 @end
 
 // ---- GPU state, as the kernel reports it (SWEET_GPU_SEL_INFO). ABI minor 1 and 2 are both served: only flags & 3 is read (bit0 ready,
