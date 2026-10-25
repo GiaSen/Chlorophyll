@@ -53,7 +53,10 @@ static char g_state[192] = F_STATE, g_off[192] = F_OFF;
 #define F_BB_ARM "/private/var/tmp/bgmtl-bb.arm"
 #define F_BB_STATE "/private/var/tmp/bgmtl-bb.state"
 
-static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider", NULL };
+// iconservicesagent: iOS 26 renders every icon variant (tinted, dark, clear) with Metal; without a device each one failed with
+// IconRendering.TextureIOError 6 and was retried forever (169 % CPU, blank tinted icons).
+static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider",
+                                      "com.apple.iconservicesagent", NULL };
 static volatile int g_failures, g_registered, g_bb;
 static volatile unsigned g_completed;
 
