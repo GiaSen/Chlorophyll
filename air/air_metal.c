@@ -125,7 +125,41 @@ struct rwa_device {
     * clears leave the framebuffer bound, so a pass's draws hand freedreno an EQUAL state and it keeps its batch and
     * its emitted state; resetting it after every draw re-dirtied all state and switched batches twice per draw. */
    struct rwa_texture *fb_color[PIPE_MAX_COLOR_BUFS], *fb_depth;
+
+   /* Chlorophyll: the sampler views and sampler states each stage has bound (no references). A draw used to unbind
+    * them after itself and the next draw bound the same ones again, which re-dirtied freedreno's texture state and
+    * rebuilt it every draw; now an equal binding is skipped, and a view or sampler is unbound (unbind_tex_state) before
+    * it is destroyed, which is the safety the per-draw unbind gave. */
+   struct pipe_sampler_view *bound_views[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
+   void *bound_samplers[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
+   unsigned n_bound_views[PIPE_SHADER_TYPES], n_bound_samplers[PIPE_SHADER_TYPES];
 };
+
+/* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
+static void
+unbind_tex_state(struct rwa_device *device, const void *p)
+{
+   if (!device || !p)
+      return;
+   for (unsigned st = 0; st < PIPE_SHADER_TYPES; st++) {
+      bool hit = false;
+      for (unsigned i = 0; i < device->n_bound_views[st] && !hit; i++)
+         hit = device->bound_views[st][i] == p;
+      for (unsigned i = 0; i < device->n_bound_samplers[st] && !hit; i++)
+         hit = device->bound_samplers[st][i] == p;
+      if (!hit)
+         continue;
+      if (device->n_bound_views[st])
+         device->pipe->set_sampler_views(device->pipe, st, 0, 0, device->n_bound_views[st], false, NULL);
+      if (device->n_bound_samplers[st]) {
+         void *none[RWA_MAX_TEXTURES] = { 0 };
+         device->pipe->bind_sampler_states(device->pipe, st, 0, device->n_bound_samplers[st], none);
+      }
+      memset(device->bound_views[st], 0, sizeof(device->bound_views[st]));
+      memset(device->bound_samplers[st], 0, sizeof(device->bound_samplers[st]));
+      device->n_bound_views[st] = device->n_bound_samplers[st] = 0;
+   }
+}
 
 /*
  * WHAT AN MTLArgumentEncoder LEAVES BEHIND, which is a record and not bytes.
@@ -1148,8 +1182,10 @@ tex_pool_size(const struct pipe_resource *r)
 static void
 tex_pool_drop(unsigned k)
 {
-   if (tex_pool[k].view)
+   if (tex_pool[k].view) {
+      unbind_tex_state(tex_pool[k].dev, tex_pool[k].view);
       tex_pool[k].dev->pipe->sampler_view_destroy(tex_pool[k].dev->pipe, tex_pool[k].view);
+   }
    pipe_resource_reference(&tex_pool[k].res, NULL);
    tex_pool_total -= tex_pool[k].bytes;
    memset(&tex_pool[k], 0, sizeof(tex_pool[k]));
@@ -1888,8 +1924,10 @@ rwa_texture_destroy(struct rwa_texture *texture)
       free(texture);          /* the pool holds the resource's reference and the view now */
       return;
    }
-   if (texture->view)
+   if (texture->view) {
+      unbind_tex_state(texture->device, texture->view);
       texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
+   }
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
 }
@@ -2571,6 +2609,8 @@ rwa_sampler_destroy(struct rwa_sampler *sampler)
     * freed memory until something else is bound over it.
     */
    argbuf_scrub(sampler->device, NULL, NULL, sampler);
+   unbind_tex_state(sampler->device, sampler->cso);
+   unbind_tex_state(sampler->device, sampler->cso_compare);
    sampler->device->pipe->delete_sampler_state(sampler->device->pipe, sampler->cso);
    sampler->device->pipe->delete_sampler_state(sampler->device->pipe,
                                                sampler->cso_compare);
@@ -3363,9 +3403,11 @@ rwa_compute_destroy(struct rwa_compute *compute)
     * nothing of its own bound.
     */
    for (unsigned i = 0; i < RWA_MAX_TEXTURES; i++)
-      if (compute->own_sampler[i])
+      if (compute->own_sampler[i]) {
+         unbind_tex_state(compute->device, compute->own_sampler[i]);
          compute->device->pipe->delete_sampler_state(compute->device->pipe,
                                                      compute->own_sampler[i]);
+      }
    ralloc_free(compute->mem_ctx);
    free(compute);
 }
@@ -4207,12 +4249,28 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
 
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
-   if (num_views)
-      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);
+   if (num_views || device->n_bound_views[stage]) {
+      unsigned had = device->n_bound_views[stage];
+      if (num_views != had || memcmp(views, device->bound_views[stage], num_views * sizeof(views[0]))) {
+         pipe->set_sampler_views(pipe, stage, 0, num_views, had > num_views ? had - num_views : 0, false, views);
+         memset(device->bound_views[stage], 0, sizeof(device->bound_views[stage]));
+         memcpy(device->bound_views[stage], views, num_views * sizeof(views[0]));
+         device->n_bound_views[stage] = num_views;
+      }
+   }
    if (num_images)
       pipe->set_shader_images(pipe, stage, 0, num_images, 0, images);
-   if (num_samplers)
-      pipe->bind_sampler_states(pipe, stage, 0, num_samplers, samplers);
+   if (num_samplers || device->n_bound_samplers[stage]) {
+      unsigned had = device->n_bound_samplers[stage];
+      if (num_samplers != had || memcmp(samplers, device->bound_samplers[stage], num_samplers * sizeof(samplers[0]))) {
+         void *all[RWA_MAX_TEXTURES] = { 0 };
+         memcpy(all, samplers, num_samplers * sizeof(samplers[0]));
+         pipe->bind_sampler_states(pipe, stage, 0, MAX2(num_samplers, had), all);
+         memset(device->bound_samplers[stage], 0, sizeof(device->bound_samplers[stage]));
+         memcpy(device->bound_samplers[stage], samplers, num_samplers * sizeof(samplers[0]));
+         device->n_bound_samplers[stage] = num_samplers;
+      }
+   }
 
    bound->num_ssbo = num_ssbo;
    bound->num_views = num_views;
@@ -4232,14 +4290,17 @@ unbind_stage(struct rwa_device *device, enum pipe_shader_type stage,
              const struct rwa_bound *bound)
 {
    struct pipe_context *pipe = device->pipe;
-   if (bound->num_views)
-      pipe->set_sampler_views(pipe, stage, 0, 0, bound->num_views, false, NULL);
+   if (device->n_bound_views[stage])
+      pipe->set_sampler_views(pipe, stage, 0, 0, device->n_bound_views[stage], false, NULL);
    if (bound->num_images)
       pipe->set_shader_images(pipe, stage, 0, 0, bound->num_images, NULL);
-   if (bound->num_samplers) {
+   if (device->n_bound_samplers[stage]) {
       void *none[RWA_MAX_TEXTURES] = { 0 };
-      pipe->bind_sampler_states(pipe, stage, 0, bound->num_samplers, none);
+      pipe->bind_sampler_states(pipe, stage, 0, device->n_bound_samplers[stage], none);
    }
+   memset(device->bound_views[stage], 0, sizeof(device->bound_views[stage]));
+   memset(device->bound_samplers[stage], 0, sizeof(device->bound_samplers[stage]));
+   device->n_bound_views[stage] = device->n_bound_samplers[stage] = 0;
 }
 
 int
@@ -6985,10 +7046,14 @@ rwa_render_destroy(struct rwa_render *render)
       pipe_resource_reference(&render->vbuf, NULL);
 
    for (unsigned i = 0; i < RWA_MAX_TEXTURES; i++) {
-      if (render->frag_own_sampler[i])
+      if (render->frag_own_sampler[i]) {
+         unbind_tex_state(render->device, render->frag_own_sampler[i]);
          pipe->delete_sampler_state(pipe, render->frag_own_sampler[i]);
-      if (render->vert_own_sampler[i])
+      }
+      if (render->vert_own_sampler[i]) {
+         unbind_tex_state(render->device, render->vert_own_sampler[i]);
          pipe->delete_sampler_state(pipe, render->vert_own_sampler[i]);
+      }
    }
 
    ralloc_free(render->mem_ctx);
@@ -7674,9 +7739,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    rc = per_draw ? finish_or_say_why(device, true, "draw", why, why_size) : 0;
 
 unbind:
-   unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);
-   if (!render->generated_vertex)
-      unbind_stage(device, PIPE_SHADER_VERTEX, &vbound);
+   /* Chlorophyll: views and samplers stay bound for the next draw (rwa_device.bound_views; unbind_tex_state frees them
+    * safely); shader images do not. */
+   if (fbound.num_images)
+      pipe->set_shader_images(pipe, PIPE_SHADER_FRAGMENT, 0, 0, fbound.num_images, NULL);
+   if (!render->generated_vertex && vbound.num_images)
+      pipe->set_shader_images(pipe, PIPE_SHADER_VERTEX, 0, 0, vbound.num_images, NULL);
    /* The framebuffer is released before the surfaces are destroyed, and both before the
     * caller's next call, which may be rwa_texture_destroy on one of these attachments:
     * a context still holding a surface of a freed resource is the same trap as a bound
