@@ -486,6 +486,39 @@ main(int argc, char **argv)
       printf("  texture view (level 1, BGR1): %.2f %.2f %.2f %.2f%s%s\n", po ? po[0] : 0, po ? po[1] : 0, po ? po[2] : 0, po ? po[3] : 0,
              ok ? "" : ": ", ok ? "" : why2);
    }
+   { // bg_tex_write_half: half colours into RGBA16Float and RGBA8Unorm images (was stored as integers: huge, or zero)
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_tex_write_half", &info);
+      static const unsigned fmts[2] = { 115, 70 };
+      for (unsigned f = 0; c && f < 2; f++) {
+         char why2[512] = { 0 };
+         struct rwa_texture_shape sh = { .pixel_format = fmts[f], .type = 2, .width = 16, .height = 8, .depth = 1, .array_length = 1,
+                                         .mip_levels = 1, .sample_count = 1, .usage = 3 };
+         struct rwa_texture *t = rwa_texture_create(dev, &sh, why2, sizeof(why2));
+         uint8_t raw[16 * 8 * 8] = { 0 };
+         unsigned origin[3] = { 0, 0, 0 }, size[3] = { 16, 8, 1 };
+         bool ok = t && rwa_texture_write(t, 0, 0, origin, size, raw, 0, why2, sizeof(why2)) == 0;
+         struct rwa_texture *texs[1] = { t };
+         struct rwa_bindings b = { .textures = texs, .texture_count = 1 };
+         unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 16, 8, 1 };
+         ok = ok && rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0 &&
+              rwa_texture_read(t, 0, 0, origin, size, raw, 0, why2, sizeof(why2)) == 0;
+         float got[4] = { 0 };
+         if (ok && fmts[f] == 115) {
+            const uint16_t *h = (const uint16_t *)raw;
+            for (unsigned k = 0; k < 4; k++) {   /* half -> float, normal numbers only */
+               unsigned e = (h[k] >> 10) & 31, m = h[k] & 1023;
+               got[k] = e ? ldexpf(1.0f + m / 1024.0f, (int)e - 15) : 0.0f;
+               if (h[k] & 0x8000) got[k] = -got[k];
+            }
+         } else if (ok)
+            for (unsigned k = 0; k < 4; k++) got[k] = raw[k] / 255.0f;
+         bool good = ok && fabsf(got[0] - 0.25f) < 0.01f && fabsf(got[1] - 0.5f) < 0.01f && fabsf(got[2] - 0.75f) < 0.01f &&
+                     fabsf(got[3] - 1.0f) < 0.01f;
+         CHECK(good, "bg_tex_write_half fmt %u: %g %g %g %g%s%s", fmts[f], got[0], got[1], got[2], got[3], ok ? "" : ": ", ok ? "" : why2);
+         printf("  bg_tex_write_half fmt %u: %.3f %.3f %.3f %.3f (want 0.25 0.5 0.75 1)\n", fmts[f], got[0], got[1], got[2], got[3]);
+      }
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;

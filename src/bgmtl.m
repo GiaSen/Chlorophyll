@@ -1376,6 +1376,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          static int force_alpha = -1;
          if (force_alpha < 0) force_alpha = access("/private/var/tmp/bgmtl.forcealpha", F_OK) == 0;
          if (force_alpha) rwa_texture_force_opaque([(BGMTLTexture *)w->dst rwaTexture]);
+         // debugging: /private/var/tmp/bgmtl.tintresolve fills what a resolve wrote with red (does the screen show this texture?);
+         // checked at every resolve, so it can be switched live
+         if (access("/private/var/tmp/bgmtl.tintresolve", F_OK) == 0)
+            rwa_texture_debug_fill([(BGMTLTexture *)w->dst rwaTexture], (const float[4]){ 1.0f, 0.0f, 0.0f, 1.0f });
       } else if (w->kind == BG_WORK_TEXCOPY &&
                  rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
                                   (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },

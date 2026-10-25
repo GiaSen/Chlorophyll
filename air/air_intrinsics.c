@@ -1758,6 +1758,10 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
       if (!coord)
          return false;
+      /* Chlorophyll: the type of what is stored is the VALUE's (a write returns void, so dest_type, read off the return type,
+       * said uint for every store): half colours stored as integers made Mercury's blur pyramid enormous (an overexposed
+       * wallpaper); 32-bit float stores happened to survive the uint type */
+      nir_alu_type value_type = tex_dest_type(c, in->operands[arg]->type, n);
       nir_def *value = air_get_ssa(c, in->operands[arg++]);
       if (!value)
          return false;
@@ -1776,7 +1780,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
                       nir_imm_int(&c->b, 0),
                       .image_dim = t.dim, .image_array = t.is_array,
-                      .src_type = dest_type);
+                      .src_type = value_type);
       return true;
    }
 

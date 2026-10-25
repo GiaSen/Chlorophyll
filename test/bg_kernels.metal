@@ -118,3 +118,10 @@ kernel void bg_math(device const float *in [[buffer(0)]], device float *out [[bu
    o[14] = float(pow(half3(hy), half3(1.5)).y);
    o[15] = fast::fmax(x, y * 0.5);
 }
+
+// half colours written to an image (Mercury's blur pyramid): the store's type must be the value's, not the void return's
+kernel void bg_tex_write_half(texture2d<half, access::write> t [[texture(0)]], uint2 gid [[thread_position_in_grid]])
+{
+   if (gid.x < t.get_width() && gid.y < t.get_height())
+      t.write(half4(0.25h, 0.5h, 0.75h, 1.0h), gid);
+}

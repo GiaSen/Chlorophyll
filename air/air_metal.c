@@ -1901,6 +1901,24 @@ rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst, unsigned d
    return 0;
 }
 
+static struct pipe_surface *texture_surface(struct rwa_texture *t);
+
+/* Chlorophyll debugging: fill level 0 (as a render target) with one colour on the GPU, e.g. to see whether a compositor shows
+ * this texture at all. -1: no texture or no surface. */
+int
+rwa_texture_debug_fill(struct rwa_texture *dst, const float rgba[4])
+{
+   if (!dst || !dst->res)
+      return -1;
+   struct pipe_surface *ps = texture_surface(dst);
+   if (!ps)
+      return -1;
+   union pipe_color_union c;
+   memcpy(c.f, rgba, sizeof(c.f));
+   dst->device->pipe->clear_render_target(dst->device->pipe, ps, &c, 0, 0, dst->res->width0, dst->res->height0, false);
+   return 0;
+}
+
 /* Chlorophyll: set every texel's alpha of level 0 to one, on the GPU (a blit of the alpha channel alone from a 1x1 opaque texture).
  * A debugging aid for content composited as if it had alpha when it is meant to be opaque. -1: no texture or the blit failed. */
 int
