@@ -3451,6 +3451,11 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
    cs->info.workgroup_size[1] = block[1];
    cs->info.workgroup_size[2] = block[2];
    cs->info.workgroup_size_variable = false;
+   /* A threadgroup buffer sized by the dispatch (-setThreadgroupMemoryLength:atIndex:) is read at shared offset 0
+    * (air_to_nir.c); with no static threadgroup memory before it, the state reserves all of the Adreno 630's 32 KB,
+    * so whatever length the dispatch set fits. iOS 26's CoreAnimation needs it (compute_average_luma). */
+   if (compute->dynamic_threadgroup && cs->info.shared_size == 0)
+      cs->info.shared_size = 32768;
 
    finalize_for_gallium(cs, device->screen);
 
@@ -4369,7 +4374,7 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
       return -1;
    }
 
-   if (compute->dynamic_threadgroup) {
+   if (compute->dynamic_threadgroup && compute->info.threadgroup_bytes != 0) {
       say(why, why_size, "%s takes a threadgroup buffer whose size only the dispatch can "
                          "give (Metal's -setThreadgroupMemoryLength:atIndex:), and this "
                          "call has no argument for it", name);
