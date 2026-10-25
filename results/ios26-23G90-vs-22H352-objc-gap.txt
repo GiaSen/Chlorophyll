@@ -1,0 +1,54 @@
+== base classes Chlorophyll subclasses (old -> new)
+_MTLDevice                 super NSObject->NSObject  ivars 50->56  methods 598->672 (+74 -0)
+_MTLObjectWithLabel        super NSObject->NSObject  ivars 2->2  methods 5->5 (+0 -0)
+_MTLAllocation             super _MTLObjectWithLabel->_MTLObjectWithLabel  ivars 1->1  methods 2->2 (+0 -0)
+_MTLResource               super _MTLAllocation->_MTLAllocation  ivars 0->0  methods 6->11 (+5 -0)
+_MTLCommandQueue           super _MTLObjectWithLabel->_MTLObjectWithLabel  ivars 34->34  methods 63->63 (+0 -0)
+_MTLCommandBuffer          super _MTLObjectWithLabel->_MTLObjectWithLabel  ivars 61->65  methods 98->108 (+10 -0)
+_MTLCommandEncoder         super _MTLObjectWithLabel->_MTLObjectWithLabel  ivars 9->9  methods 76->91 (+15 -0)
+_MTLComputePipelineState   super NSObject->_MTLAllocation  ivars 7->10  methods 33->44 (+11 -0)
+_MTLRenderPipelineState    super NSObject->_MTLAllocation  ivars 19->32  methods 71->103 (+32 -0)
+_MTLSamplerState           super NSObject->NSObject  ivars 5->5  methods 15->15 (+0 -0)
+_MTLDepthStencilState      super NSObject->NSObject  ivars 2->2  methods 13->16 (+3 -0)
+
+== QuartzCore selector refs: 2572 -> 2888 (+329 new)
+
+== required protocol methods NEW in the newer iOS, per Chlorophyll class: answered by us / by the 26 base class / only by the zero-forwarder
+BGMTLDevice          MTLDevice                      req 109->129 new= 20 base-answers= 10 UNANSWERED=  0 
+BGMTLDevice          MTLDeviceSPI                   req 471->528 new= 57 base-answers= 34 UNANSWERED=  0 
+BGMTLBuffer          MTLBuffer                      req  21-> 23 new=  2 base-answers=  2 UNANSWERED=  0 
+BGMTLBuffer          MTLResource                    req  14-> 14 new=  0 base-answers=  0 UNANSWERED=  0 
+BGMTLBuffer          MTLResourceSPI                 req  25-> 25 new=  0 base-answers=  0 UNANSWERED=  0 
+BGMTLTexture         MTLTexture                     req  49-> 51 new=  2 base-answers=  2 UNANSWERED=  0 
+BGMTLTexture         MTLTextureSPI                  req  73-> 76 new=  3 base-answers=  2 UNANSWERED=  1 
+       writeAccessPattern 
+BGMTLTexture         MTLTextureImplementation       req  74-> 77 new=  3 base-answers=  2 UNANSWERED=  1 
+       writeAccessPattern 
+BGMTLTexture         MTLResource                    req  14-> 14 new=  0 base-answers=  0 UNANSWERED=  0 
+BGMTLTexture         MTLResourceSPI                 req  25-> 25 new=  0 base-answers=  0 UNANSWERED=  0 
+BGMTLCommandBuffer   MTLCommandBuffer               req  39-> 39 new=  0 base-answers=  0 UNANSWERED=  0 
+BGMTLComputeEncoder  MTLCommandEncoder              req   7->  8 new=  1 base-answers=  1 UNANSWERED=  0 
+BGMTLBlitEncoder     MTLCommandEncoder              req   7->  8 new=  1 base-answers=  1 UNANSWERED=  0 
+BGMTLRenderEncoder   MTLCommandEncoder              req   7->  8 new=  1 base-answers=  1 UNANSWERED=  0 
+BGMTLComputePipeline MTLComputePipelineState        req  13-> 19 new=  6 base-answers=  6 UNANSWERED=  0 
+BGMTLRenderPipeline  MTLRenderPipelineState         req  18-> 27 new=  9 base-answers=  9 UNANSWERED=  0 
+BGMTLSampler         MTLSamplerState                req   3->  3 new=  0 base-answers=  0 UNANSWERED=  0 
+BGMTLSampler         MTLSamplerStateSPI             req   8->  8 new=  0 base-answers=  0 UNANSWERED=  0 
+BGMTLDepthStencil    MTLDepthStencilState           req   2->  3 new=  1 base-answers=  1 UNANSWERED=  0 
+BGMTLDepthStencil    MTLDepthStencilStateSPI        req   6->  9 new=  3 base-answers=  3 UNANSWERED=  0 
+
+== selectors QuartzCore (new) newly references that are Metal protocol methods, and whether a Chlorophyll class chain answers them
+  addAllocation:                                                         MTLResidencySet                                              answered-by: NONE (zero-forwarder)
+  newComputePipelineStateWithDescriptor:error:                           MTL4Archive,MTLDeviceSPI                                     answered-by: BGMTLDevice
+  newResidencySetWithDescriptor:error:                                   MTLDevice                                                    answered-by: BGMTLDevice
+  newSharedEventWithMachPort:                                            MTLDeviceSPI                                                 answered-by: BGMTLDevice
+  newTextureViewWithDescriptor:                                          MTLTexture                                                   answered-by: BGMTLBuffer,BGMTLTexture
+  removeAllocation:                                                      MTLResidencySet                                              answered-by: NONE (zero-forwarder)
+  setImageblockWidth:height:                                             MTL4ComputeCommandEncoder,MTLIndirectComputeCommand          answered-by: NONE (zero-forwarder)
+  setResponsibleProcess:                                                 MTLResourceSPI                                               answered-by: NONE (zero-forwarder)
+  signalEvent:value:                                                     MTL4CommandQueue,MTLIOCommandBuffer                          answered-by: NONE (zero-forwarder)
+  signalOnCommandQueue:                                                  MTLDrawableSPI                                               answered-by: NONE (zero-forwarder)
+  sparseTextureTier                                                      MTLTexture                                                   answered-by: BGMTLBuffer,BGMTLTexture
+  supportsLossyCompression                                               MTLDeviceSPI                                                 answered-by: BGMTLDevice
+  waitForEvent:value:                                                    MTL4CommandQueue,MTLIOCommandBuffer                          answered-by: NONE (zero-forwarder)
+  waitOnCommandQueue:                                                    MTLDrawableSPI                                               answered-by: NONE (zero-forwarder)

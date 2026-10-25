@@ -573,7 +573,8 @@ ensure_protocol(Class cls, const char *proto)
    BOOL r;
    if (family >= 1001 && family <= 1009) r = family - 1000 <= apple_max;          // MTLGPUFamilyApple1..9
    else if (family == 3001 || family == 3002) r = YES;                            // MTLGPUFamilyCommon1, Common2
-   else r = ((BOOL (*)(struct objc_super *, SEL, NSInteger))objc_msgSendSuper)(&(struct objc_super){ self, [_MTLDevice class] }, _cmd, family);
+   else if (family == 5002) r = NO;                                               // MTLGPUFamilyMetal4 (iOS 26): see below
+   else r =((BOOL (*)(struct objc_super *, SEL, NSInteger))objc_msgSendSuper)(&(struct objc_super){ self, [_MTLDevice class] }, _cmd, family);
    BG_TRACE("supportsFamily %ld -> %d\n", (long)family, r);
    return r;
 }
@@ -590,6 +591,70 @@ ensure_protocol(Class cls, const char *proto)
 // path only (air2ir3's FORMATS.md: WindowServer decides the same way).
 - (BOOL)supportsExtendedXR10Formats { BG_TRACE("supportsExtendedXR10Formats -> NO\n"); return NO; }
 - (BOOL)supportsExtendedColors { BG_TRACE("supportsExtendedColors -> NO\n"); return NO; }
+
+// iOS 26: no Metal 4, tensors, machine learning encoders, texture view pools or placement sparse. iOS 26's _MTLDevice gained
+// these queries and factories (74 methods over 18.7.8, read from the 23G90 shared cache); their answers come from the feature
+// tables an Apple GPU driver fills in, which this device does not, and a Metal 4 queue made by the base class would not
+// submit to this GPU. QuartzCore 26 references MTL4CommandQueue (signalEvent:value:/waitForEvent:value:), so every query
+// says NO and every factory returns nil here. iOS 18 never sends these selectors.
+- (BOOL)supportsMTL4CommandQueue { BG_TRACE("supportsMTL4CommandQueue -> NO\n"); return NO; }
+- (BOOL)supportsMTL4CommandAllocator { return NO; }
+- (BOOL)supportsMTL4Compiler { return NO; }
+- (BOOL)supportsMTL4ComputeCommandEncoder { return NO; }
+- (BOOL)supportsMTL4RenderCommandEncoder { return NO; }
+- (BOOL)supportsMTL4Counters { return NO; }
+- (BOOL)supportsMTL4LateBoundRenderTargets { return NO; }
+- (BOOL)supportsMTL4PSOSpecialization { return NO; }
+- (BOOL)supportsMTL4PlacementSparse { return NO; }
+- (BOOL)supportsPlacementSparse { return NO; }
+- (BOOL)supportsTensors { return NO; }
+- (BOOL)supportsMachineLearningCommandEncoders { return NO; }
+- (BOOL)supportsMTLTextureViewPools { return NO; }
+- (BOOL)supportsTextureAccessPatterns { return NO; }
+- (BOOL)validateMetal4SupportWithError:(NSError **)error
+{
+   [self bgFail:error with:@"Metal 4 is not supported on this device"];
+   return NO;
+}
+- (id)newMTL4CommandQueue { BG_TRACE("newMTL4CommandQueue -> nil\n"); return nil; }
+- (id)newMTL4CommandQueueWithDescriptor:(id)descriptor error:(NSError **)error
+{
+   (void)descriptor;
+   BG_TRACE("newMTL4CommandQueueWithDescriptor -> nil\n");
+   return [self bgFail:error with:@"Metal 4 command queues are not supported on this device"];
+}
+- (id)newCommandQueue4 { return nil; }
+- (id)newCommandAllocator { return nil; }
+- (id)newCommandAllocatorWithDescriptor:(id)descriptor error:(NSError **)error
+{
+   (void)descriptor;
+   return [self bgFail:error with:@"Metal 4 command allocators are not supported on this device"];
+}
+- (id)newCompilerWithDescriptor:(id)descriptor error:(NSError **)error
+{
+   (void)descriptor;
+   return [self bgFail:error with:@"Metal 4 compilers are not supported on this device"];
+}
+- (id)newArgumentTableWithDescriptor:(id)descriptor error:(NSError **)error
+{
+   (void)descriptor;
+   return [self bgFail:error with:@"Metal 4 argument tables are not supported on this device"];
+}
+- (id)newCounterHeapWithDescriptor:(id)descriptor error:(NSError **)error
+{
+   (void)descriptor;
+   return [self bgFail:error with:@"counter heaps are not supported on this device"];
+}
+- (id)newTensorWithDescriptor:(id)descriptor error:(NSError **)error
+{
+   (void)descriptor;
+   return [self bgFail:error with:@"tensors are not supported on this device"];
+}
+- (id)newTextureViewPoolWithDescriptor:(id)descriptor error:(NSError **)error
+{
+   (void)descriptor;
+   return [self bgFail:error with:@"texture view pools are not supported on this device"];
+}
 
 - (BOOL)metalAssertionsEnabled { return _assertions; }
 - (void)setMetalAssertionsEnabled:(BOOL)enabled { _assertions = enabled; }
