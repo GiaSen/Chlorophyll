@@ -65,3 +65,23 @@ and an 18.0 deployment target loads on 26. arm64e is PAC-stripped by `freedreno-
 
    The default poster descriptor `com.apple.MercuryPoster:fluidity.two` was read back from PosterBoard on 18. Read it back again on
    26 (`sweetposterset --descriptors`) before the image makes it the default.
+
+## On the phone, 2026-10-25 (boot 33b, backboardd and Mercury on Chlorophyll)
+
+Five front-end and runtime gaps, each found from a refusal in `bgmtl-fail/refused.txt` or a dead-man trip, fixed and checked on the A630
+with `test/bgair_test.c` (14/14) and the QuartzCore + HDR corpus (369/375, unchanged):
+
+| commit | what was refused | fix |
+|---|---|---|
+| 6ac86f5 | backboardd's `compute_sum_luma` / `compute_average_luma` bind a `device` buffer at offsets 32, 96, 224; three refusals tripped the dead-man (`bgmtl-bb.off`) | `add_ssbo_deltas`: the buffer is bound in place at the offset rounded down to 64 and every load, store and atomic adds the rest, read from entries 16-31 of the delta table in constant buffer 15 (compute and draws). `RWA_SSBO_DELTA=0` turns it off |
+| 8382d85 | Mercury's `VariableBlurrer::downsample`: an image store (and size query) at a mip level known only at run time | the image gets one slot per level 1..11 above the shader's images, the level picks the slot (ir3 takes a dynamic image index; resinfo ignores a lod), the runtime binds a view of each level there |
+| 7425752, 6b32429 | Mercury's `space::rasterizeBackgroundFragment`: a phi between two textures, and in another variant a select among three merged with a fourth by a phi | the phi becomes a texture chosen at run time (a 1-bit register stored on each incoming edge); a texture operation on a chosen texture is made on every texture and the answers selected (derivatives stay valid). A write to a chosen texture is refused (the CFG is unstructured) |
+| 462d0c2 | Mercury's `space::rasterizeMeshVertex` samples `air.get_null_texture` | a null texture reads zero, answers a query with zero, writes nowhere |
+
+After these, Mercury's `space.dynamic` poster runs with no refused pipeline (pid 7070, first command buffer completed). Not yet seen on screen.
+
+Found on the way, not fixed: an RGBA8Unorm image written by a compute kernel reads back zeros through `rwa_texture_read` (RGBA32Float is
+fine, which is why `bg_tex_write` and `bg_mip_write` use it); `copyFromTexture:sourceSlice:sourceLevel:toTexture:destinationSlice:destinationLevel:sliceCount:levelCount:`
+is unimplemented (Mercury calls it).
+
+Lesson: a refused pipeline names the fragment (`(f)`) even when the vertex stage is the one refused; translate both dumps.
