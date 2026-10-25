@@ -341,6 +341,7 @@ bg_install_fallback(Class c)
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
+   BOOL _surfCopy;       // an IOSurface the GPU could not import (row pitch not 64-aligned): own memory, refreshed from the surface at each use
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
 }
@@ -1682,6 +1683,14 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
       bg_lock();
       _tex = rwa_texture_from_surface([device rwa], &_shape, (int)IOSurfaceGetID((IOSurfaceRef)surface), 0, 0, why, sizeof(why));
+      /* iOS 26 CoreAnimation hands small surfaces with a pitch the Adreno cannot map (480 bytes a row: 120 BGRA texels; its
+       * compute_average_luma samples one). Such a texture gets its own memory and the surface's pixels are copied in at each
+       * use, like the no-copy textures below; good for sampling, which is all CA does with them. */
+      if (!_tex && IOSurfaceGetBytesPerRow((IOSurfaceRef)surface) % 64 != 0) {
+         char why2[512] = { 0 };
+         _tex = rwa_texture_create([device rwa], &_shape, why2, sizeof(why2));
+         if (_tex) _surfCopy = YES;
+      }
       bg_unlock();
       _surface = CFRetain(surface);
       _plane = plane;
@@ -1740,6 +1749,19 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 
 - (struct rwa_texture *)rwaTexture
 {
+   if (_surfCopy && _tex && _surface) {
+      IOSurfaceRef sf = (IOSurfaceRef)_surface;
+      if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
+         bg_lock();
+         char why[256] = { 0 };
+         const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
+         if (rwa_texture_write(_tex, 0, 0, o, sz, (const uint8_t *)IOSurfaceGetBaseAddress(sf), (unsigned)IOSurfaceGetBytesPerRow(sf),
+                               why, sizeof(why)) != 0)
+            BG_LOG("surface copy refresh: %s\n", why);
+         bg_unlock();
+         IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+      }
+   }
    if (_ncBytes && _tex) {
       bg_lock();
       char why[256] = { 0 };
