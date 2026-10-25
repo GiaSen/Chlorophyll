@@ -246,8 +246,19 @@ ret_store_leaves(struct air_ctx *c, const struct air_type *t, const struct air_v
       return true;
    }
    unsigned L = (*idx)++;
-   if (L >= c->num_ret_fields || !c->ret_fields[L] || !v)
+   if (L >= c->num_ret_fields || !v)
       return true;
+   if (!c->ret_fields[L]) {
+      /* a pointer leaf: it has no parameter, so a translation-time resolution goes back to the caller as the value itself;
+       * every return of the callee must give the same one */
+      if (c->ret_static && v->kind == AIR_VAL_PTR) {   /* one with an offset is mapped back to the caller's argument at the end of translate_callee */
+         const struct air_val *had = c->ret_static[L];
+         if (had && (had->ptr.class != v->ptr.class || had->ptr.binding != v->ptr.binding || had->ptr.is_image != v->ptr.is_image))
+            return air_error(c, "instruction: leaf %u of a returned aggregate is a different pointer on two returns", L);
+         c->ret_static[L] = (struct air_val *)v;
+      }
+      return true;
+   }
    if (v->kind != AIR_VAL_SSA)
       return air_error(c, "instruction: leaf %u of a returned aggregate is not a number, from a function called in the module", L);
    nir_store_deref(&c->b, c->ret_fields[L], v->def, nir_component_mask(v->def->num_components));
@@ -255,17 +266,20 @@ ret_store_leaves(struct air_ctx *c, const struct air_type *t, const struct air_v
 }
 
 static struct air_val *
-ret_build_leaves(struct air_ctx *c, const struct air_type *t, nir_variable **fields, unsigned *idx)
+ret_build_leaves(struct air_ctx *c, const struct air_type *t, nir_variable **fields, struct air_val **statics, unsigned *idx)
 {
    if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
       unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : (unsigned)t->count;
       struct air_val *agg = air_val_agg(c, n);
       for (unsigned i = 0; i < n; i++)
-         agg->elems[i] = ret_build_leaves(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem, fields, idx);
+         agg->elems[i] = ret_build_leaves(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem, fields, statics, idx);
       return agg;
    }
-   nir_variable *f = fields[(*idx)++];
-   return f ? air_val_ssa(c, nir_load_var(&c->b, f)) : NULL;
+   unsigned L = (*idx)++;
+   nir_variable *f = fields[L];
+   if (!f)
+      return statics ? statics[L] : NULL;   /* a pointer leaf the callee resolved (ret_static), or undef */
+   return air_val_ssa(c, nir_load_var(&c->b, f));
 }
 
 static struct air_val *air_constant_val(struct air_ctx *c, const struct air_constant *k);
@@ -2532,6 +2546,10 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
          res = nir_unpack_32_2x16(&c->b, x);
       else if (sn == 2 && sb == 16 && dn == 1 && db == 32)
          res = nir_pack_32_2x16(&c->b, x);
+      /* Bergamota (iOS 26, VideoToolbox's VTMTSComputeFunction1x1: <4 x i16> to <2 x i32>): any other repacking of the same
+       * total width, element 0 at the lowest bits as above -- nir_bitcast_vector packs and unpacks in that order */
+      else if (dn * db == sn * sb && db >= 8 && sb >= 8 && dn <= NIR_MAX_VEC_COMPONENTS && sn <= NIR_MAX_VEC_COMPONENTS)
+         res = nir_bitcast_vector(&c->b, x, db);
       else
          return air_error(c, "instruction: a bitcast from %u x %u bits to %u x %u bits, "
                              "which is a repacking this frontend does not do",
@@ -3869,6 +3887,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    nir_deref_instr *saved_ret = c->ret_deref;
    nir_deref_instr **saved_ret_fields = c->ret_fields;
    unsigned saved_num_ret_fields = c->num_ret_fields;
+   struct air_val **saved_ret_static = c->ret_static;
    /* a constant of the caller is a def of the caller's impl, so the place
     * constants are built belongs to the function being translated, like the
     * values table above */
@@ -3889,6 +3908,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    c->ret_deref = NULL;
    c->ret_fields = NULL;
    c->num_ret_fields = 0;
+   c->ret_static = NULL;
 
    /* this function's own globals, built in its own builder */
    materialise_globals(c);
@@ -3901,6 +3921,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    if (ret_struct) {
       c->ret_fields = rzalloc_array(c->mem_ctx, nir_deref_instr *, MAX2(nleaves_ret, 1));
       c->num_ret_fields = nleaves_ret;
+      c->ret_static = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(nleaves_ret, 1));
+      if (!c->ret_statics)
+         c->ret_statics = _mesa_pointer_hash_table_create(c->mem_ctx);
+      _mesa_hash_table_insert(c->ret_statics, fn, c->ret_static);
       unsigned p = 0;
       for (unsigned i = 0; i < nleaves_ret; i++) {
          if (!ret_member_is_number(rleaf[i]))
@@ -3939,6 +3963,24 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    }
    if (ok)
       ok = translate_body(c);
+   /* A returned pointer leaf with a byte offset holds an offset of THIS function (a parameter): it can only be one of the
+    * caller's pointer arguments passed through (CoreImage's `_ci_sampler_builder` returns its `ptr addrspace(2)` argument,
+    * `buffer0 + 80`), and the caller gets its own argument back. Anything else stays undef in the caller. */
+   for (unsigned L = 0; ok && c->ret_static && L < nleaves_ret; L++) {
+      struct air_val *rv = c->ret_static[L];
+      if (!rv || !rv->ptr.offset)
+         continue;
+      c->ret_static[L] = NULL;
+      for (unsigned i = 0; i < f->num_args; i++) {
+         struct hash_entry *ae = _mesa_hash_table_search(c->values, &f->args[i]);
+         const struct air_val *av = ae ? ae->data : NULL;
+         if (av && av->kind == AIR_VAL_PTR && av->ptr.offset == rv->ptr.offset && av->ptr.class == rv->ptr.class &&
+             av->ptr.binding == rv->ptr.binding && argv && argv[i]) {
+            c->ret_static[L] = argv[i];
+            break;
+         }
+      }
+   }
 
    c->b = saved_b;
    c->fn = saved_fn;
@@ -3950,6 +3992,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    c->ret_deref = saved_ret;
    c->ret_fields = saved_ret_fields;
    c->num_ret_fields = saved_num_ret_fields;
+   c->ret_static = saved_ret_static;
    return ok ? fn : NULL;
 }
 
@@ -4055,7 +4098,8 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
 
    if (ret_struct) {
       unsigned L = 0;
-      air_set(c, &in->base, ret_build_leaves(c, rt, fields, &L));
+      struct hash_entry *rs = c->ret_statics ? _mesa_hash_table_search(c->ret_statics, fn) : NULL;
+      air_set(c, &in->base, ret_build_leaves(c, rt, fields, rs ? rs->data : NULL, &L));
    } else if (has_ret) {
       air_set(c, &in->base, air_val_ssa(c, nir_load_var(&c->b, tmp)));
    }

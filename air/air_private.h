@@ -193,6 +193,14 @@ struct air_ctx {
    nir_deref_instr **ret_fields;
    unsigned num_ret_fields;
 
+   /* Bergamota (iOS 26 CoreImage): the leaves of such a returned struct that are not numbers but pointers resolved while
+    * translating (a binding with no run-time offset). They have no parameter; emit_return records them here, indexed like
+    * ret_fields, and the caller puts them back into the struct it builds from the call (ret_statics: nir_function -> this
+    * array). CoreImage's `_ci_sampler_builder` returns `Sampler_h { texture2d, sampler, ptr addrspace(2), float2 }` and the
+    * kernel then indexes through the pointer it takes back out: "getelementptr on something that is not a pointer". */
+   struct air_val **ret_static;
+   struct hash_table *ret_statics;
+
    /* What each module global resolves to, decided once (plan_globals) and
     * turned into a value in whichever function needs it (materialise_globals).
     * The two are separate because the deciding half has side effects that must

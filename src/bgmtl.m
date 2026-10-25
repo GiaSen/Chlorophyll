@@ -94,6 +94,24 @@ bg_log(const char *fmt, ...)
    }
 }
 
+// /private/var/tmp/bgmtl.faildump: a pipeline Chlorophyll refuses leaves its reason in bgmtl-fail/refused.txt and the bitcode of
+// its functions in bgmtl-fail/<pid>-<name>.<stage>.bc, without the per-frame volume of the trace (backboardd's glass, the poster
+// extensions' CoreImage kernels: callers that drop the NSError silently). air2nir on the Mac takes the .bc as it is.
+static void
+bg_fail_dump(const char *reason, NSData *vair, NSString *vname, NSData *air, NSString *name, const char *stage)
+{
+   if (access("/private/var/tmp/bgmtl.faildump", F_OK) != 0) return;
+   mkdir("/private/var/tmp/bgmtl-fail", 0777);
+   NSString *dir = @"/private/var/tmp/bgmtl-fail";
+   if (vair) [vair writeToFile:[dir stringByAppendingFormat:@"/%d-%@.v.bc", getpid(), vname] atomically:NO];
+   if (air) [air writeToFile:[dir stringByAppendingFormat:@"/%d-%@.%s.bc", getpid(), name, stage] atomically:NO];
+   FILE *f = fopen("/private/var/tmp/bgmtl-fail/refused.txt", "a");
+   if (!f) return;
+   fprintf(f, "[%d %s] %s%s%s (%s): %s\n", getpid(), getprogname(), vname ? vname.UTF8String : "", vname ? " + " : "",
+           name ? name.UTF8String : "?", stage, reason);
+   fclose(f);
+}
+
 // BGMTL_TRACE=1 or /private/var/tmp/bgmtl.trace: one line per command buffer, render pass, pipeline build and commit
 // (what a client such as CoreAnimation sends)
 static int
@@ -867,7 +885,10 @@ bg_air_slice(NSData *d)
    struct rwa_render *r = rwa_render_create(_rwa, vair ? vair.bytes : NULL, vair ? vair.length : 0, vertex ? [[vertex name] UTF8String] : NULL, fair.bytes, fair.length,
                                             [[fragment name] UTF8String], &shape, &info, why, sizeof(why));
    bg_unlock();
-   if (!r) return [self bgFail:error with:[NSString stringWithUTF8String:why]];
+   if (!r) {
+      bg_fail_dump(why, vair, vertex ? [vertex name] : nil, fair, [fragment name], "f");
+      return [self bgFail:error with:[NSString stringWithUTF8String:why]];
+   }
    BGMTLRenderPipeline *p = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
    if (!p) { bg_lock(); rwa_render_destroy(r); bg_unlock(); return [self bgFail:error with:@"_MTLRenderPipelineState refused to initialise"]; }
    p->_owner = self; p->_render = r; p->_info = info;
@@ -898,7 +919,10 @@ bg_air_slice(NSData *d)
    bg_lock();
    struct rwa_compute *c = rwa_compute_create(_rwa, air.bytes, air.length, [[function name] UTF8String], &info, why, sizeof(why));
    bg_unlock();
-   if (!c) return [self bgFail:error with:[NSString stringWithUTF8String:why]];
+   if (!c) {
+      bg_fail_dump(why, nil, nil, air, [function name], "c");
+      return [self bgFail:error with:[NSString stringWithUTF8String:why]];
+   }
    BGMTLComputePipeline *p = [[BGMTLComputePipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];
    if (!p) { bg_lock(); rwa_compute_destroy(c); bg_unlock(); return [self bgFail:error with:@"_MTLComputePipelineState refused to initialise"]; }
    p->_owner = self;

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
-// bgmtl-inject.dylib: puts BGMTLDevice into ONE process, MercuryPosterExtension, and nowhere else.
+// bgmtl-inject.dylib: puts BGMTLDevice into the poster extensions on its allow-list (Mercury, Photos) and nowhere else.
 //
 // Linked into the extension's executable as an extra LC_LOAD_DYLIB (like sweetfp.dylib into PosterBoard: Renegade's `bgmtl` feature, OFF by
 // default). The constructor does nothing unless every gate is open:
-//   1. the process is on the allow-list by bundle identifier (compiled in: com.apple.MercuryPoster);
+//   1. the process is on the allow-list by bundle identifier (compiled in: com.apple.MercuryPoster and, since iOS 26, whose Photos
+//      poster aborts in NeutrinoCore without a Metal device, com.apple.PhotosUIPrivate.PhotosPosterProvider);
 //   2. /private/var/tmp/bgmtl.arm exists (the dylib is inert until a person arms it) and /private/var/tmp/bgmtl.off does not (kill switch);
 //   3. the in-process dead-man has not tripped: two unclean launches in a row (state file) write bgmtl.off and the process runs as stock;
 //   4. the kernel reports the GPU ready and not lost (SWEET_GPU_SEL_INFO, flags & 3);
@@ -48,7 +49,7 @@ extern int bgmtl_gpu_state(unsigned *abi_minor);
 #define F_BB_ARM "/private/var/tmp/bgmtl-bb.arm"
 #define F_BB_STATE "/private/var/tmp/bgmtl-bb.state"
 
-static const char *const kAllow[] = { "com.apple.MercuryPoster", NULL };
+static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider", NULL };
 static volatile int g_failures, g_registered, g_bb;
 static volatile unsigned g_completed;
 
@@ -394,6 +395,11 @@ bgmtl_inject_init(void)
       NSArray *pre = all();
       ilog("devices before registration: %lu", (unsigned long)[pre count]);
       install_diag();
+      // CoreImage builds Metal libraries from CIKL source kernels at run time ("MTL DAG") and reads their -[MTLFunction arguments];
+      // those come back empty here, and +[CIKernel kernelsWithString:...] then copies N argument types into an empty vector
+      // (SIGSEGV in CIKernelReflection::consolidate, PhotosPosterProvider on iOS 26). CoreImage reads this switch from the
+      // environment first, so it is set before any CIKernel exists.
+      setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
       add(dev);
       g_registered = 1;
       ilog("%s: BGMTLDevice registered in this process (kernel ABI minor %u)", [bid UTF8String], minor);

@@ -564,6 +564,13 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_unpack_unorm_4x8(&c->b, a[0]);
       if (air_nir_bit_size(c, in->base.type) == 16)
          r = nir_f2f16(&c->b, r);
+   } else if (!strcmp(op, "pack") && n->num >= 2 && !strcmp(n->part[1], "unorm4x8")) {
+      /* Bergamota (iOS 26, VideoToolbox): the inverse, pack_float_to_unorm4x8 -- clamp to [0, 1], times 255, rounded to
+       * nearest, component 0 in the LOW byte; GLSL's packUnorm4x8 and so NIR's opcode. The half form (.v4f16) widens first. */
+      nir_def *x = a[0];
+      if (x->bit_size != 32)
+         x = nir_f2f32(&c->b, x);
+      r = nir_pack_unorm_4x8(&c->b, x);
    } else if (!strcmp(op, "convert")) {
       /* air.convert.<dst sign>.<dst type>.<src sign>.<src type> */
       if (n->num < 5) {
@@ -1166,6 +1173,20 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       if (!a)
          return false;
       air_set(c, &in->base, air_val_ssa(c, nir_fabs(&c->b, a)));
+      return true;
+   }
+   /* Bergamota (iOS 26): the integer min/max LLVM folds `select (icmp)` into; VideoToolbox's VTMTSComputeFunction1x1 has
+    * llvm.umax.i32 */
+   static const struct { const char *p; nir_op op; } minmax[] = {
+      { "llvm.smax.", nir_op_imax }, { "llvm.smin.", nir_op_imin }, { "llvm.umax.", nir_op_umax }, { "llvm.umin.", nir_op_umin },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(minmax); i++) {
+      if (strncmp(name, minmax[i].p, strlen(minmax[i].p)))
+         continue;
+      nir_def *a = air_get_ssa(c, in->operands[1]), *b = air_get_ssa(c, in->operands[2]);
+      if (!a || !b)
+         return false;
+      air_set(c, &in->base, air_val_ssa(c, nir_build_alu2(&c->b, minmax[i].op, a, b)));
       return true;
    }
    if (!strcmp(name, "llvm.trap"))
