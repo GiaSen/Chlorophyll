@@ -22,6 +22,7 @@
 #ifndef AIR_METAL_H
 #define AIR_METAL_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -576,6 +577,11 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 			 const struct rwa_buffer_bind *table, unsigned table_count,
 			 const unsigned groups[3], const unsigned group_size[3],
 			 char *why, size_t why_size);
+
+/* Whether rwa_dispatch / rwa_dispatch_buffers wait for the GPU before they return (the default, true). A driver whose
+ * command buffers wait once at their end (rwa_flush + rwa_fence_wait) turns it off, as draws already do not wait; a
+ * failure then surfaces at that wait instead of naming the dispatch. A new symbol: an older library simply lacks it. */
+void rwa_device_set_dispatch_wait(struct rwa_device *device, bool wait);
 
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);

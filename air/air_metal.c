@@ -133,6 +133,25 @@ struct rwa_device {
    struct pipe_sampler_view *bound_views[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
    void *bound_samplers[PIPE_SHADER_TYPES][RWA_MAX_TEXTURES];
    unsigned n_bound_views[PIPE_SHADER_TYPES], n_bound_samplers[PIPE_SHADER_TYPES];
+
+   /* Chlorophyll: the graphics state the last draw bound (no references), so that a draw binding the same skips the
+    * call. freedreno marks its state dirty on every bind whether or not it changed, and a vs/fs bind costs an
+    * ir3_cache_lookup at the next draw; CoreAnimation draws dozens of small passes a frame with a handful of pipelines.
+    * Forgotten (shadow_forget) wherever one of these objects is deleted; freedreno's blitter saves and restores the same
+    * objects around its blits, so those leave it true. RWA_NO_STATE_SHADOW=1 binds everything every draw again. */
+   struct {
+      bool valid;
+      struct pipe_viewport_state viewport;
+      struct pipe_scissor_state scissor;
+      struct pipe_stencil_ref stencil_ref;
+      void *blend, *dsa, *rast, *vs, *fs, *velem;
+      struct pipe_resource *vb_res[PIPE_MAX_ATTRIBS];
+      unsigned vb_offset[PIPE_MAX_ATTRIBS];
+      unsigned nvb;
+   } last;
+
+   /* Chlorophyll: whether a dispatch returns without waiting for the GPU (rwa_device_set_dispatch_wait). */
+   bool dispatch_no_wait;
 };
 
 /* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
@@ -159,6 +178,14 @@ unbind_tex_state(struct rwa_device *device, const void *p)
       memset(device->bound_samplers[st], 0, sizeof(device->bound_samplers[st]));
       device->n_bound_views[st] = device->n_bound_samplers[st] = 0;
    }
+}
+
+/* Forget the graphics state the last draw bound (rwa_device.last): the next draw binds everything. */
+static void
+shadow_forget(struct rwa_device *device)
+{
+   if (device)
+      device->last.valid = false;
 }
 
 /*
@@ -354,13 +381,14 @@ struct rwa_compute {
     */
    bool compare_sampler[RWA_MAX_TEXTURES];
 
-   /* One compiled state, not a cache. The threadgroup size is a dispatch argument in
-    * Metal and a shader constant to both Gallium drivers here, so the state belongs to
-    * a size; a caller that alternates two sizes recompiles each time, which is a cost
-    * no caller here pays and cheaper than an eviction policy a library cannot choose.
-    */
-   void *cso;
-   unsigned cso_block[3];
+   /* Chlorophyll: a few compiled states, one per threadgroup size (a dispatch argument in Metal and a shader constant
+    * to the Gallium drivers here). It was one state, deleted and recompiled whenever the size changed; with dispatches
+    * no longer waiting for the GPU (rwa_device_set_dispatch_wait) a deleted state could still be in flight, so a full
+    * cache now waits for the GPU before it evicts, and eviction is rare. */
+#define RWA_COMPUTE_STATES 4
+   void *cso[RWA_COMPUTE_STATES];
+   unsigned cso_block[RWA_COMPUTE_STATES][3];
+   unsigned cso_next;   /* the slot the next new size goes into */
 };
 
 /* The argument-buffer recorder, whose own block is further down beside the encode calls
@@ -3628,8 +3656,9 @@ rwa_compute_destroy(struct rwa_compute *compute)
 {
    if (!compute)
       return;
-   if (compute->cso)
-      delete_compute_state(compute->device, compute->cso);
+   for (unsigned i = 0; i < RWA_COMPUTE_STATES; i++)
+      if (compute->cso[i])
+         delete_compute_state(compute->device, compute->cso[i]);
    /* and the states built for the samplers the shader declared itself. Nothing is
     * unbound first, for the reason rwa_sampler_destroy gives: a dispatch leaves
     * nothing of its own bound.
@@ -3659,19 +3688,26 @@ rwa_compute_destroy(struct rwa_compute *compute)
  * threadgroup size into the code, so the shader as translated has to stay untouched for
  * the next size.
  */
+static int finish_or_say_why(struct rwa_device *device, bool required, const char *what, char *why, size_t why_size);
+
 static void *
 compute_state_for(struct rwa_compute *compute, const unsigned block[3],
                   char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
 
-   if (compute->cso && compute->cso_block[0] == block[0] &&
-       compute->cso_block[1] == block[1] && compute->cso_block[2] == block[2])
-      return compute->cso;
+   for (unsigned i = 0; i < RWA_COMPUTE_STATES; i++)
+      if (compute->cso[i] && compute->cso_block[i][0] == block[0] &&
+          compute->cso_block[i][1] == block[1] && compute->cso_block[i][2] == block[2])
+         return compute->cso[i];
 
-   if (compute->cso) {
-      delete_compute_state(device, compute->cso);
-      compute->cso = NULL;
+   unsigned slot = compute->cso_next % RWA_COMPUTE_STATES;
+   if (compute->cso[slot]) {
+      /* a dispatch of this state may not have run yet: let it finish before the state goes */
+      char w2[256];
+      finish_or_say_why(device, false, "dispatch", w2, sizeof(w2));
+      delete_compute_state(device, compute->cso[slot]);
+      compute->cso[slot] = NULL;
    }
 
    nir_shader *cs = nir_shader_clone(NULL, compute->nir);
@@ -3725,10 +3761,11 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
       }
    }
 
-   compute->cso = cso;
-   compute->cso_block[0] = block[0];
-   compute->cso_block[1] = block[1];
-   compute->cso_block[2] = block[2];
+   compute->cso[slot] = cso;
+   compute->cso_block[slot][0] = block[0];
+   compute->cso_block[slot][1] = block[1];
+   compute->cso_block[slot][2] = block[2];
+   compute->cso_next = slot + 1;
    return cso;
 }
 
@@ -4690,9 +4727,25 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * and call it a result. rwa_finish is for a caller that wants to wait again, or to
     * wait for work dispatched through another pipeline of the same device.
     */
-   int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
+   /* Chlorophyll: a Metal command buffer waits once, at its end (rwa_flush + rwa_fence_wait), and its buffers stay
+    * referenced until then, as with draws; waiting per dispatch cost a full GPU round trip for each of CoreAnimation's
+    * luma kernels every frame. The library's own callers (air_run, the tests) keep the wait. */
+   /* Without the wait, the ordering Metal promises between the dispatches of a command buffer (and the draws after them)
+    * has to be asked for: Gallium does not order a launch_grid against the next one, so a kernel reading what the one
+    * before it wrote raced it -- on the first try Mercury's first frame hung the GPU (a kernel looping on half-written
+    * input) and the kernel declared it lost. The wait gave the same ordering implicitly. */
+   if (device->dispatch_no_wait)
+      pipe->memory_barrier(pipe, PIPE_BARRIER_ALL);
+   int rc = device->dispatch_no_wait ? 0 : finish_or_say_why(device, true, "dispatch", why, why_size);
    unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
    return rc;
+}
+
+void
+rwa_device_set_dispatch_wait(struct rwa_device *device, bool wait)
+{
+   if (device)
+      device->dispatch_no_wait = !wait;
 }
 
 int
@@ -5470,6 +5523,7 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
     * leaves the context pointing at freed memory until something else is bound over it
     * -- the same trap delete_compute_state is about.
     */
+   shadow_forget(state->device);
    state->device->pipe->bind_depth_stencil_alpha_state(state->device->pipe, NULL);
    state->device->pipe->delete_depth_stencil_alpha_state(state->device->pipe, state->cso);
    free(state);
@@ -7431,6 +7485,7 @@ rwa_render_destroy(struct rwa_render *render)
    if (!render)
       return;
    struct pipe_context *pipe = render->device->pipe;
+   shadow_forget(render->device);
 
    /* Unbound before deleted, each of them, for the reason delete_compute_state and
     * rwa_sampler_destroy give: a Gallium context holds a pointer to the state bound in
@@ -7958,7 +8013,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    float znear = draw->depth_range ? draw->depth_range[0] : 0.0f;
    float zfar = draw->depth_range ? draw->depth_range[1] : 1.0f;
-   pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+   static int no_shadow = -1;
+   if (no_shadow < 0)
+      no_shadow = getenv("RWA_NO_STATE_SHADOW") && getenv("RWA_NO_STATE_SHADOW")[0] == '1';
+   const bool shadow = !no_shadow && device->last.valid;
+   struct pipe_viewport_state vp;
+   memset(&vp, 0, sizeof(vp));   /* compared with memcmp below: no stray padding */
+   vp = (struct pipe_viewport_state){
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
        * y = +1 belongs in memory row 0; a positive y scale puts clip y = -1 there, which is
@@ -7972,7 +8033,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * (100+x, 200+(3-y), ...), the texture mirrored vertically, on both back ends.
        */
       .scale = { w / 2.0f, -(h / 2.0f), zfar - znear },
-      .translate = { w / 2.0f, h / 2.0f, znear } });
+      .translate = { w / 2.0f, h / 2.0f, znear } };
+   if (!shadow || memcmp(&vp, &device->last.viewport, sizeof(vp))) {
+      pipe->set_viewport_states(pipe, 0, 1, &vp);
+      device->last.viewport = vp;
+   }
 
    {
       /* Chlorophyll: Metal's scissor test (see rwa_draw.scissor), clamped to the attachment as Metal requires. */
@@ -7983,24 +8048,40 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          unsigned y1 = MIN2((uint64_t)draw->scissor[1] + draw->scissor[3], h);
          sc = (struct pipe_scissor_state){ .minx = x0, .miny = y0, .maxx = x1, .maxy = y1 };
       }
-      pipe->set_scissor_states(pipe, 0, 1, &sc);
+      if (!shadow || memcmp(&sc, &device->last.scissor, sizeof(sc))) {
+         pipe->set_scissor_states(pipe, 0, 1, &sc);
+         device->last.scissor = sc;
+      }
    }
-   pipe->bind_blend_state(pipe, render->blend);
+   void *dsa = draw->depth_stencil ? draw->depth_stencil->cso : render->dsa;
+   struct pipe_stencil_ref sref = {
+      .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
+                     (uint8_t)(draw->stencil_reference[1] & 0xff) } };
+   if (!shadow || device->last.blend != render->blend)
+      pipe->bind_blend_state(pipe, render->blend);
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
     * behaviour with no MTLDepthStencilState set: no test and no write.
     */
-   pipe->bind_depth_stencil_alpha_state(pipe, draw->depth_stencil ? draw->depth_stencil->cso
-                                                                  : render->dsa);
+   if (!shadow || device->last.dsa != dsa)
+      pipe->bind_depth_stencil_alpha_state(pipe, dsa);
    /* Metal keeps the reference value on the encoder and not in the state object, so it
     * is set per draw. Gallium's is one byte per face, which is the stencil buffer's
     * width; Metal's is a uint32 and only those bits can match anything.
     */
-   pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
-      .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
-                     (uint8_t)(draw->stencil_reference[1] & 0xff) } });
-   pipe->bind_rasterizer_state(pipe, render->rast);
-   pipe->bind_vs_state(pipe, render->vs_cso);
-   pipe->bind_fs_state(pipe, render->fs_cso);
+   if (!shadow || memcmp(&sref, &device->last.stencil_ref, sizeof(sref)))
+      pipe->set_stencil_ref(pipe, sref);
+   if (!shadow || device->last.rast != render->rast)
+      pipe->bind_rasterizer_state(pipe, render->rast);
+   if (!shadow || device->last.vs != render->vs_cso)
+      pipe->bind_vs_state(pipe, render->vs_cso);
+   if (!shadow || device->last.fs != render->fs_cso)
+      pipe->bind_fs_state(pipe, render->fs_cso);
+   device->last.blend = render->blend;
+   device->last.dsa = dsa;
+   device->last.stencil_ref = sref;
+   device->last.rast = render->rast;
+   device->last.vs = render->vs_cso;
+   device->last.fs = render->fs_cso;
 
    /*
     * The vertex state, bound on BOTH paths and never NULL.
@@ -8071,8 +8152,28 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * set_vertex_buffers rather than in draw_vbo. Neither driver here does, so the
     * other order worked; it worked by permission and not by contract.
     */
-   pipe->bind_vertex_elements_state(pipe, render->velem);
-   pipe->set_vertex_buffers(pipe, nvb, vbs);
+   /* With the shadow: the elements only when they changed, and the buffers when either changed (p_context.h's order
+    * rule above holds for every call that is made). An equal buffer list keeps the references freedreno already has,
+    * so the ones taken above are dropped; a resource compared by pointer cannot have been freed and reused while the
+    * context still holds its reference. */
+   bool vb_same = shadow && device->last.velem == render->velem && device->last.nvb == nvb;
+   for (unsigned k = 0; vb_same && k < nvb; k++)
+      vb_same = device->last.vb_res[k] == vbs[k].buffer.resource && device->last.vb_offset[k] == vbs[k].buffer_offset;
+   if (!shadow || device->last.velem != render->velem)
+      pipe->bind_vertex_elements_state(pipe, render->velem);
+   if (vb_same) {
+      for (unsigned k = 0; k < nvb; k++)
+         pipe_resource_reference(&vbs[k].buffer.resource, NULL);
+   } else {
+      for (unsigned k = 0; k < nvb; k++) {
+         device->last.vb_res[k] = vbs[k].buffer.resource;
+         device->last.vb_offset[k] = vbs[k].buffer_offset;
+      }
+      device->last.nvb = nvb;
+      pipe->set_vertex_buffers(pipe, nvb, vbs);
+   }
+   device->last.velem = render->velem;
+   device->last.valid = true;
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
    int rc = -1;

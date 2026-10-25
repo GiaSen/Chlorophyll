@@ -486,6 +486,8 @@ ensure_protocol(Class cls, const char *proto)
    if (!self) return nil;
    _rwa = rwa_device_open(_why, sizeof(_why));
    BG_LOG("rwa_device_open: %s\n", _rwa ? rwa_device_name(_rwa) : _why);
+   // a command buffer waits once at its end, so a dispatch need not wait for itself (/private/var/tmp/bgmtl.dispatchwait: it does)
+   if (_rwa && access("/private/var/tmp/bgmtl.dispatchwait", F_OK) != 0) rwa_device_set_dispatch_wait(_rwa, false);
    return self;
 }
 
@@ -1647,6 +1649,50 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 - (id)blitCommandEncoderWithDescriptor:(id)d { (void)d; return [self blitCommandEncoder]; }
 @end
 
+// setBytes / setVertexBytes / setFragmentBytes: a slice of a shared 64 KB slab instead of a buffer of its own. Each call
+// used to make a GPU buffer (a GEM allocation and a permanent mapping) for a few dozen bytes, many times a frame in the
+// compositor. Slices are 256-byte aligned, so a constant buffer binds in place without the offset-delta path. A slab is
+// reused once nothing but the pool holds it: the work recorded with it retains it until its command buffer completes, and
+// the encoder that asked holds it until then too, so a slab can never be handed out again while a slice of it is waiting
+// to be recorded. /private/var/tmp/bgmtl.nobytesring: a buffer per call, as before.
+#define BG_SLAB_SIZE (64u * 1024u)
+#define BG_SLAB_ALIGN 256u
+static BGMTLBuffer *
+bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUInteger *offset)
+{
+   static int off = -1;
+   static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+   static NSMutableArray *slabs;   // every slab made; the pool holds one reference to each
+   static BGMTLBuffer *cur;        // the slab being filled (one more reference)
+   static NSUInteger used;
+   if (off < 0) off = access("/private/var/tmp/bgmtl.nobytesring", F_OK) == 0;
+   NSUInteger need = (MAX(length, (NSUInteger)1) + BG_SLAB_ALIGN - 1) & ~(NSUInteger)(BG_SLAB_ALIGN - 1);
+   if (off || !bytes || need > BG_SLAB_SIZE / 4) return nil;
+   BGMTLBuffer *slab = nil;
+   os_unfair_lock_lock(&lk);
+   if (!slabs) slabs = [[NSMutableArray alloc] init];
+   if (!cur || used + need > BG_SLAB_SIZE) {
+      [cur release];
+      cur = nil;
+      for (BGMTLBuffer *s in slabs)
+         if ([s retainCount] == 1) { cur = [s retain]; break; }   // only the pool holds it: no slice of it is in use
+      if (!cur) {
+         BGMTLBuffer *s = [dev newBufferWithLength:BG_SLAB_SIZE options:0];
+         if (s && [s contents]) { [slabs addObject:s]; cur = s; }
+         else [s release];
+      }
+      used = 0;
+   }
+   if (cur) {
+      memcpy((uint8_t *)[cur contents] + used, bytes, length);
+      *offset = used;
+      used += need;
+      slab = [[cur retain] autorelease];
+   }
+   os_unfair_lock_unlock(&lk);
+   return slab;
+}
+
 @implementation BGMTLComputeEncoder
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb
 {
@@ -1670,10 +1716,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 - (void)setSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _samplers[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
-   id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:length < 16 ? 16 : length options:0] autorelease];
+   NSUInteger off = 0;
+   id b = bg_bytes_slice((BGMTLDevice *)[self device], bytes, length, &off);
+   if (!b) b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:length < 16 ? 16 : length options:0] autorelease];
    if (!b) { BG_LOG("setBytes: no buffer\n"); return; }
-   [_scratch addObject:b];
-   [self setBuffer:b offset:0 atIndex:index];
+   if ([_scratch lastObject] != b) [_scratch addObject:b];
+   [self setBuffer:b offset:off atIndex:index];
 }
 - (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)size
 {
@@ -2233,14 +2281,18 @@ bg_attachment_view(id tex, NSUInteger level, NSUInteger slice)
       BG_LOG("  last 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", t[0], t[1], t[2], t[3],
              t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
    }
-   id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
-   if (b) { [_scratch addObject:b]; [self setVertexBuffer:b offset:0 atIndex:i]; }
+   NSUInteger off = 0;
+   id b = bg_bytes_slice((BGMTLDevice *)[self device], bytes, l, &off);
+   if (!b) b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
+   if (b) { if ([_scratch lastObject] != b) [_scratch addObject:b]; [self setVertexBuffer:b offset:off atIndex:i]; }
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
    BG_TRACE("setFragmentBytes length %lu index %lu\n", (unsigned long)l, (unsigned long)i);
-   id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
-   if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
+   NSUInteger off = 0;
+   id b = bg_bytes_slice((BGMTLDevice *)[self device], bytes, l, &off);
+   if (!b) b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
+   if (b) { if ([_scratch lastObject] != b) [_scratch addObject:b]; [self setFragmentBuffer:b offset:off atIndex:i]; }
 }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
 {

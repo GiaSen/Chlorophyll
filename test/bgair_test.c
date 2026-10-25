@@ -575,6 +575,68 @@ main(int argc, char **argv)
       CHECK(ok && !bad1 && !bad0, "render into level 1: %u wrong in level 1, %u changed in level 0%s%s", bad1, bad0, ok ? "" : ": ", ok ? "" : why2);
       printf("  render into level 1 via a view: %u wrong in level 1, %u changed in level 0%s%s\n", bad1, bad0, ok ? "" : ": ", ok ? "" : why2);
    }
+   { // dispatches that do not wait (what the Metal driver does): bg_add three times with three threadgroup sizes into three
+     // outputs, then one wait for all of them; then a fourth and fifth size, so the compute state cache evicts one in use
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_add", &info);
+      enum { N = 256 };
+      struct rwa_buffer *a = c ? buf(N * 4) : NULL, *b = a ? buf(N * 4) : NULL, *n = b ? buf(16) : NULL, *out[5] = { NULL };
+      for (unsigned k = 0; n && k < 5; k++) out[k] = buf(N * 4);
+      bool ok = out[4] != NULL;
+      char why2[512] = { 0 };
+      if (ok) {
+         float *pa = rwa_buffer_map(a), *pb = rwa_buffer_map(b);
+         for (unsigned i = 0; i < N; i++) { pa[i] = (float)i; pb[i] = 1000.0f; }
+         *(uint32_t *)rwa_buffer_map(n) = N;
+         for (unsigned k = 0; k < 5; k++) memset(rwa_buffer_map(out[k]), 0, N * 4);
+         rwa_device_set_dispatch_wait(dev, false);
+         static const unsigned sizes[5] = { 64, 32, 128, 16, 256 };
+         for (unsigned k = 0; ok && k < 5; k++) {
+            struct rwa_buffer *bufs[4] = { a, b, out[k], n };
+            struct rwa_bindings bb = { .buffers = bufs, .buffer_count = 4 };
+            unsigned groups[3] = { N / sizes[k], 1, 1 }, gs[3] = { sizes[k], 1, 1 };
+            ok = rwa_dispatch(c, &bb, groups, gs, why2, sizeof(why2)) == 0;
+         }
+         ok = ok && rwa_finish(dev, why2, sizeof(why2)) == 0;
+         rwa_device_set_dispatch_wait(dev, true);
+      }
+      unsigned bad = 0;
+      for (unsigned k = 0; ok && k < 5; k++) {
+         const float *po = rwa_buffer_map(out[k]);
+         for (unsigned i = 0; i < N; i++) if (po[i] != 2000.0f + (float)i) bad++;
+      }
+      CHECK(ok && !bad, "dispatch without waiting: %u wrong of 5x%u%s%s", bad, (unsigned)N, ok ? "" : ": ", ok ? "" : why2);
+      printf("  5 dispatches without waiting (sizes 64/32/128/16/256), one finish: %u wrong%s%s\n", bad, ok ? "" : ": ", ok ? "" : why2);
+   }
+   { // dependent dispatches without waiting: bg_copy a -> b, then b -> c, then c -> d, one finish; d must equal a
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_copy", &info);
+      enum { N = 4096 };
+      struct rwa_buffer *v[4] = { NULL }, *n = c ? buf(16) : NULL;
+      for (unsigned k = 0; n && k < 4; k++) v[k] = buf(N * 4);
+      bool ok = v[3] != NULL;
+      char why2[512] = { 0 };
+      if (ok) {
+         uint32_t *pa = rwa_buffer_map(v[0]);
+         for (unsigned i = 0; i < N; i++) pa[i] = 0x9e3779b9u * (i + 1);
+         for (unsigned k = 1; k < 4; k++) memset(rwa_buffer_map(v[k]), 0, N * 4);
+         *(uint32_t *)rwa_buffer_map(n) = N;
+         rwa_device_set_dispatch_wait(dev, false);
+         for (unsigned k = 0; ok && k < 3; k++) {
+            struct rwa_buffer *bufs[3] = { v[k], v[k + 1], n };
+            struct rwa_bindings bb = { .buffers = bufs, .buffer_count = 3 };
+            unsigned groups[3] = { N / 64, 1, 1 }, gs[3] = { 64, 1, 1 };
+            ok = rwa_dispatch(c, &bb, groups, gs, why2, sizeof(why2)) == 0;
+         }
+         ok = ok && rwa_finish(dev, why2, sizeof(why2)) == 0;
+         rwa_device_set_dispatch_wait(dev, true);
+      }
+      unsigned bad = 0;
+      const uint32_t *pa = ok ? rwa_buffer_map(v[0]) : NULL, *pd = ok ? rwa_buffer_map(v[3]) : NULL;
+      for (unsigned i = 0; ok && i < N; i++) if (pd[i] != pa[i]) bad++;
+      CHECK(ok && !bad, "dependent dispatches without waiting: %u wrong of %u%s%s", bad, (unsigned)N, ok ? "" : ": ", ok ? "" : why2);
+      printf("  3 dependent copies without waiting, one finish: %u wrong%s%s\n", bad, ok ? "" : ": ", ok ? "" : why2);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;
