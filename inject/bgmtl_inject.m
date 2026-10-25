@@ -355,7 +355,10 @@ __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
    @autoreleasepool {
-      if (getenv("BGMTL_BB") && !strcmp(getprogname(), "backboardd")) {   // bgl-launch chose Metal for this launch
+      // bgl-launch chose Metal for this launch; on iOS 26 there is no bgl-launch (and dyld ignores DYLD_* for backboardd), so the
+      // inject is weakly linked into a re-signed backboardd and /private/var/tmp/bgmtl-bb.direct stands in for BGMTL_BB=1
+      // (bgmtl-bb.arm, bgmtl-bb.off, the GPU state and the watchdog still apply in bb_init)
+      if ((getenv("BGMTL_BB") || exists("/private/var/tmp/bgmtl-bb.direct")) && !strcmp(getprogname(), "backboardd")) {
          bb_init();
          return;
       }
