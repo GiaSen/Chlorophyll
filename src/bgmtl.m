@@ -2147,6 +2147,7 @@ static id
 bg_attachment_view(id tex, NSUInteger level, NSUInteger slice)
 {
    if (!tex || (level == 0 && slice == 0)) return tex;
+   if (access("/private/var/tmp/bgmtl.nolevels", F_OK) == 0) return tex;   // debugging: the old behaviour, switchable live
    NSUInteger type = [(id<MTLTexture>)tex sampleCount] > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
    id v = [(BGMTLTexture *)tex newTextureViewWithPixelFormat:[(id<MTLTexture>)tex pixelFormat] textureType:type
                                                        levels:NSMakeRange(level, 1) slices:NSMakeRange(slice, 1)];

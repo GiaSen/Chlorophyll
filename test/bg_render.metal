@@ -45,3 +45,7 @@ fragment float4 bg_fs_tex3(V in [[stage_in]], texture2d<float> t [[texture(3)]],
 // a fragment stage with the varyings of CoreAnimation's std_vert0_*: color (float4) and texcoord0_0 (float2)
 struct CAV { float4 pos [[position]]; float4 color; float2 texcoord0_0; };
 fragment float4 bg_fs_ca_color(CAV in [[stage_in]]) { return in.color; }
+
+// two colour outputs (CoreAnimation 26's blur downsample: a mip-level view and a full-size target in one pass)
+struct Two { float4 a [[color(0)]]; float4 b [[color(1)]]; };
+fragment Two bg_fs_two(V in [[stage_in]]) { Two o; o.a = in.color; o.b = in.color.bgra; return o; }

@@ -7544,7 +7544,10 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
          say(why, why_size, "colour attachment %u (%s) was made without MTLTextureUsageRenderTarget", i, t->format_name);
          goto fail;
       }
-      if (present++ == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
+      /* the area every attachment covers, as a draw's pass (rwa_render_draw): a pass of a mip-level view and a
+       * full-size target clears only what it renders */
+      unsigned tw = t->shape.width, th = t->shape.height ? t->shape.height : 1;
+      if (present++ == 0) { w = tw; h = th; } else { w = MIN2(w, tw); h = MIN2(h, th); }
       surf[i] = texture_surface(t);
       if (!surf[i]) { say(why, why_size, "no render surface for colour attachment %u", i); goto fail; }
       fb.cbufs[i] = surf[i];
@@ -7554,7 +7557,8 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_clear *clear, char 
    }
    if (clear->depth) {
       struct rwa_texture *t = clear->depth;
-      if (present == 0) { w = t->shape.width; h = t->shape.height ? t->shape.height : 1; }
+      unsigned tw = t->shape.width, th = t->shape.height ? t->shape.height : 1;
+      if (present == 0) { w = tw; h = th; } else { w = MIN2(w, tw); h = MIN2(h, th); }
       zsurf = texture_surface(t);
       if (!zsurf) { say(why, why_size, "no render surface for the depth attachment"); goto fail; }
       fb.zsbuf = zsurf;
@@ -7794,7 +7798,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
 
    /* Each colour attachment: a 2D texture, made as a render target, of the format the
-    * pipeline was compiled for, and all the same size -- one render pass has one size.
+    * pipeline was compiled for. The pass renders the area all of them cover.
     */
    unsigned samples = render->shape.sample_count ? render->shape.sample_count : 1;
    unsigned w = 0, h = 0, present = 0;
@@ -7821,13 +7825,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       unsigned tw = t->shape.width;
       unsigned th = t->shape.height ? t->shape.height : 1;
+      /* Chlorophyll: attachments of different sizes are legal in Metal, which renders the area they all cover (CoreAnimation
+       * 26's blur downsamples write a mip-level view and a full-size second target at once: refusing skipped every one of them,
+       * and Liquid Glass over the wallpaper refracted an unbuilt backdrop) */
       if (present++ == 0) {
          w = tw;
          h = th;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "colour attachment %u is %ux%u and the first one is %ux%u", i,
-             tw, th, w, h);
-         return -1;
+      } else {
+         w = MIN2(w, tw);
+         h = MIN2(h, th);
       }
    }
 
@@ -7861,10 +7867,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       if (present == 0) {
          w = tw;        /* a depth-only pass: the depth attachment is the pass's size */
          h = th;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "the depth attachment is %ux%u and colour attachment 0 is %ux%u",
-             tw, th, w, h);
-         return -1;
+      } else {
+         w = MIN2(w, tw);       /* the area every attachment covers, as with the colour ones */
+         h = MIN2(h, th);
       }
    }
 
