@@ -2094,6 +2094,65 @@ imageblock_op(struct air_ctx *c, const struct air_inst *in, const struct air_nam
    return true;
 }
 
+/* Chlorophyll: the two answers of a texture operation made on both of two textures, chosen
+ * leaf by leaf (a sample's { value, residency } is an aggregate).
+ */
+static struct air_val *
+select_vals(struct air_ctx *c, nir_def *cond, struct air_val *a, struct air_val *b)
+{
+   if (!a || !b || a->kind != b->kind)
+      return NULL;
+   if (a->kind == AIR_VAL_SSA)
+      return air_val_ssa(c, nir_bcsel(&c->b, cond, a->def, b->def));
+   if (a->kind != AIR_VAL_AGG || a->num_elems != b->num_elems)
+      return NULL;
+   struct air_val *v = rzalloc(c->mem_ctx, struct air_val);
+   v->kind = AIR_VAL_AGG;
+   v->num_elems = a->num_elems;
+   v->elems = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(a->num_elems, 1));
+   for (unsigned i = 0; i < a->num_elems; i++)
+      if (!(v->elems[i] = select_vals(c, cond, a->elems[i], b->elems[i])))
+         return NULL;
+   return v;
+}
+
+/* Chlorophyll: a texture operation on a texture CHOSEN at run time (AIR_VAL_PTR_SELECT, from a
+ * select or from a phi of two textures: Mercury's space::rasterizeBackgroundFragment samples
+ * goboTexture or secondaryGoboTexture). A texture is not a value to load, so the operation is
+ * made on both and the answers selected -- in the same control flow, which keeps a sample's
+ * implicit derivatives. A write is refused: it would need an if, and this CFG is unstructured
+ * (nir_goto) until nir_lower_goto_ifs.
+ */
+static bool
+texture_op_chosen(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
+{
+   struct air_val *v = in->num_operands > 1 ? air_get(c, in->operands[1]) : NULL;
+   if (!v || v->kind != AIR_VAL_PTR_SELECT)
+      return texture_op(c, in, n);
+   if (v->num_elems != 2 || !v->elems[0] || !v->elems[1] ||
+       v->elems[0]->kind != AIR_VAL_PTR || v->elems[1]->kind != AIR_VAL_PTR)
+      return air_error(c, "intrinsic: air.%s on a texture chosen between more than two", n->part[0]);
+   if (strstr(n->part[0], "write") || strstr(n->part[0], "atomic"))
+      return air_error(c, "intrinsic: air.%s to a texture chosen at run time", n->part[0]);
+   struct air_val *res[2] = { NULL, NULL };
+   for (unsigned s = 0; s < 2; s++) {
+      air_set(c, in->operands[1], v->elems[s]);
+      bool ok = texture_op(c, in, n);
+      air_set(c, in->operands[1], v);
+      if (!ok)
+         return false;
+      struct hash_entry *e = _mesa_hash_table_search(c->values, &in->base);
+      res[s] = e ? e->data : NULL;
+   }
+   if (!res[0] && !res[1])
+      return true;
+   struct air_val *sel = select_vals(c, v->def, res[0], res[1]);
+   if (!sel)
+      return air_error(c, "intrinsic: air.%s on a texture chosen at run time, whose two answers "
+                          "do not have one shape", n->part[0]);
+   air_set(c, &in->base, sel);
+   return true;
+}
 
 bool
 air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *name)
@@ -2178,7 +2237,7 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (strstr(op, "texture") || strstr(op, "_depth_") || !strncmp(op, "sample", 6) ||
        !strncmp(op, "gather", 6) || !strncmp(op, "read_", 5) || !strncmp(op, "write_", 6) ||
        strstr(op, "_lod_"))
-      return texture_op(c, in, &n);
+      return texture_op_chosen(c, in, &n);
 
    return air_error(c, "intrinsic: %s", name);
 }

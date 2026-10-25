@@ -116,6 +116,22 @@ same_ptr(const struct air_ptr *a, const struct air_ptr *b)
           nir_src_as_uint(nir_src_for_ssa(b->offset));
 }
 
+/* Chlorophyll: two different textures of one kind, which a phi may choose between at run
+ * time (resolve_pointer_phi), the operation on it being made on both (texture_op_chosen).
+ */
+static bool
+is_texture_choice(const struct air_ptr *a, const struct air_ptr *b)
+{
+   return a->class == AIR_PTR_TEXTURE && b->class == AIR_PTR_TEXTURE &&
+          a->is_image == b->is_image && !a->offset && !b->offset;
+}
+
+/* ... and the register that says which one came in, true for `first` */
+struct air_texture_phi {
+   nir_def *reg;
+   struct air_val *first;
+};
+
 static struct air_val *
 air_val_agg(struct air_ctx *c, unsigned n)
 {
@@ -4337,7 +4353,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
 static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable, const int *fold, unsigned phi_block)
 {
-   struct air_val *first = NULL;
+   struct air_val *first = NULL, *second = NULL;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
          continue;
@@ -4357,12 +4373,30 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
                                       : "not a resolved pointer");
       if (!first)
          first = v;
-      else if (!same_ptr(&first->ptr, &v->ptr))
+      else if (same_ptr(&first->ptr, &v->ptr) || (second && same_ptr(&second->ptr, &v->ptr)))
+         continue;
+      else if (!second && is_texture_choice(&first->ptr, &v->ptr))
+         second = v;
+      else
          return air_error(c, "instruction: a phi between pointers that name different "
                              "places, which would have to be chosen at run time");
    }
    if (!first)
       return air_error(c, "instruction: a phi of pointers with no reachable operand");
+   if (second) {
+      /* Chlorophyll: two textures (Mercury's space::rasterizeBackgroundFragment samples
+       * goboTexture or secondaryGoboTexture). Which edge came in is a 1-bit register,
+       * true for `first`, stored at the end of each predecessor with the other phis
+       * (translate_body); the texture operation is made on both (texture_op_chosen).
+       */
+      nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
+      struct air_texture_phi *tp = rzalloc(c->mem_ctx, struct air_texture_phi);
+      tp->reg = nir_decl_reg(&entry, 1, 1, 0);
+      tp->first = first;
+      _mesa_hash_table_insert(c->phi_regs, (void *)((uintptr_t)in | 2), tp);
+      air_set(c, &in->base, air_val_ptr_select(c, nir_load_reg(&c->b, tp->reg), first, second));
+      return true;
+   }
    air_set(c, &in->base, first);
    return true;
 }
@@ -4589,6 +4623,25 @@ translate_body(struct air_ctx *c)
             continue;
          struct hash_entry *rea = _mesa_hash_table_search(c->phi_regs, (void *)((uintptr_t)in | 1));
          struct hash_entry *re = rea ? NULL : _mesa_hash_table_search(c->phi_regs, in);
+         struct hash_entry *rt = _mesa_hash_table_search(c->phi_regs, (void *)((uintptr_t)in | 2));
+         if (rt) {
+            /* Chlorophyll: a phi of two textures (resolve_pointer_phi): which one came in */
+            const struct air_texture_phi *tp = rt->data;
+            for (unsigned k = 0; k < in->num_operands; k++) {
+               struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
+               if (!ce)
+                  continue;
+               if (fold[in->targets[k]->index] >= 0 && (unsigned)fold[in->targets[k]->index] != bi)
+                  continue;
+               struct air_val *av = air_get(c, in->operands[k]);
+               if (!av || av->kind != AIR_VAL_PTR)
+                  return air_error(c, "instruction: a phi of two textures with an operand that is not one");
+               c->b.cursor = *(nir_cursor *)ce->data;
+               nir_store_reg(&c->b, nir_imm_bool(&c->b, same_ptr(&tp->first->ptr, &av->ptr)), tp->reg);
+               *(nir_cursor *)ce->data = c->b.cursor;
+            }
+            continue;
+         }
          if (!re && !rea)
             continue; /* a phi in an unreachable block, or one of pointers */
          for (unsigned k = 0; k < in->num_operands; k++) {

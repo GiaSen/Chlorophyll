@@ -67,3 +67,16 @@ kernel void bg_mip_write(texture2d<float, access::write> t [[texture(0)]], const
    if (gid.x < w && gid.y < h)
       t.write(float4(float(w) / 255.0, float(h) / 255.0, float(lod) / 255.0, 1.0), gid, lod);
 }
+
+// read one of two textures chosen at run time, through a phi (Mercury's space::rasterizeBackgroundFragment samples goboTexture or
+// secondaryGoboTexture that way): which == 0 reads a, else b; the branch has a store of its own so that the choice stays a phi
+kernel void bg_tex_choice(texture2d<float, access::read> a [[texture(0)]], texture2d<float, access::read> b [[texture(1)]],
+                          constant uint &which [[buffer(0)]], device float4 *out [[buffer(1)]], uint gid [[thread_position_in_grid]])
+{
+   texture2d<float, access::read> t = b;
+   if (which == 0) {
+      t = a;
+      out[16 + gid] = float4(1.0);
+   }
+   out[gid] = t.read(uint2(gid, 0));
+}

@@ -264,6 +264,38 @@ main(int argc, char **argv)
          printf("  bg_mip_write (%u level%s): written at a level from a buffer, %u texels wrong\n", LEVELS, LEVELS > 1 ? "s" : "", bad);
       } else { fail++; printf("  bg_mip_write FAILED: %s\n", why2); }
    }
+   { // bg_tex_choice: a phi between two textures, which one a buffer value (0: a, 1: b)
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_tex_choice", &info);
+      struct rwa_texture_shape shape = { .pixel_format = 125, .type = 2, .width = 16, .height = 1, .depth = 1, .array_length = 1,
+                                         .mip_levels = 1, .sample_count = 1, .usage = 1 };
+      char why2[512] = { 0 };
+      struct rwa_texture *ta = c ? rwa_texture_create(dev, &shape, why2, sizeof(why2)) : NULL;
+      struct rwa_texture *tb = ta ? rwa_texture_create(dev, &shape, why2, sizeof(why2)) : NULL;
+      struct rwa_buffer *k = tb ? buf(16) : NULL, *o = k ? buf(32 * 16) : NULL;
+      float da[16 * 4], db[16 * 4];
+      for (unsigned i = 0; i < 16 * 4; i++) { da[i] = (float)i; db[i] = 1000.0f + i; }
+      unsigned origin[3] = { 0, 0, 0 }, size[3] = { 16, 1, 1 };
+      bool ok = o && rwa_texture_write(ta, 0, 0, origin, size, da, 0, why2, sizeof(why2)) == 0 &&
+                rwa_texture_write(tb, 0, 0, origin, size, db, 0, why2, sizeof(why2)) == 0;
+      unsigned bad = 0;
+      for (unsigned which = 0; ok && which < 2; which++) {
+         *(uint32_t *)rwa_buffer_map(k) = which;
+         memset(rwa_buffer_map(o), 0, 32 * 16);
+         struct rwa_buffer *bufs[2] = { k, o };
+         struct rwa_texture *texs[2] = { ta, tb };
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = 2, .textures = texs, .texture_count = 2 };
+         unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 16, 1, 1 };
+         ok = rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
+         const float *po = rwa_buffer_map(o), *want = which ? db : da;
+         for (unsigned i = 0; ok && i < 16 * 4; i++)
+            if (po[i] != want[i]) { if (bad++ < 3) printf("    which=%u out[%u]=%g want %g\n", which, i, po[i], want[i]); }
+         for (unsigned i = 16 * 4; ok && i < 32 * 4; i++)
+            if (po[i] != (which ? 0.0f : 1.0f)) { if (bad++ < 3) printf("    which=%u marker[%u]=%g\n", which, i - 64, po[i]); }
+      }
+      CHECK(ok && bad == 0, "bg_tex_choice %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
+      printf("  bg_tex_choice: %u wrong\n", bad);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;
