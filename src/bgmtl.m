@@ -145,6 +145,8 @@ bg_ctx_init(void)
    pthread_mutexattr_destroy(&a);
 }
 static void bg_lock(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, bg_ctx_init); pthread_mutex_lock(&bg_ctx_mutex); }
+// counts commits: a buffer-backed texture is filled from its buffer at most once per command buffer (BGMTLTexture _linSeq)
+static unsigned long g_bg_commit_seq;
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
 #define BG_MAX_BINDINGS 16
@@ -377,6 +379,7 @@ bg_install_fallback(Class c)
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
    dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
    int _slotReturned;                                      // the base queue's in-flight slot given back (bg_return_slot)
+   NSMutableSet *_linWritten;                              // buffer-backed textures this command buffer writes (bg_linear_written)
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgRecord:(BGWork *)work;
@@ -420,6 +423,8 @@ bg_install_fallback(Class c)
    @public
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
+   unsigned long _linSeq; // the commit (g_bg_commit_seq) it was last filled from its buffer in: once per command buffer
+   int _linPending;       // command buffers in flight that write it: no fill from the buffer until they wrote back
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    BOOL _surfCopy;       // an IOSurface the GPU could not import (row pitch not 64-aligned): own memory, refreshed from the surface at each use
    NSUInteger _ncLength;
@@ -432,6 +437,8 @@ bg_install_fallback(Class c)
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
 - (struct rwa_texture *)rwaTexture;
 - (struct rwa_texture *)rwaTextureSampled;   // also cleans the CPU cache of a surface another process wrote since
+- (void)bgLinearPending:(int)delta;
+- (void)bgLinearWriteBack;
 @end
 
 @interface BGMTLSampler : _MTLSamplerState {
@@ -1136,6 +1143,11 @@ bg_air_slice(NSData *d)
    t->_linBpr = bpr;
    return t;
 }
+// MTLBuffer's own texture over its memory (iOS 26's IconRendering: "Could not make MTLTexture referencing MTLBuffer" without it)
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr
+{
+   return [self newLinearTextureWithDescriptor:d offset:offset bytesPerRow:bpr bytesPerImage:bpr * [d height]];
+}
 @end
 
 // ---- pipeline --------------------------------------------------------------------------------------------------------
@@ -1199,6 +1211,7 @@ bg_return_slot(BGMTLCommandBuffer *cb, BGMTLCommandQueue *queue)
 {
    bg_return_slot(self, _queue);
    [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
+   [_linWritten release];
    if (_done) dispatch_release(_done);
    [super dealloc];
 }
@@ -1306,8 +1319,29 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    }
 }
 
+// The buffer-backed textures (the root, for a view) a recorded command writes: colour attachments, resolve, blit and mipmap
+// destinations, and every texture a dispatch binds (which ones it writes is not known here).
+static void
+bg_linear_written(BGWork *w, NSMutableSet *into)
+{
+   id ts[8 + BG_MAX_TEX];
+   unsigned n = 0;
+   if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR)
+      for (unsigned i = 0; i < w->color_count && i < 8; i++) ts[n++] = w->color[i];
+   else if (w->kind == BG_WORK_RESOLVE || w->kind == BG_WORK_TEXCOPY || w->kind == BG_WORK_BUF2TEX || w->kind == BG_WORK_MIPMAPS)
+      ts[n++] = w->dst;
+   else if (w->kind == BG_WORK_DISPATCH)
+      for (unsigned i = 0; i < w->texture_count && i < BG_MAX_TEX; i++) ts[n++] = w->textures[i];
+   for (unsigned i = 0; i < n; i++) {
+      BGMTLTexture *t = (BGMTLTexture *)ts[i];
+      while (t && t->_parent) t = t->_parent;
+      if (t && t->_linSrc) [into addObject:t];
+   }
+}
+
 - (void)commit
 {
+   __atomic_add_fetch(&g_bg_commit_seq, 1, __ATOMIC_RELAXED);
    bgmtl_note_committed();
    BG_TRACE("commit: %lu recorded commands\n", (unsigned long)[_work count]);
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -1454,6 +1488,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    // a serial completion queue, which waits for it and then runs what follows a completed command buffer (surface sync, presents,
    // completed handlers), in submission order. BGMTL_TRACE keeps it synchronous: the trace reads attachments back through the
    // drawing context, which belongs to the encoding thread.
+   for (BGWork *w in _work) {
+      if (!_linWritten) _linWritten = [[NSMutableSet alloc] init];
+      bg_linear_written(w, _linWritten);
+   }
+   for (BGMTLTexture *t in _linWritten) [t bgLinearPending:1];
    dispatch_group_enter(_done);
    // In the compositor "scheduled" is reported only when the GPU has FINISHED: the render server hands a framebuffer to the
    // display from the scheduled notification / waitUntilScheduled, and this display path has no GPU write fence on the surface,
@@ -1518,6 +1557,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    (void)dev;
    for (void (^h)(id) in _scheduled) h(self);    // left here by the compositor's deferral (see commit)
    [_scheduled removeAllObjects];
+   // buffer-backed textures: the GPU's result goes back into their buffers before any completed handler reads them
+   for (BGMTLTexture *t in _linWritten) {
+      if (_status == 4) [t bgLinearWriteBack];
+      [t bgLinearPending:-1];
+   }
+   [_linWritten removeAllObjects];
    // what the GPU wrote into an IOSurface becomes visible to the compositor before the drawable is presented
    // In the compositor (backboardd, BGMTL_BB) the IOSurfaces drawn into are its own framebuffers: the GPU writes DRAM, the display
    // reads DRAM, the CPU never touches them, so neither the cache clean nor the seed bump below is needed -- and each was a kernel
@@ -2085,7 +2130,11 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
          BG_LOG("no-copy texture refresh: %s\n", why);
       bg_unlock();
    }
-   if (_linSrc && _tex) {
+   // Filled from the buffer once per command buffer (a second fill in the same one would wipe what its earlier draws put
+   // there), and not while a command buffer that writes it is in flight: its result reaches the buffer only at completion.
+   unsigned long seq = __atomic_load_n(&g_bg_commit_seq, __ATOMIC_RELAXED);
+   if (_linSrc && _tex && __atomic_load_n(&_linPending, __ATOMIC_ACQUIRE) == 0 && _linSeq != seq) {
+      _linSeq = seq;
       bg_lock();
       char why[256] = { 0 };
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
@@ -2095,6 +2144,19 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       bg_unlock();
    }
    return _tex;
+}
+- (void)bgLinearPending:(int)delta { __atomic_add_fetch(&_linPending, delta, __ATOMIC_ACQ_REL); }
+// What the GPU wrote, back into the buffer the texture was made over (the caller reads the buffer: iOS 26's icon renderer
+// draws an icon into such a texture and serializes the buffer's bytes). Called once the command buffer's fence has passed.
+- (void)bgLinearWriteBack
+{
+   if (!_linSrc || !_tex) return;
+   char why[256] = { 0 };
+   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _shape.width, _shape.height, 1 };
+   bg_lock();
+   if (rwa_texture_read(_tex, 0, 0, o, sz, (uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff, (unsigned)_linBpr, why, sizeof(why)) != 0)
+      BG_LOG("linear texture write-back: %s\n", why);
+   bg_unlock();
 }
 - (id)device { return _owner; }
 - (NSUInteger)width { return _shape.width; }

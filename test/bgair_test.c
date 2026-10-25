@@ -637,6 +637,27 @@ main(int argc, char **argv)
       CHECK(ok && !bad, "dependent dispatches without waiting: %u wrong of %u%s%s", bad, (unsigned)N, ok ? "" : ": ", ok ? "" : why2);
       printf("  3 dependent copies without waiting, one finish: %u wrong%s%s\n", bad, ok ? "" : ": ", ok ? "" : why2);
    }
+   { // MTLPixelFormatRGB10A2Unorm (90): red is bits 0-9. Clear to pure red, then pure blue + alpha 0, and read the raw words.
+      char why2[512] = { 0 };
+      struct rwa_texture_shape sh = { .pixel_format = 90, .type = 2, .width = 4, .height = 4, .depth = 1, .array_length = 1,
+                                      .mip_levels = 1, .sample_count = 1, .usage = 5 };
+      struct rwa_texture *t = rwa_texture_create(dev, &sh, why2, sizeof(why2));
+      uint32_t px[16] = { 0 }, got[2] = { 0 };
+      static const float vals[2][4] = { { 1, 0, 0, 1 }, { 0, 0, 1, 0 } };
+      bool ok = t != NULL;
+      for (unsigned k = 0; ok && k < 2; k++) {
+         struct rwa_texture *col[1] = { t };
+         struct rwa_clear cl = { .color = col, .color_count = 1, .color_mask = 1 };
+         memcpy(cl.color_value[0], vals[k], sizeof(vals[k]));
+         unsigned o[3] = { 0, 0, 0 }, sz[3] = { 4, 4, 1 };
+         ok = rwa_render_clear(dev, &cl, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0 &&
+              rwa_texture_read(t, 0, 0, o, sz, px, 0, why2, sizeof(why2)) == 0;
+         got[k] = px[5];
+      }
+      CHECK(ok && got[0] == 0xC00003FFu && got[1] == 0x3FF00000u, "RGB10A2Unorm: red 0x%08x (want 0xC00003FF), blue 0x%08x (want 0x3FF00000)%s%s",
+            got[0], got[1], ok ? "" : ": ", ok ? "" : why2);
+      printf("  RGB10A2Unorm clear: red 0x%08x blue 0x%08x (want 0xC00003FF 0x3FF00000)%s%s\n", got[0], got[1], ok ? "" : ": ", ok ? "" : why2);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;

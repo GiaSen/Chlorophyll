@@ -861,8 +861,9 @@ texture_type_name(unsigned type)
  * so the translation is the identity on memory and there is nothing in it to get subtly
  * wrong.
  *
- * What is deliberately absent is everything packed into a 32-bit word -- RGB10A2Unorm,
- * RG11B10Float, RGB9E5, the XR formats. Those names order their channels by one
+ * What was deliberately absent is everything packed into a 32-bit word -- RGB10A2Unorm,
+ * RG11B10Float, RGB9E5, the XR formats (Chlorophyll: the first four are in now, see their entries, with a
+ * GPU test of the bit order). Those names order their channels by one
  * convention and Gallium's by another, and a mistake there does not fail: it shifts a
  * channel by two bits in a texture that still looks like a texture. docs/air.md has
  * both shapes of that already -- zero printed as clamp_to_border by one of Apple's own
@@ -957,6 +958,15 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    {  74, "MTLPixelFormatRGBA8Sint",       PIPE_FORMAT_R8G8B8A8_SINT },
    {  80, "MTLPixelFormatBGRA8Unorm",      PIPE_FORMAT_B8G8R8A8_UNORM },
    {  81, "MTLPixelFormatBGRA8Unorm_sRGB", PIPE_FORMAT_B8G8R8A8_SRGB },
+   /* Chlorophyll: the packed 32-bit formats. Metal and Gallium both name a packed format's channels from the least
+    * significant bits up (Metal's RGB10A2Unorm is red in bits 0-9, Vulkan's A2B10G10R10_UNORM_PACK32, as MoltenVK maps it;
+    * Gallium's R10G10B10A2_UNORM is the same word), so the names line up one for one. bgair_test clears an RGB10A2 texture to
+    * pure red and checks the raw word is 0xC00003FF. iOS 26's icon renderer draws every icon variant into RGB10A2Unorm. */
+   {  90, "MTLPixelFormatRGB10A2Unorm",    PIPE_FORMAT_R10G10B10A2_UNORM },
+   {  91, "MTLPixelFormatRGB10A2Uint",     PIPE_FORMAT_R10G10B10A2_UINT },
+   {  92, "MTLPixelFormatRG11B10Float",    PIPE_FORMAT_R11G11B10_FLOAT },
+   {  93, "MTLPixelFormatRGB9E5Float",     PIPE_FORMAT_R9G9B9E5_FLOAT },
+   {  94, "MTLPixelFormatBGR10A2Unorm",    PIPE_FORMAT_B10G10R10A2_UNORM },
    /* Chlorophyll: Apple's extended-range (XR) formats, stood in for by a native format of the SAME size so layouts stay
     * consistent (the XR encoding itself is not reproduced: SDR content comes out close, extended values do not). QuartzCore's
     * render server builds its deep-colour pipelines in these whatever the device answers, and a refusal aborts the server
@@ -1135,8 +1145,7 @@ pixel_format_refusal(unsigned f)
              "public header names is one whose layout nothing here can read";
    if (f >= 90 && f <= 94)
       return "one of Metal's formats packed into a 32-bit word (RGB10A2, RG11B10, RGB9E5, "
-             "BGR10A2), whose field order and bias this library will not guess: an error of "
-             "two bits in a channel is a picture, not a failure";
+             "BGR10A2) that this GPU driver does not offer for this use";
    if (f >= 130 && f <= 153)
       return "one of the BC compressed formats, whose texels come in blocks this library "
              "cannot make and whose rows are not rows of pixels";
