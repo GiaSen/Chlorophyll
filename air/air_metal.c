@@ -3992,6 +3992,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
     */
    struct pipe_shader_buffer sb[PIPE_MAX_SHADER_BUFFERS] = { 0 };
    unsigned num_ssbo = 0, writable = 0;
+   uint32_t cb_deltas[16] = { 0 };     /* add_cb_deltas: per buffer index, read by the shader from slot cb_delta_ubo - 1 */
 
    /* and each texture as the kind of view its own instructions ask for. A read-only
     * texture stays a texture: Metal's read() on one becomes a txf, a texture fetch, so
@@ -4098,6 +4099,13 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
          };
          if (boffset % device->ubo_offset_align == 0) {
             cb.buffer = b->res;
+         } else if (info->cb_delta_ubo && r->index < 16 && (info->cb_delta_mask & (1u << r->index))) {
+            /* Chlorophyll: bound in place at the aligned offset below; the shader adds the rest (add_cb_deltas). */
+            size_t aligned = boffset - boffset % device->ubo_offset_align;
+            cb.buffer = b->res;
+            cb.buffer_offset = (unsigned)aligned;
+            cb.buffer_size = (unsigned)(left + (boffset - aligned));
+            cb_deltas[r->index] = (uint32_t)(boffset - aligned);
          } else {
             size_t want = r->size && r->size <= left ? r->size : left;
             /* An UNSIZED constant pointer (no air.buffer_size: QuartzCore's texture_matrix, lod_bias) used to upload
@@ -4247,6 +4255,10 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       num_samplers = MAX2(num_samplers, i + 1);
    }
 
+   if (info->cb_delta_ubo) {
+      struct pipe_constant_buffer dcb = { .user_buffer = cb_deltas, .buffer_size = sizeof(cb_deltas) };
+      pipe->set_constant_buffer(pipe, stage, info->cb_delta_ubo - 1, false, &dcb);
+   }
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
    if (num_views || device->n_bound_views[stage]) {
@@ -6444,6 +6456,61 @@ size_unsized_constants(nir_shader *nir, struct air_shader_info *info)
       _mesa_hash_table_destroy(range_ht, NULL);
 }
 
+/* Chlorophyll: the constant buffers size_unsized_constants left unbounded read through a delta (air_shader_info,
+ * cb_delta_mask): every load from one becomes load(offset + delta[index]), the deltas living in the last of the 16 constant
+ * buffer slots a6xx has, when the shader leaves it free. RWA_CB_DELTA=0 turns it off. */
+#define CB_DELTA_SLOT 15
+static void
+add_cb_deltas(nir_shader *nir, struct air_shader_info *info)
+{
+   static int on = -1;
+   if (on < 0)
+      on = !(getenv("RWA_CB_DELTA") && getenv("RWA_CB_DELTA")[0] == '0');
+   unsigned mask = 0;
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      const struct air_resource *r = &info->resources[i];
+      if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
+         continue;
+      if (r->index >= CB_DELTA_SLOT)
+         return;                 /* the slot is the shader's own (or past it): keep the copying path */
+      if (!r->size)
+         mask |= 1u << r->index;
+   }
+   if (!on || !mask)
+      return;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(in->src[0]))
+               continue;
+            unsigned idx = nir_src_as_uint(in->src[0]);
+            if (idx >= 32 || !(mask & (1u << idx)))
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *delta = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, CB_DELTA_SLOT), nir_imm_int(&b, 4 * idx),
+                                          .align_mul = 4, .align_offset = 0, .range_base = 0, .range = 64);
+            nir_def *off = nir_iadd(&b, in->src[1].ssa, delta);
+            nir_src_rewrite(&in->src[1], off);
+            /* the delta is a multiple of 4, so the load is only known 4-aligned now */
+            if (nir_intrinsic_align_mul(in) > 4) {
+               nir_intrinsic_set_align_mul(in, 4);
+               nir_intrinsic_set_align_offset(in, nir_intrinsic_align_offset(in) % 4);
+            }
+            nir_intrinsic_set_range_base(in, 0);
+            nir_intrinsic_set_range(in, ~0);
+         }
+      }
+      nir_metadata_preserve(impl, nir_metadata_control_flow);
+   }
+   nir->info.num_ubos = MAX2(nir->info.num_ubos, CB_DELTA_SLOT + 1);
+   info->cb_delta_mask = mask;
+   info->cb_delta_ubo = CB_DELTA_SLOT + 1;
+}
+
 struct rwa_render *
 rwa_render_create(struct rwa_device *device,
                   const void *vertex_bitcode, size_t vertex_size,
@@ -6800,8 +6867,11 @@ rwa_render_create(struct rwa_device *device,
    }
 
    size_unsized_constants(fs, &render->finfo);
-   if (!render->generated_vertex)
+   add_cb_deltas(fs, &render->finfo);
+   if (!render->generated_vertex) {
       size_unsized_constants(vs, &render->vinfo);
+      add_cb_deltas(vs, &render->vinfo);
+   }
 
    /* Compile both stages now. A failure here is a creation failure and says so; the
     * stages are linked later, at the draw.

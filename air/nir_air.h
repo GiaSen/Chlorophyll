@@ -288,6 +288,13 @@ struct air_shader_info {
     */
    unsigned fbfetch_targets;
 
+   /* Chlorophyll: constant buffers the shader reads at offsets no bound was found for (one bit per [[buffer(n)]]),
+    * whose loads were rewritten to add a delta read from constant buffer cb_delta_ubo - 1 (4 bytes per buffer index):
+    * the runtime binds such a buffer at its offset rounded down to the GPU's alignment and uploads only the deltas,
+    * instead of copying 4 KB from a misaligned offset every draw. cb_delta_ubo == 0: none. */
+   unsigned cb_delta_mask;
+   unsigned cb_delta_ubo;
+
    /* The raster order groups the shader declares on its resources, one bit
     * each; 0 when it declares none.
     *
