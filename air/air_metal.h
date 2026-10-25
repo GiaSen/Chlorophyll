@@ -587,6 +587,7 @@ int rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, 
                      struct rwa_texture *dst, unsigned dlevel, unsigned dslice, const unsigned dorg[3], const unsigned size[3]);
 /* Chlorophyll: a render pass's multisample resolve into level/slice of a single-sample texture, on the GPU (0 or -1). */
 int rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst, unsigned dlevel, unsigned dslice);
+int rwa_texture_force_opaque(struct rwa_texture *dst);   /* Chlorophyll debugging: alpha := 1 on level 0 */
 /* Chlorophyll: generateMipmapsForTexture on the GPU, levels 1..last from level 0 (0 or -1). */
 int rwa_texture_generate_mipmaps(struct rwa_texture *texture);
 

@@ -1316,6 +1316,10 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          if (rwa_texture_resolve([(BGMTLTexture *)w->src rwaTexture], [(BGMTLTexture *)w->dst rwaTexture], (unsigned)w->t_dlevel,
                                  (unsigned)w->t_dslice) != 0)
             BG_LOG("render pass: multisample resolve refused (the attachment is not multisample)\n");
+         // debugging: /private/var/tmp/bgmtl.forcealpha makes what a resolve wrote opaque (is a compositor blending on alpha?)
+         static int force_alpha = -1;
+         if (force_alpha < 0) force_alpha = access("/private/var/tmp/bgmtl.forcealpha", F_OK) == 0;
+         if (force_alpha) rwa_texture_force_opaque([(BGMTLTexture *)w->dst rwaTexture]);
       } else if (w->kind == BG_WORK_TEXCOPY &&
                  rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
                                   (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },
@@ -2076,6 +2080,11 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
    BG_TRACE("setVertexBytes length %lu index %lu\n", (unsigned long)l, (unsigned long)i);
+   if (bg_trace() && bytes && l >= 16) {   // the tail too: flags and counts sit at the end of uniform structs
+      const uint8_t *t = (const uint8_t *)bytes + l - 16;
+      BG_LOG("  last 16 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", t[0], t[1], t[2], t[3],
+             t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
+   }
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
    if (b) { [_scratch addObject:b]; [self setVertexBuffer:b offset:0 atIndex:i]; }
 }

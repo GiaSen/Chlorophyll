@@ -1881,6 +1881,41 @@ rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst, unsigned d
    return 0;
 }
 
+/* Chlorophyll: set every texel's alpha of level 0 to one, on the GPU (a blit of the alpha channel alone from a 1x1 opaque texture).
+ * A debugging aid for content composited as if it had alpha when it is meant to be opaque. -1: no texture or the blit failed. */
+int
+rwa_texture_force_opaque(struct rwa_texture *dst)
+{
+   if (!dst || !dst->res)
+      return -1;
+   struct rwa_device *device = dst->device;
+   struct pipe_context *pipe = device->pipe;
+   static struct pipe_resource *one;
+   if (!one) {
+      struct pipe_resource t = { .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_R8G8B8A8_UNORM, .width0 = 1, .height0 = 1,
+                                 .depth0 = 1, .array_size = 1, .bind = PIPE_BIND_SAMPLER_VIEW, .usage = PIPE_USAGE_DEFAULT };
+      one = device->screen->resource_create(device->screen, &t);
+      if (!one)
+         return -1;
+      static const uint8_t white[4] = { 255, 255, 255, 255 };
+      struct pipe_box box;
+      u_box_2d(0, 0, 1, 1, &box);
+      pipe->texture_subdata(pipe, one, 0, 0, &box, white, 4, 4);
+   }
+   struct pipe_blit_info b;
+   memset(&b, 0, sizeof(b));
+   b.src.resource = one;
+   b.src.format = one->format;
+   u_box_2d(0, 0, 1, 1, &b.src.box);
+   b.dst.resource = dst->res;
+   b.dst.format = dst->res->format;
+   u_box_2d(0, 0, dst->res->width0, dst->res->height0, &b.dst.box);
+   b.mask = PIPE_MASK_A;
+   b.filter = PIPE_TEX_FILTER_NEAREST;
+   pipe->blit(pipe, &b);
+   return 0;
+}
+
 /* Chlorophyll: -[MTLBlitCommandEncoder generateMipmapsForTexture:], on the GPU and in order with the draws: each level a
  * linear-filtered blit of the one above (util_gen_mipmap), every slice. CoreAnimation's blurs downsample through a mip chain
  * and sample its lower levels; with the call ignored those levels kept whatever the allocation held (blocky, oversaturated

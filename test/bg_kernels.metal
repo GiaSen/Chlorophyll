@@ -93,3 +93,28 @@ kernel void bg_tex_choice3(texture2d<float, access::read> a [[texture(0)]], text
    }
    out[gid] = t.read(uint2(gid, 0));
 }
+
+// the math Mercury's space shaders use, in fast and half forms: out[16 * gid + k] for input in[gid] (checked against libm)
+kernel void bg_math(device const float *in [[buffer(0)]], device float *out [[buffer(1)]], uint gid [[thread_position_in_grid]])
+{
+   float x = in[gid];               // in (-1, 1)
+   float y = in[gid] * 0.5 + 0.7;   // in (0.2, 1.2)
+   half hx = half(x), hy = half(y);
+   device float *o = out + 16 * gid;
+   o[0] = fast::acos(x);
+   o[1] = fast::asin(x);
+   o[2] = fast::atan(x * 3.0);
+   o[3] = fast::atan2(x, y);
+   o[4] = fast::cos(x * 3.0);
+   o[5] = fast::sqrt(y);
+   o[6] = fast::rsqrt(y);
+   o[7] = fast::saturate(x * 2.0);
+   o[8] = float(pow(hy, half(2.2)));
+   o[9] = pow(y, 2.2);
+   o[10] = float(saturate(hx * half(2.0)));
+   o[11] = float(clamp(hx, half(-0.25), half(0.25)));
+   o[12] = float(mix(hx, hy, half(0.25)));
+   o[13] = fast::pow(y, 0.4545);
+   o[14] = float(pow(half3(hy), half3(1.5)).y);
+   o[15] = fast::fmax(x, y * 0.5);
+}

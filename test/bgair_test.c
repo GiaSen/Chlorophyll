@@ -4,6 +4,7 @@
 // The same source builds for the Mac (RWA_SOFTWARE=1 runs softpipe, a reference for the expected numbers) and for the phone.
 //   bgair_test FILE.metallib
 // The MTLB container reader is the format of the frontend's air_metallib.c (MIT, Copyright 2026 Darwin on redwood contributors).
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -354,6 +355,100 @@ main(int argc, char **argv)
       }
       CHECK(ok && bad == 0, "multisample resolve: %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
       printf("  multisample resolve: %u wrong%s%s\n", bad, ok ? "" : ": ", ok ? "" : why2);
+   }
+   { // the same resolve in BGRA8Unorm_sRGB (Mercury's format): 0.5 linear is 188 stored; a resolve that encodes twice gives ~225
+      char why2[512] = { 0 };
+      struct rwa_texture_shape ms = { .pixel_format = 81, .type = 4, .width = 64, .height = 32, .depth = 1,
+                                      .array_length = 1, .mip_levels = 1, .sample_count = 4, .usage = 4 };
+      struct rwa_texture_shape ss = ms;
+      ss.type = 2; ss.sample_count = 1; ss.usage = 5;
+      struct rwa_texture *tm = rwa_texture_create(dev, &ms, why2, sizeof(why2));
+      struct rwa_texture *ts = tm ? rwa_texture_create(dev, &ss, why2, sizeof(why2)) : NULL;
+      bool ok = ts != NULL;
+      if (ok) {
+         struct rwa_texture *col[1] = { tm };
+         struct rwa_clear cl = { .color = col, .color_count = 1, .color_mask = 1, .color_value = { { 0.5f, 0.5f, 0.5f, 1.0f } } };
+         ok = rwa_render_clear(dev, &cl, why2, sizeof(why2)) == 0 && rwa_texture_resolve(tm, ts, 0, 0) == 0 &&
+              rwa_finish(dev, why2, sizeof(why2)) == 0;
+      }
+      uint8_t got[64 * 32 * 4];
+      unsigned origin[3] = { 0, 0, 0 }, size[3] = { 64, 32, 1 };
+      ok = ok && rwa_texture_read(ts, 0, 0, origin, size, got, 0, why2, sizeof(why2)) == 0;
+      unsigned bad = 0;
+      for (unsigned i = 0; ok && i < 64 * 32; i++)
+         if (got[4 * i] < 186 || got[4 * i] > 190) { if (bad++ < 2) printf("    texel %u = %u %u %u %u\n", i, got[4 * i], got[4 * i + 1], got[4 * i + 2], got[4 * i + 3]); }
+      CHECK(ok && bad == 0, "sRGB multisample resolve: %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
+      printf("  sRGB multisample resolve: texel 0 = %u, %u wrong\n", ok ? got[0] : 0, bad);
+   }
+   { // bg_math: Mercury's built-ins against libm (half results get a half's tolerance)
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_math", &info);
+      const unsigned n = 64;
+      if (c) {
+         struct rwa_buffer *in = buf(n * 4), *out = buf(n * 16 * 4);
+         float *pi = rwa_buffer_map(in), *po = rwa_buffer_map(out);
+         for (unsigned i = 0; i < n; i++) pi[i] = -0.97f + 1.94f * i / (n - 1);
+         struct rwa_buffer *bufs[2] = { in, out };
+         static const char *names[16] = { "acos", "asin", "atan", "atan2", "cos", "sqrt", "rsqrt", "saturate", "pow.f16", "pow",
+                                          "saturate.f16", "clamp.f16", "mix.f16", "fast pow", "pow.v3f16", "fmax" };
+         if (dispatch(c, bufs, 2, n / 64, 64, "bg_math")) {
+            unsigned bad[16] = { 0 };
+            for (unsigned i = 0; i < n; i++) {
+               double x = pi[i], y = pi[i] * 0.5 + 0.7, hx = x, hy = y;
+               double want[16] = { acos(x), asin(x), atan(x * 3.0), atan2(x, y), cos(x * 3.0), sqrt(y), 1.0 / sqrt(y),
+                                   fmin(fmax(x * 2.0, 0.0), 1.0), pow(hy, 2.2), pow(y, 2.2), fmin(fmax(hx * 2.0, 0.0), 1.0),
+                                   fmin(fmax(hx, -0.25), 0.25), hx + (hy - hx) * 0.25, pow(y, 0.4545), pow(hy, 1.5), fmax(x, y * 0.5) };
+               for (unsigned k = 0; k < 16; k++) {
+                  double tol = (k >= 8 && k != 9 && k != 13 && k != 15) ? 0.01 + 0.004 * fabs(want[k]) : 0.002 + 0.002 * fabs(want[k]);
+                  if (!(fabs(po[16 * i + k] - want[k]) <= tol)) { if (bad[k]++ < 2) printf("    %s(x=%g): %g want %g\n", names[k], x, po[16 * i + k], want[k]); }
+               }
+            }
+            unsigned total = 0;
+            for (unsigned k = 0; k < 16; k++) total += bad[k];
+            CHECK(total == 0, "bg_math: %u wrong", total);
+            printf("  bg_math: %u of %u wrong\n", total, n * 16);
+         } else fail++;
+      } else fail++;
+   }
+   { // sRGB textures sampled (Mercury's albedo is ASTC 6x6 sRGB): 0.5 stored must sample as ~0.214 linear, for BGRA8 sRGB and ASTC 4x4 sRGB
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_tex_sample", &info);
+      char why2[512] = { 0 };
+      struct rwa_sampler_state st = { .normalized_coordinates = 1, .lod_max = 1000.0f };
+      struct rwa_sampler *smp = c ? rwa_sampler_create(dev, &st, why2, sizeof(why2)) : NULL;
+      static const unsigned fmts[3] = { 81, 186, 70 };
+      static const char *fname[3] = { "BGRA8Unorm_sRGB", "ASTC_4x4_sRGB", "RGBA8Unorm" };
+      for (unsigned f = 0; smp && f < 3; f++) {
+         struct rwa_texture_shape sh = { .pixel_format = fmts[f], .type = 2, .width = 16, .height = 16, .depth = 1, .array_length = 1,
+                                         .mip_levels = 1, .sample_count = 1, .usage = 1 };
+         struct rwa_texture *t = rwa_texture_create(dev, &sh, why2, sizeof(why2));
+         if (!t) { printf("  %s: %s\n", fname[f], why2); fail++; continue; }
+         uint8_t data[16 * 16 * 4];
+         unsigned origin[3] = { 0, 0, 0 }, size[3] = { 16, 16, 1 };
+         size_t stride = 16 * 4;
+         if (fmts[f] == 186) {   /* 16 void-extent blocks: a constant colour, UNORM16 0x8000 in each channel */
+            for (unsigned b = 0; b < 16; b++) {
+               uint8_t *q = data + 16 * b;
+               static const uint8_t blk[16] = { 0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0xFF, 0xFF };
+               memcpy(q, blk, 16);
+            }
+            stride = 4 * 16;   /* a row of 4 blocks */
+         } else
+            for (unsigned i = 0; i < 16 * 16 * 4; i++) data[i] = (i % 4 == 3) ? 255 : 128;
+         if (rwa_texture_write(t, 0, 0, origin, size, data, stride, why2, sizeof(why2)) != 0) { printf("  %s write: %s\n", fname[f], why2); fail++; continue; }
+         struct rwa_buffer *o = buf(16 * 16 * 16);
+         struct rwa_buffer *bufs[1] = { o };
+         struct rwa_texture *texs[1] = { t };
+         struct rwa_sampler *smps[1] = { smp };
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = 1, .textures = texs, .texture_count = 1, .samplers = smps, .sampler_count = 1 };
+         unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 16, 16, 1 };
+         bool ok = rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
+         const float *po = rwa_buffer_map(o);
+         double want = fmts[f] == 70 ? 128 / 255.0 : (fmts[f] == 186 ? pow((0.5 + 0.055) / 1.055, 2.4) : pow((128 / 255.0 + 0.055) / 1.055, 2.4));
+         bool good = ok && fabs(po[0] - want) < 0.01 && fabs(po[1] - want) < 0.01 && fabs(po[2] - want) < 0.01;
+         CHECK(good, "sample %s: %g %g %g %g want %g%s%s", fname[f], po[0], po[1], po[2], po[3], want, ok ? "" : ": ", ok ? "" : why2);
+         printf("  sample %s: %.3f %.3f %.3f %.3f (want %.3f)\n", fname[f], po[0], po[1], po[2], po[3], want);
+      }
    }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
