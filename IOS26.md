@@ -85,3 +85,52 @@ fine, which is why `bg_tex_write` and `bg_mip_write` use it); `copyFromTexture:s
 is unimplemented (Mercury calls it).
 
 Lesson: a refused pipeline names the fragment (`(f)`) even when the vertex stage is the one refused; translate both dumps.
+
+## Performance: what DXVK and Zink do that Chlorophyll does not (2026-10-25)
+
+Read-only study of DXVK (cbd2206) and Mesa's Zink (837ab0e) against this tree. Nothing below is measured yet: turn on
+`/private/var/tmp/bgmtl.perf` (encode time vs GPU wait per command buffer) before and after each change.
+
+What Mesa already gives us, so we do not rebuild it: freedreno compiles initial ir3 variants on its own `compile_queue`
+(ir3_gallium.c); Gallium/freedreno handle barriers and descriptors; ir3 picks variant keys per draw. Not worth copying:
+pipeline libraries, our own compile thread pool for ir3, custom variant keys.
+
+Ranked (impact over effort):
+
+1. **setBytes / setVertexBytes / setFragmentBytes allocate a GEM buffer and a permanent map per call** (bgmtl.m
+   `newBufferWithBytes` -> `rwa_buffer_create`). CoreAnimation calls these many times per frame. Replace with a
+   per-command-buffer bump allocator over recycled 64-256 KB slabs (DXVK `DxvkStagingBuffer`, Gallium `u_upload_mgr`),
+   slabs retired at completion. Small-medium effort, low risk.
+2. **Compute dispatch waits for the GPU every time**: `rwa_dispatch_buffers` ends in a required finish (flush + fence wait).
+   The luma kernels pay a full round trip each frame. Drop the wait as draws already did (keep an `RWA_DISPATCH_FINISH`
+   switch); check the readback paths go through the commit fence. Small effort, low-medium risk.
+3. **Per-draw state is re-bound unconditionally** in `rwa_render_draw`: blend, DSA, rasterizer, vs/fs, vertex elements,
+   viewport, scissor, stencil ref, vertex buffers. freedreno does not dedup these: every vs/fs bind dirties PROG and costs
+   an `ir3_cache_lookup` per draw. Shadow the last-bound objects on the device and skip equal ones (Zink `zink_state.c`,
+   DXVK dirty flags; `cso_context` does the same). Small effort, low risk (invalidate on destroy).
+4. **Pipeline creation has no cache, parses the bitcode three times, and runs under the global `bg_lock`**
+   (`rwa_render_create`: fragment and vertex `air_to_nir`, then `rwa_module_textures` again in bgmtl.m). Cache translated
+   NIR + info per (bitcode hash, entry, function constants, paired vertex entry) and the CSO pair per (vs, fs, shape);
+   do the translation outside `bg_lock`. Medium effort, low risk.
+5. **No shader cache survives a restart**: `ir3_disk_cache_init` is compiled out on `__APPLE__` and the build has
+   shader-cache disabled. Re-enable it with a key from the Chlorophyll build, cache dir in `/private/var/tmp`; later add a
+   `nir_serialize` cache for the AIR->NIR half. Helps backboardd/Mercury cold starts. Medium effort, low risk.
+6. **Attachment views are new objects every pass** (`bg_attachment_view` makes a new BGMTLTexture, `texture_surface` a new
+   pipe_surface; the pool skips views). The blur pyramid pays this every frame. Cache views on the parent by (format,
+   type, levels, layers, swizzle), as Zink's surface cache does. Small-medium effort.
+7. **Per-draw constant uploads**: the 33-word delta buffer goes up as a `user_buffer` per stage per draw, and unaligned
+   constant bindings without delta support upload up to 4 KB. Skip the delta upload when unchanged; prefer the delta path.
+8. **BGWork per draw retains every slot** (16 buffers + 16 textures + samplers per stage) and replay resolves each texture
+   under `bg_lock`. Copy only changed state (DXVK's model), retain only up to the highest used slot.
+9. **Per-draw validation** (formats, `index_range` scanning the whole index list, stream bounds, `check_bindings`) can be
+   cached per pipeline + pass + binding signature, full checks behind an env switch.
+10. **Framebuffer fetch forces sysmem for the whole process** (`fd_mesa_debug` bit 9, sticky) plus a framebuffer barrier
+    before each fetching draw. Potentially the largest GPU win, but the highest risk: it fixed real corruption. Needs a
+    per-batch flag in freedreno (`gmem_reason`) and barrier elision only when the attachment was written since.
+11. **DontCare store actions are ignored**: use `pipe->invalidate_resource` so freedreno skips GMEM resolves of blur
+    intermediates (stores only; CoreAnimation relies on zeroed DontCare loads).
+12. Later, only after 1-4: `PIPE_CONTEXT_PREFER_THREADED` (freedreno supports `u_threaded_context`), deferred flushes,
+    per-resource waits instead of `rwa_finish` on CPU-blit fallbacks.
+
+Correctness gap found on the way: `setViewport:` keeps only znear/zfar; origin and size are ignored and every draw uses
+the attachment size. The traced CoreAnimation passes all set a viewport equal to the attachment, so nothing visible yet.

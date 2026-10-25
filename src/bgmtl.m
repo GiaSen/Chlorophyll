@@ -2217,7 +2217,7 @@ bg_attachment_view(id tex, NSUInteger level, NSUInteger slice)
 - (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
 { BG_TRACE("setVertexBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; if (i + 1 > _vhigh) _vhigh = (unsigned)i + 1; } }
 - (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i
-{ if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
+{ BG_TRACE("setFragmentBuffer %p offset %lu index %lu\n", b, (unsigned long)o, (unsigned long)i); if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; if (i + 1 > _fhigh) _fhigh = (unsigned)i + 1; } }
 // CoreAnimation binds a buffer once per pass and then only moves the offset between draws
 - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _voff[i] = o; }
 - (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _foff[i] = o; }
@@ -2238,6 +2238,7 @@ bg_attachment_view(id tex, NSUInteger level, NSUInteger slice)
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
+   BG_TRACE("setFragmentBytes length %lu index %lu\n", (unsigned long)l, (unsigned long)i);
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
    if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
 }
@@ -2293,6 +2294,16 @@ bg_attachment_view(id tex, NSUInteger level, NSUInteger slice)
          BG_LOG("  vbuf[%u] len %lu off %lu: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n", i,
                 (unsigned long)[(BGMTLBuffer *)_vbuf[i] length], (unsigned long)_voff[i], f[0], f[1], f[2], f[3], f[4], f[5],
                 f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+      }
+      for (unsigned i = 0; i < _fhigh; i++) {   // the fragment constants (glass: `u`, 272 bytes at index 1), as floats, up to 288 bytes
+         if (!_fbuf[i]) continue;
+         NSUInteger len = [(BGMTLBuffer *)_fbuf[i] length], off = _foff[i], have = len > off ? (len - off) / 4 : 0;
+         const float *f = (const float *)((const uint8_t *)[(BGMTLBuffer *)_fbuf[i] contents] + off);
+         char line[1600]; size_t n = 0;
+         for (unsigned k = 0; k < have && k < 72 && n < sizeof(line) - 24; k++)
+            n += snprintf(line + n, sizeof(line) - n, "%s%g", k ? (k % 4 ? " " : " | ") : "", f[k]);
+         line[n] = 0;
+         BG_LOG("  fbuf[%u] len %lu off %lu: %s\n", i, (unsigned long)len, (unsigned long)off, line);
       }
    }
    BGWork *w = [[[BGWork alloc] init] autorelease];
