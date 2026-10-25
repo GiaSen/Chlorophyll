@@ -309,6 +309,8 @@ bg_install_fallback(Class c)
    BGMTLDevice *_owner;
    struct rwa_compute *_compute;
    struct rwa_compute_info _info;
+   struct rwa_texture_decl _decls[16];   // the kernel's texture slots, for filling the ones nothing was bound to (as the render pipeline)
+   unsigned _ndecls;
 }
 @end
 
@@ -928,6 +930,11 @@ bg_air_slice(NSData *d)
    p->_owner = self;
    p->_compute = c;
    p->_info = info;
+   {
+      char dwhy[128] = { 0 };
+      unsigned nd = 0;
+      if (rwa_module_textures(_rwa, air.bytes, air.length, [[function name] UTF8String], p->_decls, 16, &nd, dwhy, sizeof(dwhy)) == 0) p->_ndecls = nd;
+   }
    BG_LOG("pipeline %s: max_threads=%u exec_width=%u buffers=%u textures=%u\n", [[function name] UTF8String],
           info.max_threads_per_group, info.thread_execution_width, info.buffers, info.textures);
    return p;
@@ -1596,6 +1603,17 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    for (unsigned i = 0; i < _highest; i++) { w->buffers[i] = [_buffers[i] retain]; w->offsets[i] = _offsets[i]; }
    for (unsigned i = 0; i < BG_MAX_TEX; i++) { w->textures[i] = [_textures[i] retain]; w->samplers[i] = [_samplers[i] retain]; }
    w->texture_count = _thigh; w->sampler_count = _shigh;
+   // Metal reads zeros from a texture slot nothing was bound to, in a kernel as in a draw: backboardd's compute_average_luma over a
+   // poster surface no texture could be made of failed three command buffers and its watchdog switched Metal off (iOS 26, Mercury)
+   BGMTLComputePipeline *cp = (BGMTLComputePipeline *)_pipeline;
+   for (unsigned i = 0; i < cp->_ndecls; i++) {
+      unsigned idx = cp->_decls[i].index;
+      if (idx >= BG_MAX_TEX || w->textures[idx]) continue;
+      w->textures[idx] = [[(BGMTLDevice *)[_cb device] bgNullTextureForType:cp->_decls[i].type_known ? cp->_decls[i].type : 2
+                                                                    element:cp->_decls[i].element] retain];
+      if (idx + 1 > w->texture_count) w->texture_count = idx + 1;
+      BG_LOG("dispatch: texture slot %u was not bound; a zero texture stands in\n", idx);
+   }
    w->groups[0] = (unsigned)groups.width; w->groups[1] = (unsigned)groups.height; w->groups[2] = (unsigned)groups.depth;
    w->group_size[0] = (unsigned)size.width; w->group_size[1] = (unsigned)size.height; w->group_size[2] = (unsigned)size.depth;
    [_cb bgRecord:w];
