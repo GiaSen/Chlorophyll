@@ -66,6 +66,7 @@
 @end
 
 #define BG_LOG(...) bg_log(__VA_ARGS__)
+static int bg_trace(void);
 static void
 bg_log(const char *fmt, ...)
 {
@@ -78,13 +79,14 @@ bg_log(const char *fmt, ...)
    va_end(ap);
    // /private/var/tmp/bgmtl.trace: the log also goes to bgmtl-trace-<pid>.txt there (daemons and extensions whose stderr
    // nobody reads and whose environment launchd sets, such as the wallpaper poster)
-   if (!tf_tried) {
-      tf_tried = 1;
-      if (access("/private/var/tmp/bgmtl.trace", F_OK) == 0) {
-         char path[96];
-         snprintf(path, sizeof(path), "/private/var/tmp/bgmtl-trace-%d.txt", getpid());
-         tf = fopen(path, "a");
-      }
+   (void)tf_tried;
+   if (bg_trace() && !tf) {          // the trace file follows the live switch (bg_trace)
+      char path[96];
+      snprintf(path, sizeof(path), "/private/var/tmp/bgmtl-trace-%d.txt", getpid());
+      tf = fopen(path, "a");
+   } else if (!bg_trace() && tf) {
+      fclose(tf);
+      tf = NULL;
    }
    if (tf) {
       va_start(ap, fmt);
@@ -117,8 +119,14 @@ bg_fail_dump(const char *reason, NSData *vair, NSString *vname, NSData *air, NSS
 static int
 bg_trace(void)
 {
-   static int t = -1;
-   if (t < 0) t = getenv("BGMTL_TRACE") != NULL || access("/private/var/tmp/bgmtl.trace", F_OK) == 0;
+   // re-read at most once a second, so a long-lived process (backboardd, which must not be restarted by hand) can be traced
+   // for a few seconds by creating and removing the file
+   static int t = -1, env = -1;
+   static time_t next;
+   if (env < 0) env = getenv("BGMTL_TRACE") != NULL;
+   if (env) return 1;
+   time_t now = time(NULL);
+   if (t < 0 || now >= next) { t = access("/private/var/tmp/bgmtl.trace", F_OK) == 0; next = now + 1; }
    return t;
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
