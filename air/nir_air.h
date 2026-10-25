@@ -163,6 +163,12 @@ struct air_resource {
     */
    unsigned argbuf_set;
    unsigned argbuf_id;
+
+   /* Chlorophyll: a `device` buffer whose accesses add a delta the runtime binds
+    * (air_shader_info.ssbo_delta_mask), so any offset that is a multiple of 4 is
+    * served and not only those the GPU can fetch from.
+    */
+   bool offset_delta;
 };
 
 struct air_varying {
@@ -294,6 +300,9 @@ struct air_shader_info {
     * instead of copying 4 KB from a misaligned offset every draw. cb_delta_ubo == 0: none. */
    unsigned cb_delta_mask;
    unsigned cb_delta_ubo;
+   /* Chlorophyll: the same for `device` buffers (one bit per [[buffer(n)]], n < 16), whose deltas are entries 16 + n of
+    * that constant buffer: such a buffer is bound in place at its offset rounded down, since a copy would lose its writes. */
+   unsigned ssbo_delta_mask;
 
    /* The raster order groups the shader declares on its resources, one bit
     * each; 0 when it declares none.

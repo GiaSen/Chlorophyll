@@ -140,6 +140,33 @@ main(int argc, char **argv)
          } else fail++;
       } else fail++;
    }
+   { // bg_copy with `device` buffers at offsets the GPU cannot fetch from (a6xx: 64; iOS 26's compute_sum_luma binds one at 32)
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_copy", &info);
+      const unsigned n = 4096, so = 32, dof = 36;
+      if (c) {
+         struct rwa_buffer *s = buf(n * 4 + 64), *d = buf(n * 4 + 64), *k = buf(16);
+         uint32_t *ps = rwa_buffer_map(s), *pd = rwa_buffer_map(d), *pk = rwa_buffer_map(k);
+         for (unsigned i = 0; i < n + 16; i++) { ps[i] = i * 2654435761u; pd[i] = 0xdeadbeef; }
+         pk[0] = n;
+         struct rwa_buffer *bufs[3] = { s, d, k };
+         struct rwa_buffer_bind table[3] = { { s, so }, { d, dof }, { k, 0 } };
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = 3 };
+         unsigned groups[3] = { n / 128, 1, 1 }, size[3] = { 128, 1, 1 };
+         char why2[512] = { 0 };
+         int r = rwa_dispatch_buffers(c, &b, table, 3, groups, size, why2, sizeof(why2));
+         if (r == 0) r = rwa_finish(dev, why2, sizeof(why2));
+         printf("  bg_copy at offsets %u/%u: %s%s%s\n", so, dof, r == 0 ? "done" : "FAILED", r ? ": " : "", r ? why2 : "");
+         if (r == 0) {
+            unsigned bad = 0, clobbered = 0;
+            for (unsigned i = 0; i < n; i++) if (pd[dof / 4 + i] != ps[so / 4 + i]) { if (bad++ < 4) printf("    dst[%u]=%08x want %08x\n", i, pd[dof / 4 + i], ps[so / 4 + i]); }
+            for (unsigned i = 0; i < dof / 4; i++) if (pd[i] != 0xdeadbeef) clobbered++;
+            CHECK(bad == 0, "bg_copy at offsets: %u wrong", bad);
+            CHECK(clobbered == 0, "bg_copy at offsets: %u words before the destination offset written", clobbered);
+            printf("  bg_copy at offsets: %u of %u correct, %u words before the offset written\n", n - bad, n, clobbered);
+         } else fail++;
+      } else fail++;
+   }
    { // bg_groupsum
       struct rwa_compute_info info = { 0 };
       struct rwa_compute *c = pipeline("bg_groupsum", &info);

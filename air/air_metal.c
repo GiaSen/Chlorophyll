@@ -2895,8 +2895,9 @@ buffer_offset_ok(const struct rwa_device *device, const struct air_resource *r,
           what, offset, b->size);
       return -1;
    }
+   /* Chlorophyll: unless the shader adds a delta to this buffer's accesses (add_ssbo_deltas), which serves any multiple of 4 */
    if (r->kind == AIR_RESOURCE_DEVICE_BUFFER &&
-       offset % device->ssbo_offset_align != 0) {
+       offset % device->ssbo_offset_align != 0 && !(r->offset_delta && offset % 4 == 0)) {
       say(why, why_size, "%s is bound at offset %zu, and %s declares it in the `device` "
                          "address space, whose offsets this GPU fetches in multiples of "
                          "%u bytes. A `constant` buffer at such an offset is uploaded "
@@ -3214,6 +3215,8 @@ slot_shapes(nir_shader *cs, struct rwa_slot slots[RWA_MAX_TEXTURES],
    }
 }
 
+static void add_ssbo_deltas(nir_shader *nir, struct air_shader_info *info);
+
 struct rwa_compute *
 rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_compute_info *info,
@@ -3288,6 +3291,9 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                 ? _mesa_shader_stage_to_string(compute->info.stage) : "non-compute");
       goto fail;
    }
+
+   /* Chlorophyll: once, on the translated shader, since compute_state_for compiles clones of it */
+   add_ssbo_deltas(compute->nir, &compute->info);
 
    /* What the shader expects to be bound, counted the way Metal counts it: by the
     * highest index plus one, because the indices are the binding numbers and a kernel
@@ -3997,7 +4003,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
     */
    struct pipe_shader_buffer sb[PIPE_MAX_SHADER_BUFFERS] = { 0 };
    unsigned num_ssbo = 0, writable = 0;
-   uint32_t cb_deltas[16] = { 0 };     /* add_cb_deltas: per buffer index, read by the shader from slot cb_delta_ubo - 1 */
+   uint32_t cb_deltas[32] = { 0 };     /* per buffer index, read by the shader from slot cb_delta_ubo - 1: 0-15 add_cb_deltas, 16-31 add_ssbo_deltas */
 
    /* and each texture as the kind of view its own instructions ask for. A read-only
     * texture stays a texture: Metal's read() on one becomes a txf, a texture fetch, so
@@ -4068,6 +4074,13 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
           */
          sb[r->index].buffer_offset = (unsigned)boffset;
          sb[r->index].buffer_size = b->size - MIN2(b->size, boffset);
+         if (boffset % device->ssbo_offset_align != 0 && r->offset_delta && info->cb_delta_ubo && r->index < 16) {
+            /* Chlorophyll: in place at the aligned offset below; the shader adds the rest (add_ssbo_deltas). */
+            size_t aligned = boffset - boffset % device->ssbo_offset_align;
+            sb[r->index].buffer_offset = (unsigned)aligned;
+            sb[r->index].buffer_size = b->size - MIN2(b->size, aligned);
+            cb_deltas[16 + r->index] = (uint32_t)(boffset - aligned);
+         }
          num_ssbo = MAX2(num_ssbo, r->index + 1);
          if (r->write)
             writable |= 1u << r->index;
@@ -6516,6 +6529,76 @@ add_cb_deltas(nir_shader *nir, struct air_shader_info *info)
    info->cb_delta_ubo = CB_DELTA_SLOT + 1;
 }
 
+/* Chlorophyll: the same delta for `device` buffers (SSBOs), which buffer_offset_ok used to refuse at an offset this GPU
+ * cannot fetch from (64 on a6xx): iOS 26's compute_sum_luma gets buffer 2 at offset 32, three of those trip backboardd's
+ * dead-man. Uploading it, as a `constant` one is, would throw the shader's writes away, so the buffer is bound in place at
+ * the offset rounded down and every load, store and atomic of it adds the rest, read from entry 16 + index of the delta
+ * table. Every `device` buffer below index 16 gets it (whether one is misaligned is only known at the dispatch); a 0 delta
+ * costs an add of a constant ir3 keeps in the const file. RWA_SSBO_DELTA=0 turns it off and the refusal is back. */
+static void
+add_ssbo_deltas(nir_shader *nir, struct air_shader_info *info)
+{
+   static int on = -1;
+   if (on < 0)
+      on = !(getenv("RWA_SSBO_DELTA") && getenv("RWA_SSBO_DELTA")[0] == '0');
+   unsigned mask = 0;
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      const struct air_resource *r = &info->resources[i];
+      if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER && r->index >= CB_DELTA_SLOT)
+         return;                 /* the delta table's slot is the shader's own */
+      if (r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->index < 16)
+         mask |= 1u << r->index;
+   }
+   if (!on || !mask)
+      return;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            unsigned isrc;       /* the buffer index; the offset is the source after it */
+            switch (in->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+               isrc = 0;
+               break;
+            case nir_intrinsic_store_ssbo:
+               isrc = 1;
+               break;
+            default:
+               continue;
+            }
+            if (!nir_src_is_const(in->src[isrc]))
+               continue;
+            unsigned idx = nir_src_as_uint(in->src[isrc]);
+            if (idx >= 16 || !(mask & (1u << idx)))
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *delta = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, CB_DELTA_SLOT), nir_imm_int(&b, 4 * (16 + idx)),
+                                          .align_mul = 4, .align_offset = 0, .range_base = 0, .range = 128);
+            nir_src_rewrite(&in->src[isrc + 1], nir_iadd(&b, in->src[isrc + 1].ssa, delta));
+            /* the delta is a multiple of 4, so the access is only known 4-aligned now */
+            if (nir_intrinsic_has_align_mul(in) && nir_intrinsic_align_mul(in) > 4) {
+               nir_intrinsic_set_align_mul(in, 4);
+               nir_intrinsic_set_align_offset(in, nir_intrinsic_align_offset(in) % 4);
+            }
+         }
+      }
+      nir_metadata_preserve(impl, nir_metadata_control_flow);
+   }
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      struct air_resource *r = &info->resources[i];
+      if (r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->index < 16)
+         r->offset_delta = true;
+   }
+   nir->info.num_ubos = MAX2(nir->info.num_ubos, CB_DELTA_SLOT + 1);
+   info->ssbo_delta_mask = mask;
+   info->cb_delta_ubo = CB_DELTA_SLOT + 1;
+}
+
 struct rwa_render *
 rwa_render_create(struct rwa_device *device,
                   const void *vertex_bitcode, size_t vertex_size,
@@ -6873,9 +6956,11 @@ rwa_render_create(struct rwa_device *device,
 
    size_unsized_constants(fs, &render->finfo);
    add_cb_deltas(fs, &render->finfo);
+   add_ssbo_deltas(fs, &render->finfo);
    if (!render->generated_vertex) {
       size_unsized_constants(vs, &render->vinfo);
       add_cb_deltas(vs, &render->vinfo);
+      add_ssbo_deltas(vs, &render->vinfo);
    }
 
    /* Compile both stages now. A failure here is a creation failure and says so; the
