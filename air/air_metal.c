@@ -248,7 +248,23 @@ struct rwa_texture {
    /* Chlorophyll: its render surface (level 0, layer 0, its own format: the only one a pass makes), made when it is
     * first an attachment and kept, so consecutive draws into it give the same pointer (see rwa_device.fb_color) */
    struct pipe_surface *surface;
+
+   /* Chlorophyll: a VIEW (rwa_texture_view: -[MTLTexture newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:]) is
+    * this struct over its parent's resource, with a format, a range of levels and slices and a swizzle of its own; every call
+    * that takes a level or a slice adds base_level / base_layer. Zero is a plain texture: its resource's format, all levels,
+    * no swizzle. QuartzCore 26 makes views (and swizzles, e.g. alpha forced to one) for its materials. */
+   bool is_view, has_swizzle;
+   enum pipe_format view_format;    /* PIPE_FORMAT_NONE: the resource's */
+   enum pipe_texture_target view_target;
+   unsigned base_level, level_count, base_layer, layer_count;
+   unsigned char swizzle[4];        /* PIPE_SWIZZLE_*, when has_swizzle */
 };
+
+static enum pipe_format
+tex_format(const struct rwa_texture *t)
+{
+   return t->view_format != PIPE_FORMAT_NONE ? t->view_format : t->res->format;
+}
 
 /* the libdrm stand-in's IOSurface calls (gpu/freedreno-sweet/sweet_drm.c); struct sweet_gpu_surface_bo, first 48 bytes (ABI minor 0 layout,
  * which every kernel minor accepts: a caller may pass and accept only these) */
@@ -1847,6 +1863,8 @@ rwa_texture_copy(struct rwa_texture *src, unsigned slevel, unsigned sslice, cons
    if (util_format_get_blocksize(src->res->format) != util_format_get_blocksize(dst->res->format) ||
        util_format_get_blockwidth(src->res->format) != util_format_get_blockwidth(dst->res->format))
       return -1;
+   slevel += src->base_level; sslice += src->base_layer;   /* views */
+   dlevel += dst->base_level; dslice += dst->base_layer;
    struct pipe_box box;
    u_box_3d((int)so[0], (int)so[1], (int)(so[2] + sslice), (int)size[0], (int)size[1], (int)(size[2] ? size[2] : 1), &box);
    struct pipe_context *pipe = src->device->pipe;
@@ -1863,16 +1881,18 @@ rwa_texture_resolve(struct rwa_texture *src, struct rwa_texture *dst, unsigned d
 {
    if (!src || !dst || !src->res || !dst->res || src->device != dst->device || src->res->nr_samples <= 1)
       return -1;
+   dlevel += dst->base_level;   /* views */
+   dslice += dst->base_layer;
    struct pipe_blit_info b;
    memset(&b, 0, sizeof(b));
    unsigned w = MIN2(u_minify(dst->res->width0, dlevel), src->res->width0);
    unsigned h = MIN2(u_minify(dst->res->height0, dlevel), src->res->height0);
    b.src.resource = src->res;
-   b.src.format = src->res->format;
-   b.src.level = 0;
+   b.src.format = tex_format(src);
+   b.src.level = src->base_level;
    u_box_3d(0, 0, 0, (int)w, (int)h, 1, &b.src.box);
    b.dst.resource = dst->res;
-   b.dst.format = dst->res->format;
+   b.dst.format = tex_format(dst);
    b.dst.level = dlevel;
    u_box_3d(0, 0, (int)dslice, (int)w, (int)h, 1, &b.dst.box);
    b.mask = PIPE_MASK_RGBA;
@@ -1936,7 +1956,10 @@ texture_surface(struct rwa_texture *t)
 {
    if (!t->surface)
       t->surface = t->device->pipe->create_surface(t->device->pipe, t->res,
-                                                   &(struct pipe_surface){ .format = t->res->format });
+                                                   &(struct pipe_surface){ .format = tex_format(t),
+                                                                           .u.tex.level = t->base_level,
+                                                                           .u.tex.first_layer = t->base_layer,
+                                                                           .u.tex.last_layer = t->base_layer });
    return t->surface;
 }
 
@@ -1984,7 +2007,7 @@ rwa_texture_destroy(struct rwa_texture *texture)
     * the moment the last reference went, which is the same trap delete_compute_state
     * below is about.
     */
-   if (!texture->surface_handle && texture->res &&
+   if (!texture->surface_handle && !texture->is_view && !texture->has_swizzle && texture->res &&
        tex_pool_put(texture->device, texture->res, texture->view)) {
       free(texture);          /* the pool holds the resource's reference and the view now */
       return;
@@ -1995,6 +2018,111 @@ rwa_texture_destroy(struct rwa_texture *texture)
    }
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
+}
+
+/* Chlorophyll: MTLTextureSwizzle (Zero, One, Red, Green, Blue, Alpha) in Gallium's terms */
+static unsigned char
+pipe_swizzle_of_metal(unsigned char m)
+{
+   static const unsigned char map[6] = { PIPE_SWIZZLE_0, PIPE_SWIZZLE_1, PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W };
+   return m < 6 ? map[m] : PIPE_SWIZZLE_X;
+}
+
+static bool
+swizzle_is_identity(const unsigned char m[4])
+{
+   return m[0] == 2 && m[1] == 3 && m[2] == 4 && m[3] == 5;
+}
+
+/* Chlorophyll: MTLTextureDescriptor.swizzle on a texture, before it is first sampled (the sampler view is made then). */
+int
+rwa_texture_set_swizzle(struct rwa_texture *t, const unsigned char metal_swizzle[4])
+{
+   if (!t || !metal_swizzle)
+      return -1;
+   if (swizzle_is_identity(metal_swizzle) && !t->has_swizzle)
+      return 0;
+   for (unsigned i = 0; i < 4; i++)
+      t->swizzle[i] = pipe_swizzle_of_metal(metal_swizzle[i]);
+   t->has_swizzle = !swizzle_is_identity(metal_swizzle);
+   if (t->view) {
+      unbind_tex_state(t->device, t->view);
+      t->device->pipe->sampler_view_destroy(t->device->pipe, t->view);
+      t->view = NULL;
+   }
+   return 0;
+}
+
+/* Chlorophyll: -[MTLTexture newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:]. The same memory as `parent` (a
+ * reference on its resource), read and rendered as `pixel_format`, `type`, levels [base_level, base_level + level_count) and
+ * slices [base_layer, base_layer + layer_count) of the parent's, with `metal_swizzle` (NULL: identity) when it is sampled. A view
+ * of a view is a view of the parent. NULL and a sentence: a format of another size per texel, or a range past the parent's. */
+struct rwa_texture *
+rwa_texture_view(struct rwa_texture *parent, unsigned metal_format, unsigned type, unsigned base_level, unsigned level_count,
+                 unsigned base_layer, unsigned layer_count, const unsigned char metal_swizzle[4], char *why, size_t why_size)
+{
+   if (!parent || !parent->res) {
+      say(why, why_size, "a view of no texture");
+      return NULL;
+   }
+   const struct rwa_pixel_format *fmt = pixel_format(metal_format);
+   if (!fmt) {
+      say(why, why_size, "pixel format %u is %s", metal_format, pixel_format_refusal(metal_format));
+      return NULL;
+   }
+   if (util_format_get_blocksize(fmt->pipe) != util_format_get_blocksize(parent->res->format)) {
+      say(why, why_size, "a %s view of a %s texture: not the same size per texel", fmt->name, parent->format_name);
+      return NULL;
+   }
+   base_level += parent->base_level;
+   base_layer += parent->base_layer;
+   if (!level_count) level_count = 1;
+   if (!layer_count) layer_count = 1;
+   if (base_level + level_count > parent->res->last_level + 1 || base_layer + layer_count > MAX2(parent->layers, 1)) {
+      say(why, why_size, "levels %u..%u and slices %u..%u of a texture with %u levels and %u slices", base_level,
+          base_level + level_count - 1, base_layer, base_layer + layer_count - 1, parent->res->last_level + 1, parent->layers);
+      return NULL;
+   }
+   struct rwa_texture *v = calloc(1, sizeof(*v));
+   if (!v) {
+      say(why, why_size, "out of memory making a texture view");
+      return NULL;
+   }
+   v->device = parent->device;
+   pipe_resource_reference(&v->res, parent->res);
+   v->shape = parent->shape;
+   v->shape.pixel_format = metal_format;
+   v->shape.type = type;
+   v->shape.width = u_minify(parent->res->width0, base_level);
+   v->shape.height = u_minify(parent->res->height0, base_level);
+   v->shape.mip_levels = level_count;
+   v->shape.array_length = layer_count;
+   v->format_name = fmt->name;
+   v->layers = parent->layers;          /* slices are counted from the parent's first (base_layer is added) */
+   v->shader_read = parent->shader_read;
+   v->shader_write = parent->shader_write;
+   v->surface_handle = parent->surface_handle;
+   v->is_view = true;
+   v->view_format = fmt->pipe;
+   switch (type) {
+   case RWA_TYPE_1D:       v->view_target = PIPE_TEXTURE_1D; break;
+   case RWA_TYPE_1D_ARRAY: v->view_target = PIPE_TEXTURE_1D_ARRAY; break;
+   case RWA_TYPE_2D_ARRAY: v->view_target = PIPE_TEXTURE_2D_ARRAY; break;
+   case RWA_TYPE_CUBE:     v->view_target = PIPE_TEXTURE_CUBE; break;
+   case RWA_TYPE_CUBE_ARRAY: v->view_target = PIPE_TEXTURE_CUBE_ARRAY; break;
+   case RWA_TYPE_3D:       v->view_target = PIPE_TEXTURE_3D; break;
+   default:                v->view_target = parent->res->target == PIPE_TEXTURE_RECT ? PIPE_TEXTURE_RECT : PIPE_TEXTURE_2D; break;
+   }
+   v->base_level = base_level;
+   v->level_count = level_count;
+   v->base_layer = base_layer;
+   v->layer_count = layer_count;
+   if (metal_swizzle && !swizzle_is_identity(metal_swizzle)) {
+      for (unsigned i = 0; i < 4; i++)
+         v->swizzle[i] = pipe_swizzle_of_metal(metal_swizzle[i]);
+      v->has_swizzle = true;
+   }
+   return v;
 }
 
 /*
@@ -2090,6 +2218,8 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                   const unsigned origin[3], const unsigned size[3], const void *bytes,
                   size_t stride, char *why, size_t why_size)
 {
+   level += texture->base_level;   /* Chlorophyll: a view's levels and slices are its parent's from its base */
+   layer += texture->base_layer;
    struct pipe_box box;
    size_t row;
 
@@ -2161,6 +2291,8 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                  const unsigned origin[3], const unsigned size[3], void *bytes,
                  size_t stride, char *why, size_t why_size)
 {
+   level += texture->base_level;   /* Chlorophyll: views (see rwa_texture_write) */
+   layer += texture->base_layer;
    struct pipe_context *pipe = texture->device->pipe;
    struct pipe_box box;
    size_t row;
@@ -2244,6 +2376,8 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                const unsigned origin[3], const unsigned size[3], float *depth,
                uint8_t *stencil, char *why, size_t why_size)
 {
+   level += texture->base_level;   /* Chlorophyll: views (see rwa_texture_write) */
+   layer += texture->base_layer;
    struct pipe_context *pipe = texture->device->pipe;
    enum pipe_format format = texture->res->format;
    struct pipe_box box;
@@ -4215,7 +4349,20 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
           */
          if (!t->view) {
             struct pipe_sampler_view tmpl = { 0 };
-            u_sampler_view_default_template(&tmpl, t->res, t->res->format);
+            u_sampler_view_default_template(&tmpl, t->res, tex_format(t));
+            if (t->is_view) {
+               tmpl.target = t->view_target;
+               tmpl.u.tex.first_level = t->base_level;
+               tmpl.u.tex.last_level = t->base_level + t->level_count - 1;
+               tmpl.u.tex.first_layer = t->base_layer;
+               tmpl.u.tex.last_layer = t->base_layer + t->layer_count - 1;
+            }
+            if (t->has_swizzle) {
+               tmpl.swizzle_r = t->swizzle[0];
+               tmpl.swizzle_g = t->swizzle[1];
+               tmpl.swizzle_b = t->swizzle[2];
+               tmpl.swizzle_a = t->swizzle[3];
+            }
             t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
             if (!t->view) {
                say(why, why_size, "%s would not make a sampler view of the %s bound at "
@@ -4231,7 +4378,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
       case AIR_RESOURCE_IMAGE:
          images[r->index] = (struct pipe_image_view){
             .resource = t->res,
-            .format = t->res->format,
+            .format = tex_format(t),
             /* what the shader does with it, from the metadata rather than assumed: a
              * read-write image told it is write-only reads zeros on some drivers.
              */
@@ -4239,7 +4386,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
                       (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
             .shader_access = (r->read ? PIPE_IMAGE_ACCESS_READ : 0) |
                              (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
-            .u.tex.level = 0,
+            .u.tex.level = t->base_level,
             .u.tex.first_layer = 0,
             .u.tex.last_layer = (t->shape.type == RWA_TYPE_3D ? t->res->depth0
                                                               : t->layers) - 1,
@@ -4248,10 +4395,10 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
          /* Chlorophyll: a view of each other mip level in the image's level slots (air_resource.level_slots); a level the
           * texture does not have gets its last one */
          for (unsigned l = 1; l <= r->level_slots && r->level_base + l - 1 < RWA_MAX_TEXTURES; l++) {
-            unsigned lvl = MIN2(l, t->res->last_level);
+            unsigned lvl = MIN2(l, t->res->last_level - t->base_level);
             struct pipe_image_view *v = &images[r->level_base + l - 1];
             *v = images[r->index];
-            v->u.tex.level = lvl;
+            v->u.tex.level = t->base_level + lvl;
             if (t->shape.type == RWA_TYPE_3D)
                v->u.tex.last_layer = MAX2(t->res->depth0 >> lvl, 1) - 1;
             num_images = MAX2(num_images, r->level_base + l);

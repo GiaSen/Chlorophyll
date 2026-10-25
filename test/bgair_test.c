@@ -450,6 +450,42 @@ main(int argc, char **argv)
          printf("  sample %s: %.3f %.3f %.3f %.3f (want %.3f)\n", fname[f], po[0], po[1], po[2], po[3], want);
       }
    }
+   { // texture view: level 1 of a 3-level RGBA32Float texture, swizzled (Blue, Green, Red, One), sampled through the view
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_tex_sample", &info);
+      char why2[512] = { 0 };
+      struct rwa_sampler_state st = { .normalized_coordinates = 1, .lod_max = 1000.0f };
+      struct rwa_sampler *smp = c ? rwa_sampler_create(dev, &st, why2, sizeof(why2)) : NULL;
+      struct rwa_texture_shape sh = { .pixel_format = 125, .type = 2, .width = 32, .height = 32, .depth = 1, .array_length = 1,
+                                      .mip_levels = 3, .sample_count = 1, .usage = 1 };
+      struct rwa_texture *t = smp ? rwa_texture_create(dev, &sh, why2, sizeof(why2)) : NULL;
+      static float lv[32 * 32 * 4];
+      bool ok = t != NULL;
+      for (unsigned l = 0; ok && l < 3; l++) {
+         unsigned w = 32 >> l;
+         for (unsigned i = 0; i < w * w; i++) { lv[4*i] = 0.1f + l; lv[4*i+1] = 0.2f + l; lv[4*i+2] = 0.3f + l; lv[4*i+3] = 0.5f; }
+         unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, w, 1 };
+         ok = rwa_texture_write(t, l, 0, o, sz, lv, 0, why2, sizeof(why2)) == 0;
+      }
+      static const unsigned char swz[4] = { 4, 3, 2, 1 };   /* MTLTextureSwizzle Blue, Green, Red, One */
+      struct rwa_texture *v = ok ? rwa_texture_view(t, 125, 2, 1, 1, 0, 1, swz, why2, sizeof(why2)) : NULL;
+      ok = v != NULL;
+      struct rwa_buffer *o = ok ? buf(16 * 16 * 16) : NULL;
+      if (ok) {
+         struct rwa_buffer *bufs[1] = { o };
+         struct rwa_texture *texs[1] = { v };
+         struct rwa_sampler *smps[1] = { smp };
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = 1, .textures = texs, .texture_count = 1, .samplers = smps, .sampler_count = 1 };
+         unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 16, 16, 1 };
+         ok = rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
+      }
+      const float *po = ok ? rwa_buffer_map(o) : NULL;
+      bool good = ok && fabsf(po[0] - 1.3f) < 0.001f && fabsf(po[1] - 1.2f) < 0.001f && fabsf(po[2] - 1.1f) < 0.001f && po[3] == 1.0f;
+      CHECK(good, "texture view: %g %g %g %g want 1.3 1.2 1.1 1%s%s", po ? po[0] : 0, po ? po[1] : 0, po ? po[2] : 0, po ? po[3] : 0,
+            ok ? "" : ": ", ok ? "" : why2);
+      printf("  texture view (level 1, BGR1): %.2f %.2f %.2f %.2f%s%s\n", po ? po[0] : 0, po ? po[1] : 0, po ? po[2] : 0, po ? po[3] : 0,
+             ok ? "" : ": ", ok ? "" : why2);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;

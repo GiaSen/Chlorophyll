@@ -353,6 +353,16 @@ bg_install_fallback(Class c)
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb;
 @end
 
+// MTLHeap (QuartzCore 26 asks for one every frame and falls back when it gets nil): every allocation is an ordinary one of the
+// device's, so nothing aliases (more memory, the same pictures); /private/var/tmp/bgmtl.noheap makes the device answer nil again.
+@interface BGMTLHeap : NSObject {
+   @public
+   id _owner;
+   NSUInteger _size, _storage, _cache, _hazard, _type;
+   NSString *_label;
+}
+@end
+
 @interface BGMTLTexture : _MTLResource {
    BGMTLDevice *_owner;
    struct rwa_texture *_tex;
@@ -366,6 +376,9 @@ bg_install_fallback(Class c)
    BOOL _surfCopy;       // an IOSurface the GPU could not import (row pitch not 64-aligned): own memory, refreshed from the surface at each use
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
+   BGMTLTexture *_parent;  // a texture view (newTextureViewWith...): the texture whose memory it shows (retained)
+   NSUInteger _parentLevel, _parentSlice;
+   MTLTextureSwizzleChannels _swizzle;
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
@@ -452,7 +465,7 @@ ensure_protocol(Class cls, const char *proto)
    // lookup there would patch the inject's copy instead of its own
    Class fb[] = { [BGMTLCommandQueue class], [BGMTLCommandBuffer class], [BGMTLRenderEncoder class], [BGMTLComputeEncoder class],
                   [BGMTLBlitEncoder class], [BGMTLBuffer class], [BGMTLTexture class], [BGMTLRenderPipeline class],
-                  [BGMTLComputePipeline class], [BGMTLSampler class], [BGMTLDepthStencil class] };
+                  [BGMTLComputePipeline class], [BGMTLSampler class], [BGMTLDepthStencil class], [BGMTLHeap class] };
    for (unsigned i = 0; i < sizeof(fb) / sizeof(fb[0]); i++) {
       if (fb[i]) bg_install_fallback(fb[i]);
    }
@@ -786,6 +799,19 @@ bg_air_slice(NSData *d)
 {
    return [[BGMTLTexture alloc] initWithBGDevice:self descriptor:d];
 }
+- (id)newHeapWithDescriptor:(MTLHeapDescriptor *)d
+{
+   if (!d || access("/private/var/tmp/bgmtl.noheap", F_OK) == 0) return nil;
+   BGMTLHeap *h = [[BGMTLHeap alloc] init];
+   h->_owner = self;
+   h->_size = [d size];
+   h->_storage = [d storageMode];
+   h->_cache = [d cpuCacheMode];
+   h->_hazard = [d hazardTrackingMode];
+   h->_type = [d type];
+   BG_TRACE("heap %p: %lu bytes, type %lu\n", h, (unsigned long)h->_size, (unsigned long)h->_type);
+   return h;
+}
 
 // A texture over the caller's memory (QuartzCore's CPU-drawn images): a texture of our own, refreshed from those bytes at each use
 // (rows of length / height bytes), and the deallocator called when it is freed.
@@ -967,6 +993,28 @@ bg_air_slice(NSData *d)
 @end
 
 // ---- buffer ----------------------------------------------------------------------------------------------------------
+@implementation BGMTLHeap
+- (void)dealloc { [_label release]; [super dealloc]; }
+- (id)device { return _owner; }
+- (NSString *)label { return _label; }
+- (void)setLabel:(NSString *)l { [_label release]; _label = [l copy]; }
+- (NSUInteger)storageMode { return _storage; }
+- (NSUInteger)cpuCacheMode { return _cache; }
+- (NSUInteger)hazardTrackingMode { return _hazard; }
+- (NSUInteger)resourceOptions { return (_storage << MTLResourceStorageModeShift) | (_cache << MTLResourceCPUCacheModeShift) | (_hazard << MTLResourceHazardTrackingModeShift); }
+- (NSUInteger)type { return _type; }
+- (NSUInteger)size { return _size; }
+- (NSUInteger)usedSize { return 0; }
+- (NSUInteger)currentAllocatedSize { return _size; }
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment { (void)alignment; return _size; }
+- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return MTLPurgeableStateNonVolatile; }
+- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options { return [_owner newBufferWithLength:length options:options]; }
+- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options offset:(NSUInteger)offset
+{ (void)offset; return [_owner newBufferWithLength:length options:options]; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return [_owner newTextureWithDescriptor:d]; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset { (void)offset; return [_owner newTextureWithDescriptor:d]; }
+@end
+
 @implementation BGMTLBuffer
 + (void)load { ensure_protocol(self, "MTLBuffer"); }
 
@@ -1789,17 +1837,82 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    }
    if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
    _owner = device;
+   // MTLTextureDescriptor.swizzle (QuartzCore 26 forces alpha to one for opaque content this way): applied when it is sampled
+   _swizzle = [d swizzle];
+   const unsigned char sw[4] = { (unsigned char)_swizzle.red, (unsigned char)_swizzle.green, (unsigned char)_swizzle.blue, (unsigned char)_swizzle.alpha };
+   bg_lock(); rwa_texture_set_swizzle(_tex, sw); bg_unlock();
    return self;
 }
+
+// ---- texture views: the parent's memory as another format, level range, slice range or swizzle ----
+- (instancetype)initViewOf:(BGMTLTexture *)parent rwa:(struct rwa_texture *)v pixelFormat:(NSUInteger)pf textureType:(NSUInteger)tt
+                    levels:(NSRange)lv slices:(NSRange)sl swizzle:(MTLTextureSwizzleChannels)sw
+{
+   self = [super init];
+   if (!self) { bg_lock(); rwa_texture_destroy(v); bg_unlock(); return nil; }
+   _tex = v;
+   _owner = parent->_owner;
+   _parent = [parent retain];
+   _parentLevel = lv.location;
+   _parentSlice = sl.location;
+   _swizzle = sw;
+   _shape = parent->_shape;
+   _shape.pixel_format = (unsigned)pf;
+   _shape.type = (unsigned)tt;
+   _shape.width = MAX(1u, parent->_shape.width >> lv.location);
+   _shape.height = MAX(1u, parent->_shape.height >> lv.location);
+   _shape.depth = MAX(1u, parent->_shape.depth >> lv.location);
+   _shape.mip_levels = (unsigned)lv.length;
+   _shape.array_length = (unsigned)MAX(sl.length, 1u);
+   return self;
+}
+- (id)bgViewWithPixelFormat:(NSUInteger)pf textureType:(NSUInteger)tt levels:(NSRange)lv slices:(NSRange)sl swizzle:(MTLTextureSwizzleChannels)sw
+{
+   BG_TRACE("texture view of %p: fmt %lu type %lu levels %lu+%lu slices %lu+%lu swizzle %u%u%u%u\n", self, (unsigned long)pf, (unsigned long)tt,
+            (unsigned long)lv.location, (unsigned long)lv.length, (unsigned long)sl.location, (unsigned long)sl.length,
+            sw.red, sw.green, sw.blue, sw.alpha);
+   const unsigned char s4[4] = { (unsigned char)sw.red, (unsigned char)sw.green, (unsigned char)sw.blue, (unsigned char)sw.alpha };
+   char why[256] = { 0 };
+   bg_lock();
+   struct rwa_texture *v = rwa_texture_view(_tex, (unsigned)pf, (unsigned)tt, (unsigned)lv.location, (unsigned)lv.length,
+                                            (unsigned)sl.location, (unsigned)sl.length, s4, why, sizeof(why));
+   bg_unlock();
+   if (!v) { BG_LOG("texture view refused: %s\n", why); return nil; }
+   return [[BGMTLTexture alloc] initViewOf:self rwa:v pixelFormat:pf textureType:tt levels:lv slices:sl swizzle:sw];
+}
+- (id)newTextureViewWithPixelFormat:(NSUInteger)pf
+{
+   return [self bgViewWithPixelFormat:pf textureType:_shape.type levels:NSMakeRange(0, MAX(_shape.mip_levels, 1u))
+                               slices:NSMakeRange(0, MAX(_shape.array_length, 1u)) swizzle:MTLTextureSwizzleChannelsDefault];
+}
+- (id)newTextureViewWithPixelFormat:(NSUInteger)pf textureType:(NSUInteger)tt levels:(NSRange)lv slices:(NSRange)sl
+{
+   return [self bgViewWithPixelFormat:pf textureType:tt levels:lv slices:sl swizzle:MTLTextureSwizzleChannelsDefault];
+}
+- (id)newTextureViewWithPixelFormat:(NSUInteger)pf textureType:(NSUInteger)tt levels:(NSRange)lv slices:(NSRange)sl
+                            swizzle:(MTLTextureSwizzleChannels)sw
+{
+   return [self bgViewWithPixelFormat:pf textureType:tt levels:lv slices:sl swizzle:sw];
+}
+- (id)newTextureViewWithDescriptor:(MTLTextureViewDescriptor *)d
+{
+   if (!d) return nil;
+   return [self bgViewWithPixelFormat:[d pixelFormat] textureType:[d textureType] levels:[d levelRange] slices:[d sliceRange]
+                              swizzle:[d swizzle]];
+}
+- (MTLTextureSwizzleChannels)swizzle { return _swizzle; }
+- (NSUInteger)parentRelativeLevel { return _parentLevel; }
+- (NSUInteger)parentRelativeSlice { return _parentSlice; }
 - (void)dealloc
 {
    bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
    if (_surface) CFRelease(_surface);
+   [_parent release];
    [_linSrc release];
    if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
    [super dealloc];
 }
-- (void *)iosurface { return (void *)_surface; }
+- (void *)iosurface { return _parent ? [_parent iosurface] : (void *)_surface; }
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (BOOL)isDrawable { return _surface != NULL; }
 // A linear texture over a buffer reads the buffer's current bytes each time it is handed to the GPU (at commit), so CPU
@@ -1814,6 +1927,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 
 - (struct rwa_texture *)rwaTextureSampledLocked
 {
+   if (_parent) { [_parent rwaTextureSampledLocked]; return _tex; }   // a view: the parent's memory is the one to refresh
    // An IOSurface another process draws with the CPU (SpringBoard's status bar, the volume HUD): its new pixels may still sit in
    // CPU caches. The surface's seed moves at every write unlock, so the cache is cleaned whenever the seed differs from the one
    // last cleaned at (per surface ID: QuartzCore makes new texture objects for the same surface all the time). The import cache
@@ -1837,6 +1951,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 
 - (struct rwa_texture *)rwaTexture
 {
+   if (_parent) { [_parent rwaTexture]; return _tex; }
    if (_surfCopy && _tex && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
@@ -1881,7 +1996,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 - (NSUInteger)textureType { return _shape.type; }
 - (NSUInteger)usage { return _shape.usage; }
 - (BOOL)isFramebufferOnly { return NO; }
-- (id)parentTexture { return nil; }
+- (id)parentTexture { return _parent; }
 - (id)buffer { return nil; }
 - (NSUInteger)storageMode { return 0; }
 - (NSUInteger)cpuCacheMode { return 0; }
