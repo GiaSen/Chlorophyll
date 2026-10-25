@@ -307,6 +307,7 @@ bg_install_fallback(Class c)
    NSInteger _status;
    NSMutableArray *_completed, *_scheduled, *_presents;   // handlers; drawables to present once the work has completed
    dispatch_group_t _done;                                 // left when the completion (fence) has run: waitUntilCompleted
+   int _slotReturned;                                      // the base queue's in-flight slot given back (bg_return_slot)
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (void)bgRecord:(BGWork *)work;
@@ -1029,6 +1030,22 @@ bg_air_slice(NSData *d)
 @end
 
 @implementation BGMTLCommandBuffer
+/* iOS 26: _MTLCommandBuffer's initializer waits on its queue's _commandBufferSemaphore (maxCommandBufferCount, 64 by default),
+ * which Apple signals from its own completion path (commandBufferDidComplete:...). Ours complete on their own, so the queue
+ * never got its slots back and command buffer 65 blocked for ever (backboardd froze after a few frames; the CA probe stopped
+ * at exactly 64 pipelines). Each buffer returns its slot once: at completion, or at dealloc if it never completed. Looked up
+ * by name, so a Metal without the ivar is left alone. */
+static void
+bg_return_slot(BGMTLCommandBuffer *cb, BGMTLCommandQueue *queue)
+{
+   if (!queue || __atomic_exchange_n(&cb->_slotReturned, 1, __ATOMIC_ACQ_REL)) return;
+   static Ivar sem_ivar;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{ sem_ivar = class_getInstanceVariable(objc_getClass("_MTLCommandQueue"), "_commandBufferSemaphore"); });
+   if (!sem_ivar) return;
+   dispatch_semaphore_t sem = (dispatch_semaphore_t)object_getIvar(queue, sem_ivar);
+   if (sem) dispatch_semaphore_signal(sem);
+}
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue
 {
    self = [super initWithQueue:queue retainedReferences:YES synchronousDebugMode:NO];
@@ -1044,6 +1061,7 @@ bg_air_slice(NSData *d)
 }
 - (void)dealloc
 {
+   bg_return_slot(self, _queue);
    [_queue release]; [_work release]; [_error release]; [_completed release]; [_scheduled release]; [_presents release];
    if (_done) dispatch_release(_done);
    [super dealloc];
@@ -1341,6 +1359,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 // What follows a completed (or failed) command buffer; run by the completion queue, or inline when tracing.
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
+   bg_return_slot(self, _queue);
    BGMTLDevice *dev = (BGMTLDevice *)[_queue device];
    (void)dev;
    for (void (^h)(id) in _scheduled) h(self);    // left here by the compositor's deferral (see commit)
