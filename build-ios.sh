@@ -12,7 +12,7 @@ BG_GPU="${BERGAMOTA_GPU:-$HERE/..}"
 WORK="${GPU_METAL_WORK:?set GPU_METAL_WORK}"
 EAGL_LIBDRM="${GPU_EAGL_LIBDRM:-$HERE/libdrm}"               # the libdrm submodule (2.4.124 headers) unless set
 VENV="${GPU_EAGL_VENV:?set GPU_EAGL_VENV}"
-EAGL_CROSS="${GPU_EAGL_CROSS:?set GPU_EAGL_CROSS to gpu-eagl's ios-hw.cross}"
+EAGL_CROSS="${GPU_EAGL_CROSS:?set GPU_EAGL_CROSS to the ios-hw.cross of gpu-eagl}"
 export PATH="$(brew --prefix bison)/bin:$VENV/bin:$PATH"
 D="$WORK/mesa-air"; cd "$D"
 "$BG_GPU/freedreno-sweet/build.sh" "$D/drm-ios" >/dev/null           # the libdrm stand-in, arm64e, PAC-stripped and signed copy in libdrm.2.dylib

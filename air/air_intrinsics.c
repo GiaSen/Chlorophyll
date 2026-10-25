@@ -1605,6 +1605,15 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
          return false;
       arg++;
    }
+   /* iOS 26 read: air.get_read_sampler() between the texture and the coordinate, an offset after the coordinate */
+   bool read_sampler = false;
+   if (!strcmp(t.op, "read") && in->num_operands > arg) {
+      struct air_val *sv = air_get(c, in->operands[arg]);
+      if (sv && sv->kind == AIR_VAL_PTR && sv->ptr.class == AIR_PTR_NONE) {
+         read_sampler = true;
+         arg++;
+      }
+   }
 
    /* A depth texture takes a plane or aspect selector before the coordinate,
     * and every call in the corpus passes 1. What else it can be is not known
@@ -1684,6 +1693,21 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
    if (!coord)
       return false;
+   if (read_sampler) {
+      if (in->num_operands <= arg)
+         return air_error(c, "intrinsic: air.%s with a read sampler but no offset", n->part[0]);
+      nir_def *off = air_get_ssa(c, in->operands[arg++]);
+      if (!off)
+         return false;
+      off = nir_u2u32(&c->b, off);
+      nir_def *comps[4];
+      for (unsigned i = 0; i < coord->num_components && i < 4; i++) {
+         comps[i] = nir_channel(&c->b, coord, i);
+         if (i < off->num_components && i < ncoord)
+            comps[i] = nir_iadd(&c->b, comps[i], nir_channel(&c->b, off, i));
+      }
+      coord = nir_vec(&c->b, comps, MIN2(coord->num_components, 4));
+   }
 
    if (!strcmp(t.op, "read") && tex.is_image) {
       uint64_t extra;
@@ -1992,6 +2016,14 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    /* Bergamota: a null texture is a pointer that names nothing (AIR_PTR_NONE); a shader that selects it only
     * ever tests it or has the branch removed by function-constant folding. Sampling it is refused where it happens. */
    if (!strncmp(name, "air.get_null_texture", 20)) {
+      struct air_ptr np = { .class = AIR_PTR_NONE };
+      air_set(c, &in->base, air_val_ptr(c, np));
+      return true;
+   }
+   /* Bergamota: the iOS 26 (Metal 4 era) texture read passes a sampler, air.get_read_sampler(), between the texture and the
+    * coordinate, and an offset after it: read_texture_2d(tex, get_read_sampler(), coord, offset, lod, ...). The sampler
+    * names no resource here (a read is a texel fetch); the read below skips it and adds the offset. */
+   if (!strcmp(name, "air.get_read_sampler")) {
       struct air_ptr np = { .class = AIR_PTR_NONE };
       air_set(c, &in->base, air_val_ptr(c, np));
       return true;
