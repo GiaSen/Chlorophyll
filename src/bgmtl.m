@@ -2216,7 +2216,15 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
    id b = [[(BGMTLDevice *)[self device] newBufferWithBytes:bytes length:l < 16 ? 16 : l options:0] autorelease];
    if (b) { [_scratch addObject:b]; [self setFragmentBuffer:b offset:0 atIndex:i]; }
 }
-- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; } }
+- (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
+{
+   if (bg_trace() && t)   // which image a draw samples: size, format, IOSurface (another process's drawable or snapshot) and its view
+      BG_LOG("setFragmentTexture %p index %lu: %lux%lu fmt %lu surface %u%s\n", t, (unsigned long)i, (unsigned long)[(id<MTLTexture>)t width],
+             (unsigned long)[(id<MTLTexture>)t height], (unsigned long)[(id<MTLTexture>)t pixelFormat],
+             [(BGMTLTexture *)t iosurface] ? (unsigned)IOSurfaceGetID((IOSurfaceRef)[(BGMTLTexture *)t iosurface]) : 0u,
+             [(id<MTLTexture>)t parentTexture] ? " (view)" : "");
+   if (i < BG_MAX_TEX) { _tex[i] = t; if (i + 1 > _thigh) _thigh = (unsigned)i + 1; }
+}
 - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { if (i < BG_MAX_TEX) { _smp[i] = s; if (i + 1 > _shigh) _shigh = (unsigned)i + 1; } }
 - (void)setViewport:(MTLViewport)v
 {
