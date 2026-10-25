@@ -5154,6 +5154,11 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       case AIR_RESOURCE_IMAGE:
          c.nir->info.num_images = MAX2(c.nir->info.num_images, r->index + 1);
          BITSET_SET(c.nir->info.images_used, r->index);
+         /* Chlorophyll: and the slots of its other mip levels (image_level_index) */
+         for (unsigned l = 0; l < r->level_slots; l++)
+            BITSET_SET(c.nir->info.images_used, r->level_base + l);
+         if (r->level_slots)
+            c.nir->info.num_images = MAX2(c.nir->info.num_images, r->level_base + r->level_slots);
          break;
       default:
          break;

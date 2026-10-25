@@ -56,3 +56,14 @@ kernel void bg_tex_write(texture2d<float, access::write> t [[texture(0)]], uint2
    if (gid.x < t.get_width() && gid.y < t.get_height())
       t.write(float4(float(gid.x) / 16.0, float(gid.y) / 16.0, 0.5, 1.0), gid);
 }
+
+// write the mip level `lod`, known only at run time (Mercury's VariableBlurrer::downsample does): every texel of that level
+// gets the level's own size as the shader measured it, so a wrong view shows as a wrong size or a texel in the wrong level
+kernel void bg_mip_write(texture2d<float, access::write> t [[texture(0)]], constant uint &lod [[buffer(0)]],
+                         device uint *sizes [[buffer(1)]], uint2 gid [[thread_position_in_grid]])
+{
+   uint w = t.get_width(lod), h = t.get_height(lod);
+   if (gid.x == 0 && gid.y == 0) { sizes[2 * lod] = w; sizes[2 * lod + 1] = h; }
+   if (gid.x < w && gid.y < h)
+      t.write(float4(float(w) / 255.0, float(h) / 255.0, float(lod) / 255.0, 1.0), gid, lod);
+}

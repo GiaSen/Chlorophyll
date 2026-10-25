@@ -4180,6 +4180,17 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
                                                               : t->layers) - 1,
          };
          num_images = MAX2(num_images, r->index + 1);
+         /* Chlorophyll: a view of each other mip level in the image's level slots (air_resource.level_slots); a level the
+          * texture does not have gets its last one */
+         for (unsigned l = 1; l <= r->level_slots && r->level_base + l - 1 < RWA_MAX_TEXTURES; l++) {
+            unsigned lvl = MIN2(l, t->res->last_level);
+            struct pipe_image_view *v = &images[r->level_base + l - 1];
+            *v = images[r->index];
+            v->u.tex.level = lvl;
+            if (t->shape.type == RWA_TYPE_3D)
+               v->u.tex.last_layer = MAX2(t->res->depth0 >> lvl, 1) - 1;
+            num_images = MAX2(num_images, r->level_base + l);
+         }
          break;
 
       case AIR_RESOURCE_SAMPLER:

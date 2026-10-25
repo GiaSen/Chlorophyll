@@ -169,6 +169,15 @@ struct air_resource {
     * served and not only those the GPU can fetch from.
     */
    bool offset_delta;
+
+   /* Chlorophyll: an image written or measured at a mip level that is not a
+    * constant 0 (Mercury's VariableBlurrer::downsample writes `lods.y`). A
+    * Gallium image view is one level and ir3's resinfo ignores a lod, so level
+    * L >= 1 has its own image slot, level_base + L - 1, for L up to
+    * level_slots, and the runtime binds a view of each level there; level 0
+    * stays at .index. level_slots == 0: only level 0.
+    */
+   unsigned level_base, level_slots;
 };
 
 struct air_varying {

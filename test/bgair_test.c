@@ -4,6 +4,7 @@
 // The same source builds for the Mac (RWA_SOFTWARE=1 runs softpipe, a reference for the expected numbers) and for the phone.
 //   bgair_test FILE.metallib
 // The MTLB container reader is the format of the frontend's air_metallib.c (MIT, Copyright 2026 Darwin on redwood contributors).
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #include "air_metal.h"
 
 static int pass, fail;
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define CHECK(c, ...) do { if (c) pass++; else { fail++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 
 static uint64_t rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = v << 8 | p[i]; return v; }
@@ -189,6 +191,78 @@ main(int argc, char **argv)
             printf("  bg_groupsum: %u of %u correct\n", groups - bad, groups);
          } else fail++;
       } else fail++;
+   }
+   { // bg_tex_write: a constant level 0 (the control for bg_mip_write). RGBA32Float as bgmtl_render_probe's P3: an RGBA8Unorm image
+     // written by a kernel reads back zeros through this path (2026-10-25, not chased yet)
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_tex_write", &info);
+      struct rwa_texture_shape shape = { .pixel_format = 125 /* RGBA32Float */, .type = 2, .width = 16, .height = 8, .depth = 1, .array_length = 1,
+                                         .mip_levels = 1, .sample_count = 1, .usage = 3 };
+      char why2[512] = { 0 };
+      struct rwa_texture *t = c ? rwa_texture_create(dev, &shape, why2, sizeof(why2)) : NULL;
+      float got[16 * 8 * 4] = { 0 };
+      unsigned origin[3] = { 0, 0, 0 }, size[3] = { 16, 8, 1 };
+      bool ok = t && rwa_texture_write(t, 0, 0, origin, size, got, 0, why2, sizeof(why2)) == 0;
+      struct rwa_texture *texs[1] = { t };
+      struct rwa_bindings b = { .textures = texs, .texture_count = 1 };
+      unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 16, 8, 1 };
+      ok = ok && rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0 &&
+           rwa_texture_read(t, 0, 0, origin, size, got, 0, why2, sizeof(why2)) == 0;
+      unsigned bad = 0;
+      for (unsigned y = 0; ok && y < 8; y++)
+         for (unsigned x = 0; x < 16; x++) {
+            const float *p = got + 4 * (y * 16 + x);
+            if (p[0] != x / 16.0f || p[1] != y / 16.0f || p[2] != 0.5f || p[3] != 1.0f) { if (bad++ < 3) printf("    texel %u,%u = %g,%g,%g,%g\n", x, y, p[0], p[1], p[2], p[3]); }
+         }
+      CHECK(ok && bad == 0, "bg_tex_write %u texels wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why2);
+      printf("  bg_tex_write: %u texels wrong\n", bad);
+   }
+   for (unsigned run = 0; run < 2; run++) { // bg_mip_write: level 0 of one level, then levels 0, 2 and 4 of a 16x8 RGBA32Float chain of 5, the level a buffer value; 1 and 3 must stay zero
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_mip_write", &info);
+      const unsigned W = 16, H = 8, LEVELS = run ? 5 : 1, written = run ? 1u << 0 | 1u << 2 | 1u << 4 : 1u;
+      struct rwa_texture_shape shape = { .pixel_format = 125 /* RGBA32Float */, .type = 2 /* 2D */, .width = W, .height = H,
+                                         .depth = 1, .array_length = 1, .mip_levels = LEVELS, .sample_count = 1,
+                                         .usage = 3 /* ShaderRead | ShaderWrite */ };
+      char why2[512] = { 0 };
+      struct rwa_texture *t = c ? rwa_texture_create(dev, &shape, why2, sizeof(why2)) : NULL;
+      if (c && !t) printf("  rwa_texture_create: %s\n", why2);
+      struct rwa_buffer *k = t ? buf(16) : NULL, *sz = t ? buf(64) : NULL;
+      float zero[16 * 8 * 4] = { 0 }, got[16 * 8 * 4];
+      bool ok = k && sz;
+      if (ok) memset(rwa_buffer_map(sz), 0xff, 64);
+      for (unsigned l = 0; ok && l < LEVELS; l++) {
+         unsigned origin[3] = { 0, 0, 0 }, size[3] = { MAX(W >> l, 1), MAX(H >> l, 1), 1 };
+         ok = rwa_texture_write(t, l, 0, origin, size, zero, 0, why2, sizeof(why2)) == 0;
+      }
+      for (unsigned l = 0; ok && l < LEVELS; l++) {
+         if (!(written & 1u << l))
+            continue;
+         *(uint32_t *)rwa_buffer_map(k) = l;
+         struct rwa_buffer *bufs[2] = { k, sz };
+         struct rwa_texture *texs[1] = { t };
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = 2, .textures = texs, .texture_count = 1 };
+         unsigned groups[3] = { 1, 1, 1 }, size[3] = { W, H, 1 };
+         ok = rwa_dispatch(c, &b, groups, size, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
+      }
+      if (ok) {
+         unsigned bad = 0;
+         const uint32_t *ps = rwa_buffer_map(sz);
+         for (unsigned l = 0; l < LEVELS; l++)
+            if (written & 1u << l) {
+               CHECK(ps[2 * l] == MAX(W >> l, 1) && ps[2 * l + 1] == MAX(H >> l, 1), "bg_mip_write: level %u measured %ux%u", l, ps[2 * l], ps[2 * l + 1]);
+            }
+         for (unsigned l = 0; l < LEVELS; l++) {
+            unsigned w = MAX(W >> l, 1), h = MAX(H >> l, 1), origin[3] = { 0, 0, 0 }, size[3] = { w, h, 1 };
+            if (rwa_texture_read(t, l, 0, origin, size, got, 0, why2, sizeof(why2)) != 0) { bad++; printf("    read level %u: %s\n", l, why2); continue; }
+            float want[4] = { 0, 0, 0, 0 };
+            if (written & 1u << l) { want[0] = w / 255.0f; want[1] = h / 255.0f; want[2] = l / 255.0f; want[3] = 1.0f; }
+            for (unsigned i = 0; i < w * h; i++)
+               if (memcmp(got + 4 * i, want, sizeof(want))) { if (bad++ < 4) printf("    level %u texel %u = %g,%g,%g,%g want %g,%g,%g,%g\n", l, i, got[4 * i], got[4 * i + 1], got[4 * i + 2], got[4 * i + 3], want[0], want[1], want[2], want[3]); }
+         }
+         CHECK(bad == 0, "bg_mip_write %u texels wrong", bad);
+         printf("  bg_mip_write (%u level%s): written at a level from a buffer, %u texels wrong\n", LEVELS, LEVELS > 1 ? "s" : "", bad);
+      } else { fail++; printf("  bg_mip_write FAILED: %s\n", why2); }
    }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);

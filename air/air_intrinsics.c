@@ -1474,6 +1474,47 @@ set_tex_result(struct air_ctx *c, const struct air_inst *in, nir_def *value)
 }
 
 
+/* Chlorophyll: the image slot of level `lod` of an image (air_resource.level_slots). A
+ * constant 0 is the image's own slot; anything else gives the image its level slots,
+ * above every image index the shader has, and picks one at run time (ir3 takes a
+ * dynamic image index). A level past the last slot writes the last slot.
+ */
+#define AIR_IMAGE_LEVEL_SLOTS 11    /* levels 1..11: a 2048-texel side down to 1 */
+#define AIR_MAX_IMAGE_SLOTS 16      /* the runtime's image table (RWA_MAX_TEXTURES) */
+static nir_def *
+image_level_index(struct air_ctx *c, const struct air_ptr *tex, nir_def *lod)
+{
+   if (!lod || (nir_src_is_const(nir_src_for_ssa(lod)) &&
+                nir_src_as_uint(nir_src_for_ssa(lod)) == 0))
+      return nir_imm_int(&c->b, tex->binding);
+
+   struct air_resource *r = NULL;
+   unsigned top = 0;
+   for (unsigned i = 0; i < c->info->num_resources; i++) {
+      struct air_resource *q = &c->info->resources[i];
+      if (q->kind != AIR_RESOURCE_IMAGE)
+         continue;
+      if (q->index == tex->binding)
+         r = q;
+      top = MAX2(top, q->level_slots ? q->level_base + q->level_slots : q->index + 1);
+   }
+   if (!r)
+      return air_error(c, "intrinsic: a mip level of image %u, which the interface does "
+                          "not declare", tex->binding), NULL;
+   if (!r->level_slots) {
+      if (top + AIR_IMAGE_LEVEL_SLOTS > AIR_MAX_IMAGE_SLOTS)
+         return air_error(c, "intrinsic: image %u at a mip level known only at run time "
+                             "needs %u image slots from %u, past the %u there are",
+                          tex->binding, AIR_IMAGE_LEVEL_SLOTS, top, AIR_MAX_IMAGE_SLOTS), NULL;
+      r->level_base = top;
+      r->level_slots = AIR_IMAGE_LEVEL_SLOTS;
+   }
+   lod = nir_u2u32(&c->b, lod);
+   nir_def *slot = nir_iadd_imm(&c->b, nir_umin(&c->b, lod, nir_imm_int(&c->b, r->level_slots)),
+                                (int64_t)r->level_base - 1);
+   return nir_bcsel(&c->b, nir_ieq_imm(&c->b, lod, 0), nir_imm_int(&c->b, tex->binding), slot);
+}
+
 /* A query: a size, a level count or a sample count, of a texture or an image. */
 static nir_def *
 query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex_name *t,
@@ -1489,7 +1530,12 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
          unsigned n = comps ? comps :
             (t->dim == GLSL_SAMPLER_DIM_1D || t->dim == GLSL_SAMPLER_DIM_BUF ? 1 :
              t->dim == GLSL_SAMPLER_DIM_3D ? 3 : 2) + (t->is_array ? 1 : 0);
-         return nir_image_size(&c->b, n, 32, index, lod ? lod : nir_imm_int(&c->b, 0),
+         /* Chlorophyll: resinfo reports the bound view's size and ignores a lod, so the
+          * lod picks the view (image_level_index) */
+         index = image_level_index(c, tex, lod);
+         if (!index)
+            return NULL;
+         return nir_image_size(&c->b, n, 32, index, nir_imm_int(&c->b, 0),
                                .image_dim = t->dim, .image_array = t->is_array);
       }
       case nir_texop_query_levels:
@@ -1715,16 +1761,17 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *value = air_get_ssa(c, in->operands[arg++]);
       if (!value)
          return false;
-      uint64_t lod;
-      if (!tex_flag(c, in, arg, &lod))
-         return false;
-      if (lod != 0)
-         return air_error(c, "intrinsic: air.%s to mip level %u (only 0 is handled)",
-                          n->part[0], (unsigned)lod);
       if (!tex.is_image)
          return air_error(c, "intrinsic: air.%s to a texture the interface says is not "
                              "written", n->part[0]);
-      nir_image_store(&c->b, nir_imm_int(&c->b, tex.binding),
+      /* Chlorophyll: the mip level, constant or not, picks the image slot of that level */
+      nir_def *lod = air_get_ssa(c, in->operands[arg]);
+      if (!lod)
+         return false;
+      nir_def *index = image_level_index(c, &tex, lod);
+      if (!index)
+         return false;
+      nir_image_store(&c->b, index,
                       nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
                       nir_imm_int(&c->b, 0),
