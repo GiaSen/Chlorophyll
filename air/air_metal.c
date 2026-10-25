@@ -254,6 +254,7 @@ struct rwa_texture {
     * that takes a level or a slice adds base_level / base_layer. Zero is a plain texture: its resource's format, all levels,
     * no swizzle. QuartzCore 26 makes views (and swizzles, e.g. alpha forced to one) for its materials. */
    bool is_view, has_swizzle;
+   bool null_standin;               /* a driver's zero texture for an unbound slot (rwa_texture_mark_null): air.is_null_texture says true */
    enum pipe_format view_format;    /* PIPE_FORMAT_NONE: the resource's */
    enum pipe_texture_target view_target;
    unsigned base_level, level_count, base_layer, layer_count;
@@ -2036,6 +2037,14 @@ rwa_texture_destroy(struct rwa_texture *texture)
    }
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
+}
+
+/* Chlorophyll: this texture is a driver's stand-in for a slot the application bound nothing to (air.is_null_texture: true) */
+void
+rwa_texture_mark_null(struct rwa_texture *t)
+{
+   if (t)
+      t->null_standin = true;
 }
 
 /* Chlorophyll: MTLTextureSwizzle (Zero, One, Red, Green, Blue, Alpha) in Gallium's terms */
@@ -4220,7 +4229,17 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
     */
    struct pipe_shader_buffer sb[PIPE_MAX_SHADER_BUFFERS] = { 0 };
    unsigned num_ssbo = 0, writable = 0;
-   uint32_t cb_deltas[32] = { 0 };     /* per buffer index, read by the shader from slot cb_delta_ubo - 1: 0-15 add_cb_deltas, 16-31 add_ssbo_deltas */
+   uint32_t cb_deltas[33] = { 0 };     /* per buffer index, read by the shader from slot cb_delta_ubo - 1: 0-15 add_cb_deltas, 16-31 add_ssbo_deltas,
+                                        * 32 the null-texture mask (AIR_NULL_MASK_WORD) */
+   if (info->null_texture_mask)
+      for (unsigned i = 0; i < info->num_resources; i++) {
+         const struct air_resource *nr = &info->resources[i];
+         if ((nr->kind != AIR_RESOURCE_TEXTURE && nr->kind != AIR_RESOURCE_IMAGE) || nr->index >= 32)
+            continue;
+         struct rwa_texture *nt = bindings && bindings->textures && nr->index < bindings->texture_count ? bindings->textures[nr->index] : NULL;
+         if (!nt || nt->null_standin)
+            cb_deltas[AIR_NULL_MASK_WORD] |= 1u << nr->index;
+      }
 
    /* and each texture as the kind of view its own instructions ask for. A read-only
     * texture stays a texture: Metal's read() on one becomes a txf, a texture fetch, so
@@ -6779,6 +6798,10 @@ add_cb_deltas(nir_shader *nir, struct air_shader_info *info)
 static void
 add_ssbo_deltas(nir_shader *nir, struct air_shader_info *info)
 {
+   if (info->null_texture_mask) {   /* air.is_null_texture reads the delta table too (AIR_NULL_MASK_WORD) */
+      info->cb_delta_ubo = CB_DELTA_SLOT + 1;
+      nir->info.num_ubos = MAX2(nir->info.num_ubos, CB_DELTA_SLOT + 1);
+   }
    static int on = -1;
    if (on < 0)
       on = !(getenv("RWA_SSBO_DELTA") && getenv("RWA_SSBO_DELTA")[0] == '0');

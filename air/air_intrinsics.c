@@ -2225,6 +2225,22 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       struct air_val *t = air_get(c, in->operands[1]);
       if (!t || t->kind != AIR_VAL_PTR)
          return air_error(c, "intrinsic: air.is_null_texture of something that is not a resolved texture");
+      /* Chlorophyll: a texture argument is null when the draw bound nothing at its slot (Metal answers true there, and
+       * Mercury's space shaders take their no-albedo / no-normals paths on it): bit `binding` of the run-time null mask in
+       * the delta constant buffer. Not when the shader has a constant buffer of its own in that slot (then: false). */
+      bool own_slot = false;
+      for (unsigned i = 0; i < c->info->num_resources; i++)
+         if (c->info->resources[i].kind == AIR_RESOURCE_CONSTANT_BUFFER && c->info->resources[i].index >= AIR_DELTA_UBO)
+            own_slot = true;
+      if (t->ptr.class == AIR_PTR_TEXTURE && t->ptr.binding < 32 && !own_slot) {
+         nir_def *mask = nir_load_ubo(&c->b, 1, 32, nir_imm_int(&c->b, AIR_DELTA_UBO), nir_imm_int(&c->b, 4 * AIR_NULL_MASK_WORD),
+                                      .align_mul = 4, .align_offset = 0, .range_base = 0, .range = ~0);
+         nir_def *bit = nir_iand_imm(&c->b, mask, 1u << t->ptr.binding);
+         c->info->null_texture_mask = true;
+         c->nir->info.num_ubos = MAX2(c->nir->info.num_ubos, AIR_DELTA_UBO + 1);
+         air_set(c, &in->base, air_val_ssa(c, nir_ine_imm(&c->b, bit, 0)));
+         return true;
+      }
       air_set(c, &in->base, air_val_ssa(c, nir_imm_bool(&c->b, t->ptr.class == AIR_PTR_NONE)));
       return true;
    }

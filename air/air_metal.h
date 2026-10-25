@@ -592,6 +592,8 @@ struct rwa_texture *rwa_texture_view(struct rwa_texture *parent, unsigned pixel_
                                      unsigned level_count, unsigned base_layer, unsigned layer_count,
                                      const unsigned char metal_swizzle[4], char *why, size_t why_size);
 int rwa_texture_set_swizzle(struct rwa_texture *texture, const unsigned char metal_swizzle[4]);
+/* Chlorophyll: a stand-in for an unbound slot, which air.is_null_texture reports as null */
+void rwa_texture_mark_null(struct rwa_texture *texture);
 int rwa_texture_debug_fill(struct rwa_texture *dst, const float rgba[4]);   /* Chlorophyll debugging */
 int rwa_texture_force_opaque(struct rwa_texture *dst);   /* Chlorophyll debugging: alpha := 1 on level 0 */
 /* Chlorophyll: generateMipmapsForTexture on the GPU, levels 1..last from level 0 (0 or -1). */

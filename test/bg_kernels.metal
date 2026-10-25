@@ -125,3 +125,10 @@ kernel void bg_tex_write_half(texture2d<half, access::write> t [[texture(0)]], u
    if (gid.x < t.get_width() && gid.y < t.get_height())
       t.write(half4(0.25h, 0.5h, 0.75h, 1.0h), gid);
 }
+
+// is_null_texture at run time: a is bound, b is not (Metal answers false, true)
+kernel void bg_is_null(texture2d<float> a [[texture(0)]], texture2d<float> b [[texture(1)]], device uint *out [[buffer(0)]],
+                       uint gid [[thread_position_in_grid]])
+{
+   if (gid == 0) { out[0] = is_null_texture(a) ? 1 : 0; out[1] = is_null_texture(b) ? 1 : 0; }
+}

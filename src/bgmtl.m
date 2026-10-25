@@ -549,6 +549,7 @@ ensure_protocol(Class cls, const char *proto)
    unsigned slices = type == MTLTextureTypeCube ? 6 : 1;
    for (unsigned sl = 0; sl < slices; sl++)
       [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:sl withBytes:zero bytesPerRow:16 bytesPerImage:0];
+   rwa_texture_mark_null([(BGMTLTexture *)t rwaTexture]);   // air.is_null_texture: true for whatever slot this stands in
    _nulls[key] = t;
    return t;
 }
@@ -1378,8 +1379,14 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
          if (force_alpha) rwa_texture_force_opaque([(BGMTLTexture *)w->dst rwaTexture]);
          // debugging: /private/var/tmp/bgmtl.tintresolve fills what a resolve wrote with red (does the screen show this texture?);
          // checked at every resolve, so it can be switched live
-         if (access("/private/var/tmp/bgmtl.tintresolve", F_OK) == 0)
-            rwa_texture_debug_fill([(BGMTLTexture *)w->dst rwaTexture], (const float[4]){ 1.0f, 0.0f, 0.0f, 1.0f });
+         // (the file may hold "r g b" in linear 0..1: a mid grey tells whether the compositor passes the drawable through unchanged)
+         FILE *tf2 = fopen("/private/var/tmp/bgmtl.tintresolve", "r");
+         if (tf2) {
+            float rgba[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+            if (fscanf(tf2, "%f %f %f", &rgba[0], &rgba[1], &rgba[2]) != 3) { rgba[0] = 1.0f; rgba[1] = rgba[2] = 0.0f; }
+            fclose(tf2);
+            rwa_texture_debug_fill([(BGMTLTexture *)w->dst rwaTexture], rgba);
+         }
       } else if (w->kind == BG_WORK_TEXCOPY &&
                  rwa_texture_copy([(BGMTLTexture *)w->src rwaTexture], (unsigned)w->t_slevel, (unsigned)w->t_sslice,
                                   (const unsigned[3]){ (unsigned)w->t_sorg[0], (unsigned)w->t_sorg[1], (unsigned)w->t_sorg[2] },
@@ -1535,6 +1542,7 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
             [seen addObject:w->dst];   // a multisample attachment cannot be read back; what it resolved into can
       for (BGMTLTexture *t in seen) {
          unsigned wd = (unsigned)[t width], ht = (unsigned)[t height];
+         if ([t iosurface]) rwa_texture_flush_surface([t rwaTexture]);   // the GPU's pixels, not stale CPU cache lines
          const unsigned pts[5][2] = { { wd / 2, ht / 2 }, { wd / 4, ht / 4 }, { 3 * wd / 4, ht / 4 }, { wd / 4, 3 * ht / 4 }, { 3 * wd / 4, 3 * ht / 4 } };
          char line[256]; size_t n = 0;
          for (unsigned k = 0; k < 5; k++) {

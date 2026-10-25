@@ -3413,7 +3413,11 @@ sc_eval_uncached(struct air_ctx *c, const struct air_inst *in, uint64_t *out, un
          struct air_val *pv = pe ? pe->data : NULL;
          if (!pv || pv->kind != AIR_VAL_PTR)
             return false;
-         *out = pv->ptr.class == AIR_PTR_NONE;
+         /* Chlorophyll: only a null texture is known here; whether a texture ARGUMENT was bound is the draw's to say
+          * (air.is_null_texture reads a run-time mask), so it is not folded */
+         if (pv->ptr.class != AIR_PTR_NONE)
+            return false;
+         *out = 1;
          return true;
       }
       if (!callee || !callee->name || strcmp(callee->name, "air.is_function_constant_defined") || in->num_operands != 2)

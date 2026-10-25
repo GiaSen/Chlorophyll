@@ -266,6 +266,9 @@ struct air_vertex_attribute {
    const char *function_constant;
 };
 
+#define AIR_DELTA_UBO 15          /* Chlorophyll: the runtime's delta table (air_metal.c, CB_DELTA_SLOT) */
+#define AIR_NULL_MASK_WORD 32     /* ... and in it, the null-texture mask (air.is_null_texture) */
+
 struct air_shader_info {
    gl_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
    const char *entry_point;
@@ -312,6 +315,9 @@ struct air_shader_info {
    /* Chlorophyll: the same for `device` buffers (one bit per [[buffer(n)]], n < 16), whose deltas are entries 16 + n of
     * that constant buffer: such a buffer is bound in place at its offset rounded down, since a copy would lose its writes. */
    unsigned ssbo_delta_mask;
+   /* Chlorophyll: the shader asks air.is_null_texture of a texture argument, answered at run time from a bit mask of the
+    * slots that hold no texture: word AIR_NULL_MASK_WORD of the delta constant buffer (slot AIR_DELTA_UBO) */
+   bool null_texture_mask;
 
    /* The raster order groups the shader declares on its resources, one bit
     * each; 0 when it declares none.

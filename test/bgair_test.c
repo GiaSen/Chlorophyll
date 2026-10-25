@@ -416,9 +416,9 @@ main(int argc, char **argv)
       char why2[512] = { 0 };
       struct rwa_sampler_state st = { .normalized_coordinates = 1, .lod_max = 1000.0f };
       struct rwa_sampler *smp = c ? rwa_sampler_create(dev, &st, why2, sizeof(why2)) : NULL;
-      static const unsigned fmts[3] = { 81, 186, 70 };
-      static const char *fname[3] = { "BGRA8Unorm_sRGB", "ASTC_4x4_sRGB", "RGBA8Unorm" };
-      for (unsigned f = 0; smp && f < 3; f++) {
+      static const unsigned fmts[5] = { 81, 186, 70, 11, 25 };
+      static const char *fname[5] = { "BGRA8Unorm_sRGB", "ASTC_4x4_sRGB", "RGBA8Unorm", "R8Unorm_sRGB", "R16Float" };
+      for (unsigned f = 0; smp && f < 5; f++) {
          struct rwa_texture_shape sh = { .pixel_format = fmts[f], .type = 2, .width = 16, .height = 16, .depth = 1, .array_length = 1,
                                          .mip_levels = 1, .sample_count = 1, .usage = 1 };
          struct rwa_texture *t = rwa_texture_create(dev, &sh, why2, sizeof(why2));
@@ -433,6 +433,12 @@ main(int argc, char **argv)
                memcpy(q, blk, 16);
             }
             stride = 4 * 16;   /* a row of 4 blocks */
+         } else if (fmts[f] == 11) {   /* one byte a texel */
+            for (unsigned i = 0; i < 16 * 16; i++) data[i] = 128;
+            stride = 16;
+         } else if (fmts[f] == 25) {   /* one half a texel: 0.5 */
+            for (unsigned i = 0; i < 16 * 16; i++) { data[2 * i] = 0x00; data[2 * i + 1] = 0x38; }
+            stride = 32;
          } else
             for (unsigned i = 0; i < 16 * 16 * 4; i++) data[i] = (i % 4 == 3) ? 255 : 128;
          if (rwa_texture_write(t, 0, 0, origin, size, data, stride, why2, sizeof(why2)) != 0) { printf("  %s write: %s\n", fname[f], why2); fail++; continue; }
@@ -444,8 +450,10 @@ main(int argc, char **argv)
          unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 16, 16, 1 };
          bool ok = rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
          const float *po = rwa_buffer_map(o);
-         double want = fmts[f] == 70 ? 128 / 255.0 : (fmts[f] == 186 ? pow((0.5 + 0.055) / 1.055, 2.4) : pow((128 / 255.0 + 0.055) / 1.055, 2.4));
-         bool good = ok && fabs(po[0] - want) < 0.01 && fabs(po[1] - want) < 0.01 && fabs(po[2] - want) < 0.01;
+         double want = fmts[f] == 70 ? 128 / 255.0 : fmts[f] == 25 ? 0.5 :
+                       (fmts[f] == 186 ? pow((0.5 + 0.055) / 1.055, 2.4) : pow((128 / 255.0 + 0.055) / 1.055, 2.4));
+         bool one = fmts[f] == 11 || fmts[f] == 25;   /* single channel: red only */
+         bool good = ok && fabs(po[0] - want) < 0.01 && (one || (fabs(po[1] - want) < 0.01 && fabs(po[2] - want) < 0.01));
          CHECK(good, "sample %s: %g %g %g %g want %g%s%s", fname[f], po[0], po[1], po[2], po[3], want, ok ? "" : ": ", ok ? "" : why2);
          printf("  sample %s: %.3f %.3f %.3f %.3f (want %.3f)\n", fname[f], po[0], po[1], po[2], po[3], want);
       }
@@ -518,6 +526,29 @@ main(int argc, char **argv)
          CHECK(good, "bg_tex_write_half fmt %u: %g %g %g %g%s%s", fmts[f], got[0], got[1], got[2], got[3], ok ? "" : ": ", ok ? "" : why2);
          printf("  bg_tex_write_half fmt %u: %.3f %.3f %.3f %.3f (want 0.25 0.5 0.75 1)\n", fmts[f], got[0], got[1], got[2], got[3]);
       }
+   }
+   { // bg_is_null: slot 0 bound, slot 1 not: 0 then 1
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_is_null", &info);
+      char why2[512] = { 0 };
+      struct rwa_texture_shape sh = { .pixel_format = 70, .type = 2, .width = 4, .height = 4, .depth = 1, .array_length = 1,
+                                      .mip_levels = 1, .sample_count = 1, .usage = 1 };
+      struct rwa_texture *t = c ? rwa_texture_create(dev, &sh, why2, sizeof(why2)) : NULL;
+      struct rwa_texture *stand_in = t ? rwa_texture_create(dev, &sh, why2, sizeof(why2)) : NULL;   /* what bgmtl binds for nothing */
+      if (stand_in) rwa_texture_mark_null(stand_in);
+      struct rwa_buffer *o = stand_in ? buf(16) : NULL;
+      bool ok = o != NULL;
+      if (ok) {
+         uint32_t *po = rwa_buffer_map(o); po[0] = po[1] = 7;
+         struct rwa_buffer *bufs[1] = { o };
+         struct rwa_texture *texs[2] = { t, stand_in };
+         struct rwa_bindings b = { .buffers = bufs, .buffer_count = 1, .textures = texs, .texture_count = 2 };
+         unsigned groups[3] = { 1, 1, 1 }, gs[3] = { 1, 1, 1 };
+         ok = rwa_dispatch(c, &b, groups, gs, why2, sizeof(why2)) == 0 && rwa_finish(dev, why2, sizeof(why2)) == 0;
+      }
+      const uint32_t *po = ok ? rwa_buffer_map(o) : NULL;
+      CHECK(ok && po[0] == 0 && po[1] == 1, "bg_is_null: %u %u want 0 1%s%s", po ? po[0] : 9, po ? po[1] : 9, ok ? "" : ": ", ok ? "" : why2);
+      printf("  bg_is_null: bound %u unbound %u (want 0 1)%s%s\n", po ? po[0] : 9, po ? po[1] : 9, ok ? "" : ": ", ok ? "" : why2);
    }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
