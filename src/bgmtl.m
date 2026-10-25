@@ -1051,6 +1051,67 @@ bg_air_slice(NSData *d)
    return s;
 }
 
+// The other ways to ask for a pipeline: with reflection, and asynchronously. They reached _MTLDevice's own implementations,
+// which hand the work to MTLCompilerService for an Apple GPU and come back with nothing usable here (iOS 26's RenderBox, which
+// draws the icons in iconservicesagent: MTLCompilerService at 100 % for minutes, then "precondition failure" and an abort).
+// Built by the methods above; the reflection object is not made (nil), and completion handlers run before returning.
+- (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor options:(NSUInteger)options
+                                reflection:(id *)reflection error:(NSError **)error
+{
+   BG_TRACE("newRenderPipelineState...options:%lu reflection:%s\n", (unsigned long)options, reflection ? "asked" : "-");
+   if (reflection) *reflection = nil;
+   return [self newRenderPipelineStateWithDescriptor:descriptor error:error];
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor completionHandler:(void (^)(id, NSError *))handler
+{
+   BG_TRACE("newRenderPipelineState...completionHandler\n");
+   NSError *err = nil;
+   id p = [self newRenderPipelineStateWithDescriptor:descriptor error:&err];
+   if (handler) handler(p, err);
+   [p release];
+}
+- (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor options:(NSUInteger)options
+                           completionHandler:(void (^)(id, id, NSError *))handler
+{
+   BG_TRACE("newRenderPipelineState...options:%lu completionHandler\n", (unsigned long)options);
+   NSError *err = nil;
+   id p = [self newRenderPipelineStateWithDescriptor:descriptor error:&err];
+   if (handler) handler(p, nil, err);
+   [p release];
+}
+- (void)newComputePipelineStateWithFunction:(id)function completionHandler:(void (^)(id, NSError *))handler
+{
+   BG_TRACE("newComputePipelineState...completionHandler\n");
+   NSError *err = nil;
+   id p = [self newComputePipelineStateWithFunction:function error:&err];
+   if (handler) handler(p, err);
+   [p release];
+}
+- (void)newComputePipelineStateWithFunction:(id)function options:(NSUInteger)options completionHandler:(void (^)(id, id, NSError *))handler
+{
+   (void)options;
+   BG_TRACE("newComputePipelineState...options completionHandler\n");
+   NSError *err = nil;
+   id p = [self newComputePipelineStateWithFunction:function error:&err];
+   if (handler) handler(p, nil, err);
+   [p release];
+}
+- (id)newComputePipelineStateWithFunction:(id)function options:(NSUInteger)options reflection:(id *)reflection error:(NSError **)error
+{
+   (void)options;
+   if (reflection) *reflection = nil;
+   return [self newComputePipelineStateWithFunction:function error:error];
+}
+- (void)newComputePipelineStateWithDescriptor:(id)descriptor options:(NSUInteger)options completionHandler:(void (^)(id, id, NSError *))handler
+{
+   (void)options;
+   BG_TRACE("newComputePipelineState(descriptor)...completionHandler\n");
+   NSError *err = nil;
+   id p = [self newComputePipelineStateWithDescriptor:descriptor error:&err];
+   if (handler) handler(p, nil, err);
+   [p release];
+}
+
 @end
 
 // ---- buffer ----------------------------------------------------------------------------------------------------------
