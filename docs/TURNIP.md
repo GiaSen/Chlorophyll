@@ -4,7 +4,7 @@ Goal (user, 2026-10-26): run Chlorophyll on Mesa's Turnip (Vulkan) instead of Ga
 The reason is CPU cost per draw. On Gallium, backboardd spends 20-55 ms encoding a frame of 170-270 draws (0.1-0.2 ms per draw),
 so home-screen swipes run at 14-35 fps, while the A630 at 710 MHz is at most 60 % busy.
 
-Status: Turnip is built for iOS and **runs on the phone**. It creates an instance and a device on the A630, clears an image, draws a
+Status (latest first): **chl, a Vulkan-native runtime on Turnip (Mesa 26.2.5), passes 27/27 checks on the phone at 5-7.5 us/draw (section 3b)**. Earlier: Turnip is built for iOS and **runs on the phone**. It creates an instance and a device on the A630, clears an image, draws a
 triangle and reads it back with every pixel correct. It encodes a 200-draw frame with per-draw state changes in about 0.8 ms.
 The Metal runtime (`air_metal.c`, `bgmtl.m`) is not ported yet. The plan for that is below.
 
@@ -126,6 +126,86 @@ What the table says:
 - **So swapping the driver underneath the same runtime would not give the 25-50x the raw numbers suggest.** The port has to record
   straight into Vulkan command buffers, as planned below. Vulkan's model makes that the natural design, which is the other reason
   for Turnip.
+
+## 3b. Mesa 26.2.5 (latest stable, 2026-10-26) and the runtime written for Turnip
+
+The user asked for the latest Mesa ("update it to latest Mesa and use Turnip") and for a runtime written for Turnip from the
+ground up, with nothing taken from Gallium or shaped like it. Both are done:
+
+- **Mesa 26.2.5** is the newest stable tag; 26.3.0 is still at rc2. It lives in its own tree, `$WORK/mesa-turnip26`, built by
+  `turnip/build-turnip.sh`, with patches from `patches/mesa-26.2/`. On the A630: `Vulkan 1.3.354`, the smoke test passes,
+  `tu_smoke` 200 draws in about 4.3 us/draw. `mesa-air` (the Gallium libbgair on the phone) is untouched.
+- **`air/chl.h` + `air/chl_vk.c` (+ `chl_render.c.inc`)**: Chlorophyll's GPU runtime, Metal-shaped and Vulkan-native. It
+  replaces `air_metal.c` and `rwa_*`, which are left in the tree only until `bgmtl.m` has moved over.
+- **`libchlorophyll.dylib`**: Turnip, libair and chl in one dylib. The runtime hands Turnip the frontend's NIR, made by the
+  same Mesa: one NIR, and one set of glsl_type singletons.
+
+### What changed in the patches from 25.0.7 to 26.2.5
+
+| patch | 26.2.5 |
+| --- | --- |
+| `air-frontend` | as it was |
+| `ir3-round-default` | as it was |
+| `ir3-disk-cache-macho` | as it was |
+| `ir3-ssbo-subdword` | rewritten. The same rule, in 26.2's `ir3_mem_access_size_align`. It also matters for Turnip on the A630, which writes 16- and 8-bit SSBO descriptors only with `storage_16bit` / `storage_8bit` |
+| `ir3-context-error-return` | rewritten (26.2 spells it `UNREACHABLE`) |
+| `turnip-ios` | rewritten. `CTR_EL0` is now read in `util/cache_ops_aarch64.c`: CWG, DminLine and IminLine are built from `sysctl hw.cachelinesize`. The BO unmap moved into msm's `bo_finish`. Added: the `libchlorophyll` and `air_vk_check` targets |
+| `ir3-shift-split` | **dropped**. 26.2's `lower_offset_for_ssbo` no longer splits a constant out of the add, so the negative-constant case it fixed cannot arise |
+| `air-ir3` | **dropped**. It was the Gallium `libbgair` target plus AIR input for Gallium's `ir3_compiler` host tool. Replaced by `libchlorophyll` and `air_vk_check` |
+| `fd-bo-cache-*`, `fd-bo-new-purge-retry`, `fd6-fb-barrier-reorder`, `fd-screen-trim`, Bergamota's osmesa / `freedreno_bo` hunks | **not carried**: Gallium |
+
+Frontend changes for Mesa 26's NIR (`air/`):
+- `nir_builder.exact` became `fp_math_ctrl`; the frontend now uses `air_b_exact` / `air_b_set_exact`.
+- `gl_shader_stage` became `mesa_shader_stage`.
+- `nir_block_create` takes the impl.
+- `nir_shader_create` lost its fourth argument.
+- The null-texture mask is now a push-constant word (`AIR_PUSH_NULL_MASK_WORD`) instead of a load from constant buffer 15.
+
+Stand-in: `drmSyncobjQuery2` stub (Mesa 26's `vk_drm_syncobj` references it).
+
+### The runtime (`chl`)
+
+| Metal | chl / Vulkan |
+| --- | --- |
+| MTLBuffer (shared) | `chl_buffer`: VkBuffer on host-visible coherent memory, mapped for its life, with a GPU address |
+| MTLTexture | `chl_texture`: VkImage in `VK_IMAGE_LAYOUT_GENERAL` plus a sampled view; single-level storage views and single-layer attachment views made on demand; views (`newTextureViewWithPixelFormat:`) share the parent's image. sRGB/linear views come through a format list |
+| MTLSamplerState | `chl_sampler`: two VkSamplers (plain and comparing; Metal decides at the sample call) |
+| MTLComputePipelineState | `chl_compute_pipeline`: the AIR translated once, one VkPipeline per threadgroup size (and dynamic threadgroup length) |
+| MTLRenderPipelineState | `chl_render_pipeline`: one VkPipeline for dynamic rendering, varyings linked by name. Dynamic state: viewport (negative height, so Metal's y-up clip space maps the same way), scissor, cull, winding, depth bias, stencil reference, blend constants, topology, depth/stencil |
+| MTLCommandBuffer | `chl_cmdbuf`: a VkCommandBuffer from its own pool, retaining what it uses until a completion thread sees its fence; `setBytes` goes to an upload ring of 256 KB slabs |
+| render / compute / blit encoder | `chl_render_begin` (load/store/resolve actions) ... `chl_draw*` ... `chl_render_end`; `chl_compute_begin` ... `chl_dispatch`; `chl_copy_*`, `chl_fill_buffer`, `chl_generate_mipmaps` |
+
+**Binding model** (`air_nir_vk.c`):
+- One push-descriptor set. Each stage has its own range: [[buffer(n)]] at n, [[texture(n)]] at 32 + n, [[sampler(n)]] at 64 + n;
+  the fragment stage is offset by 80.
+- A buffer is bound at its offset rounded down to 64. The shader adds the rest from push-constant word n of its stage (32 words a
+  stage: 31 buffer slots plus the null-texture mask). So every multiple-of-4 offset Metal allows works, with no copies.
+- Constexpr samplers are immutable samplers in the set layout.
+- An image chosen at run time (Mercury's level slots) becomes an if-chain over the slots it can be. The runtime binds a
+  single-level storage view of the texture in each level slot.
+- Hazards are handled conservatively: a full barrier between encoders and around blits, and a shader barrier between the
+  dispatches of a compute encoder. Metal tracks hazards automatically, so conservative is correct; it can be refined later.
+
+**Bugs found on the way, in Mesa's paths that only NIR-given shaders reach:**
+- Turnip's `lower_load_push_constant` reads `base` as dwords while `gather_push_constants` reads it as bytes. Workaround: offset in
+  the source, base 0.
+- `nir_rewrite_image_intrinsic` has no deref direction. It is `UNREACHABLE`, which is undefined behaviour in a release build and
+  crashed on the phone inside `nir_serialize`. The bridge converts the intrinsics itself.
+- One texture slot is read by fetches of its element type and by int size queries. Textures and images therefore get a void result
+  type, which NIR validates with both.
+- `air/air_vk_check.c` (debug host build `$WORK/mesa-turnip26/build-host`, no GPU) translates, bridges, validates and serializes
+  every function of a metallib. It found the last two bugs in seconds. bg_kernels + bg_render: 23/23.
+
+**On the phone (2026-10-26):**
+- `turnip/test/chl_test.c` (built by `turnip/build-chl-test.sh`): **27/27 checks pass**. The checks are bgair_test's compute
+  kernels (unaligned device-buffer offsets, threadgroup memory, run-time texture choice, run-time mip level choice, math against
+  libm, pointer walks), sampling (BGRA8 sRGB, ASTC 4x4 sRGB, R8 sRGB, R16Float), a swizzled level view, half stores, null textures,
+  eight dependent dispatches in one command buffer, RGB10A2 clears, 4x resolves (sRGB too), rendering into level 1 through a view,
+  and a triangle checked pixel by pixel (Metal orientation).
+- **200-draw bench through the full Metal-shaped path** (pipeline switch, setVertexBytes per draw, texture, sampler and constants
+  on every second draw): **5.0-7.5 us/draw**. For comparison: raw Turnip 3.4-4.3, Gallium `rwa_render_draw` 9-17, production
+  bgmtl 100-200. The 2-3 us above raw Turnip is the push of every binding on every draw. Dirty tracking (push only what changed)
+  is the next optimisation.
 
 ## 4. Port plan (Turnip only; Gallium is removed at the end)
 
