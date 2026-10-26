@@ -154,10 +154,24 @@ index 4c2bf6a..b53b28c 100644
  struct tu_queue;
  struct vdrm_bo;
 diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
-index 84ab61f..85e51bb 100644
+index 84ab61f..78fa54c 100644
 --- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
 +++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
-@@ -970,9 +970,14 @@ msm_bo_init_dmabuf(struct tu_device *dev,
+@@ -892,6 +892,13 @@ msm_bo_init(struct tu_device *dev,
+       .size = size,
+       .flags = 0
+    };
++#ifdef __APPLE__
++   /* Chlorophyll (iOS, SweetAdreno): the kernel leaves an unmapped guard page after every BO, where Linux's msm maps BOs
++    * back to back. The GPU's sequential readers (instruction prefetch past a shader's end, vertex and texture fetch, ...)
++    * may run a little past the end of a BO; here that is an SMMU fault and a GPU recovery (SpringBoard, 2026-10-26: reads
++    * at the first byte of the page after a BO). One page of slack per BO, which the BO's own size does not include. */
++   req.size = size + 4096;
++#endif
+ 
+    if (mem_property & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
+       if (mem_property & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
+@@ -970,9 +977,14 @@ msm_bo_init_dmabuf(struct tu_device *dev,
  {
     flags = (enum tu_bo_alloc_flags)(flags | TU_BO_ALLOC_DMABUF);
  
@@ -172,7 +186,7 @@ index 84ab61f..85e51bb 100644
     if (real_size < 0 || (uint64_t) real_size < size)
        return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
  
-@@ -1037,10 +1042,18 @@ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+@@ -1037,10 +1049,18 @@ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
     if (!offset)
        return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
  
@@ -191,7 +205,7 @@ index 84ab61f..85e51bb 100644
     if (map == MAP_FAILED)
        return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
  
-@@ -1136,7 +1149,11 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1136,7 +1156,11 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
     if (bo->map) {
        TU_RMV(bo_unmap, dev, bo);
@@ -203,7 +217,7 @@ index 84ab61f..85e51bb 100644
     }
  
     TU_RMV(bo_destroy, dev, bo);
-@@ -1594,7 +1611,12 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+@@ -1594,7 +1618,12 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
  
     /* Version 1.6 added SYNCOBJ support. */
     const int min_version_major = 1;
@@ -216,7 +230,7 @@ index 84ab61f..85e51bb 100644
  
     if (version->version_major != min_version_major ||
         version->version_minor < min_version_minor) {
-@@ -1651,6 +1673,11 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+@@ -1651,6 +1680,11 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
  
     device->has_set_iova = !tu_drm_get_va_prop(device, &device->va_start,
                                                &device->va_size);
