@@ -336,6 +336,8 @@ bb_init(void)
    // cleaned the CPU cache over its 828x1792 framebuffer and lock/unlocked it after every command buffer -- inside the frame, as
    // commits are synchronous -- for a surface only the GPU and the display touch (half its CPU samples during swipes, 2026-10-26)
    setenv("BGMTL_BB", "1", 1);
+   // the compositor's texture pool (src/bgmtl.m bg_texpool_*): CoreAnimation's per-frame offscreen targets outgrow libbgair's
+   setenv("BGMTL_TEXPOOL_MB", "192", 0);
    // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
    // A/B switch: "scheduled" only once the GPU finished, as before 0229/0240 (see -commit in src/bgmtl.m)

@@ -209,6 +209,87 @@ bg_tex_bytes(const struct rwa_texture_shape *s)
    return s->mip_levels > 1 ? b + b / 3 : b;
 }
 static void bg_count_purge(NSUInteger state) { __atomic_add_fetch(&g_bg_purge[state < 5 ? state : 0], 1, __ATOMIC_RELAXED); }
+
+// Chlorophyll: the compositor's own pool of released plain textures. CoreAnimation makes its offscreen targets (blur pyramid,
+// glass passes, full-screen RGBA16F copies) anew every frame; libbgair's pool (24 entries, 48 MB, one entry at most 12 MB)
+// is smaller than one such frame, so during home-screen swipes backboardd spent ~20 % of its samples allocating and freeing
+// GPU memory through the kernel (2026-10-26). Here a released texture with no IOSurface, view, buffer or caller memory
+// behind it is kept, and a new texture of exactly the same shape takes it back; its contents are undefined, as a new
+// Metal texture's are, and no command buffer still refers to it (recorded work retains its textures). Off unless
+// BGMTL_TEXPOOL_MB is set (the inject sets it for backboardd); entries older than 5 s go. Callers hold bg_lock.
+#define BG_TEXPOOL_SLOTS 64
+static struct { struct rwa_device *rwa; struct rwa_texture *tex; struct rwa_texture_shape shape; long bytes; uint64_t t; } g_texpool[BG_TEXPOOL_SLOTS];
+static long g_texpool_bytes;
+static unsigned long g_texpool_hits, g_texpool_misses;
+
+static long
+bg_texpool_cap(void)
+{
+   static long cap = -1;
+   if (cap < 0) cap = getenv("BGMTL_TEXPOOL_MB") ? atol(getenv("BGMTL_TEXPOOL_MB")) << 20 : 0;
+   return cap;
+}
+
+static void
+bg_texpool_drop(unsigned k)
+{
+   rwa_texture_destroy(g_texpool[k].tex);
+   g_texpool_bytes -= g_texpool[k].bytes;
+   memset(&g_texpool[k], 0, sizeof(g_texpool[k]));
+}
+
+static void
+bg_texpool_expire(uint64_t now)
+{
+   for (unsigned k = 0; k < BG_TEXPOOL_SLOTS; k++)
+      if (g_texpool[k].tex && now - g_texpool[k].t > 5000000000ull) bg_texpool_drop(k);
+}
+
+static struct rwa_texture *
+bg_texpool_take(struct rwa_device *rwa, const struct rwa_texture_shape *shape)
+{
+   if (!bg_texpool_cap()) return NULL;
+   bg_texpool_expire(clock_gettime_nsec_np(CLOCK_MONOTONIC));
+   for (unsigned k = 0; k < BG_TEXPOOL_SLOTS; k++)
+      if (g_texpool[k].tex && g_texpool[k].rwa == rwa && !memcmp(&g_texpool[k].shape, shape, sizeof(*shape))) {
+         struct rwa_texture *t = g_texpool[k].tex;
+         g_texpool_bytes -= g_texpool[k].bytes;
+         memset(&g_texpool[k], 0, sizeof(g_texpool[k]));
+         g_texpool_hits++;
+         return t;
+      }
+   g_texpool_misses++;
+   return NULL;
+}
+
+// keep a released texture; NO: the caller destroys it
+static BOOL
+bg_texpool_put(struct rwa_device *rwa, struct rwa_texture *tex, const struct rwa_texture_shape *shape)
+{
+   long cap = bg_texpool_cap(), bytes = bg_tex_bytes(shape) * 2;   // the estimate counts 4 bytes a texel; RGBA16F has 8
+   if (!cap || bytes > cap / 4) return NO;
+   uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   bg_texpool_expire(now);
+   int free_k = -1;
+   for (;;) {
+      int old_k = -1;
+      free_k = -1;
+      for (unsigned k = 0; k < BG_TEXPOOL_SLOTS; k++) {
+         if (!g_texpool[k].tex) { if (free_k < 0) free_k = (int)k; }
+         else if (old_k < 0 || g_texpool[k].t < g_texpool[old_k].t) old_k = (int)k;
+      }
+      if (free_k >= 0 && g_texpool_bytes + bytes <= cap) break;
+      if (old_k < 0) return NO;
+      bg_texpool_drop((unsigned)old_k);   // the oldest makes room
+   }
+   g_texpool[free_k].rwa = rwa;
+   g_texpool[free_k].tex = tex;
+   g_texpool[free_k].shape = *shape;
+   g_texpool[free_k].bytes = bytes;
+   g_texpool[free_k].t = now;
+   g_texpool_bytes += bytes;
+   return YES;
+}
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
 #define BG_MAX_BINDINGS 16
@@ -1613,6 +1694,12 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                   (unsigned long long)bin[0], (unsigned long long)bin[1], (unsigned long long)bin[2], (unsigned long long)bin[3]);
          bgmtl_note_line(line);
       }
+      if (bg_texpool_cap()) {
+         snprintf(line, sizeof(line), "texpool: %lu hits, %lu misses, %.1f MB held", g_texpool_hits, g_texpool_misses,
+                  g_texpool_bytes / 1048576.0);
+         bgmtl_note_line(line);
+         g_texpool_hits = g_texpool_misses = 0;
+      }
       burst_ns = burst_frames = bin[0] = bin[1] = bin[2] = bin[3] = 0;
       win_start = t_waited; n = draws = enc = wait = gap = enc_max = wait_max = 0;
    }
@@ -2406,7 +2493,8 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       _plane = plane;
    } else {
       bg_lock();
-      _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
+      _tex = bg_texpool_take([device rwa], &_shape);
+      if (!_tex) _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
       bg_unlock();
    }
    if (!_tex) {
@@ -2490,7 +2578,10 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
 - (NSUInteger)parentRelativeSlice { return _parentSlice; }
 - (void)dealloc
 {
-   bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
+   bg_lock();
+   if (_tex && (_parent || _surface || _linSrc || _ncBytes || !bg_texpool_put([_owner rwa], _tex, &_shape)))
+      rwa_texture_destroy(_tex);
+   bg_unlock();
    if (_tex && !_parent && (!_surface || _surfCopy)) {
       __atomic_sub_fetch(&g_bg_tex_n, 1, __ATOMIC_RELAXED);
       __atomic_sub_fetch(&g_bg_tex_bytes, bg_tex_bytes(&_shape), __ATOMIC_RELAXED);
