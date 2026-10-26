@@ -207,8 +207,11 @@ chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipelin
    ms.alphaToCoverageEnable = desc->alpha_to_coverage;
    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
    dss.minDepthBounds = 0, dss.maxDepthBounds = 1;
-   VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE,
-                                               VK_LOGIC_OP_COPY, p->color_count, blend, { 0, 0, 0, 0 } };
+   /* a framebuffer fetch sees what the earlier primitives left, as on Apple's tile memory: rasterization-order access */
+   VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL,
+                                               p->fs.nir && p->fs.info.fbfetch_targets
+                                                  ? VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT : 0,
+                                               VK_FALSE, VK_LOGIC_OP_COPY, p->color_count, blend, { 0, 0, 0, 0 } };
    static const VkDynamicState dyn[] = {
       VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
       VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
@@ -329,8 +332,11 @@ chl_render_begin(struct chl_cmdbuf *cb, const struct chl_render_pass *pass, char
       h = lh ? lh : 1;
    }
    VkRenderingAttachmentInfo col[8], dep, sten;
-   for (unsigned i = 0; i < ncolor; i++)
+   memset(cb->pass_color, 0, sizeof(cb->pass_color));
+   for (unsigned i = 0; i < ncolor; i++) {
       attachment_info(cb, &pass->color[i], &col[i], false, false);
+      cb->pass_color[i] = col[i].imageView;
+   }
    attachment_info(cb, &pass->depth, &dep, true, false);
    attachment_info(cb, &pass->stencil, &sten, false, true);
    /* a combined depth/stencil texture bound to both is one attachment in two roles */

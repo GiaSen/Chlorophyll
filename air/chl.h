@@ -113,12 +113,15 @@ void chl_sampler_retain(struct chl_sampler *s);
 void chl_sampler_release(struct chl_sampler *s);
 
 /* ---- functions and pipelines ---- */
+struct chl_linked_function { const void *bitcode; size_t size; const char *name; };   /* MTLLinkedFunctions, as AIR */
 struct chl_function {
    const void *bitcode;       /* the AIR module of the function, as a .metallib stores it */
    size_t size;
    const char *entry;
    const void *constants;     /* MTLFunctionConstantValues, as air_constant_value[]; NULL for the module's defaults */
    unsigned num_constants;
+   const struct chl_linked_function *linked;   /* the functions the stage's declared calls resolve against */
+   unsigned num_linked;
 };
 
 /* What a pipeline tells its caller (MTLComputePipelineReflection's useful part). */

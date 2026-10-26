@@ -21,8 +21,10 @@ struct air_shader_info;
 #define AIR_VK_TEXTURE_SLOTS    32
 #define AIR_VK_SAMPLER_BINDING  64    /* [[sampler(n)]] at stage base + 64 + n */
 #define AIR_VK_SAMPLER_SLOTS    16
-#define AIR_VK_STAGE_BINDINGS   80    /* stage 0 (vertex or compute) 0..79, stage 1 (fragment) 80..159 */
-#define AIR_VK_MAX_BINDINGS     160
+#define AIR_VK_INPUT_BINDING    80    /* a [[color(n)]] read (framebuffer fetch) at stage base + 80 + n: INPUT_ATTACHMENT n */
+#define AIR_VK_INPUT_SLOTS      8
+#define AIR_VK_STAGE_BINDINGS   88    /* stage 0 (vertex or compute) 0..87, stage 1 (fragment) 88..175 */
+#define AIR_VK_MAX_BINDINGS     176
 #define AIR_VK_PUSH_STAGE_BYTES 128   /* 32 words a stage: buffer offset remainders 0..30, null-texture mask 31 */
 
 struct air_vk_layout {

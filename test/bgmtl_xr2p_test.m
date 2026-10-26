@@ -37,7 +37,7 @@ main(void)
       d.usage = MTLTextureUsageShaderRead;
       id<MTLTexture> t = [dev newTextureWithDescriptor:d iosurface:sf plane:0];
       if (!t) { printf("texture refused\n"); return 1; }
-      ((void * (*)(id, SEL))objc_msgSend)(t, sel_getUid("rwaTexture"));   // the refresh a draw would do
+      ((void * (*)(id, SEL, id))objc_msgSend)(t, sel_getUid("chlTextureFor:"), nil);   // the refresh a draw would do
       uint8_t px[16] = { 0 };
       [t getBytes:px bytesPerRow:16 fromRegion:MTLRegionMake2D(10, 10, 1, 1) mipmapLevel:0];
       printf("texel = %u %u %u %u (want about 127 0 255 200)\n", px[0], px[1], px[2], px[3]);
@@ -66,10 +66,10 @@ main(void)
       // seed 0: a surface nobody has written yet
       IOSurfaceRef sf2 = IOSurfaceCreate((CFDictionaryRef)props);
       id<MTLTexture> t2 = [dev newTextureWithDescriptor:d iosurface:sf2 plane:0];
-      ((void * (*)(id, SEL))objc_msgSend)(t2, sel_getUid("rwaTexture"));   // first use: decoded (empty)
+      ((void * (*)(id, SEL, id))objc_msgSend)(t2, sel_getUid("chlTextureFor:"), nil);   // first use: decoded (empty)
       const uint8_t mark[4] = { 10, 20, 30, 40 };   // stands in for a draw not written back yet
       [t2 replaceRegion:MTLRegionMake2D(3, 4, 1, 1) mipmapLevel:0 withBytes:mark bytesPerRow:4];
-      ((void * (*)(id, SEL))objc_msgSend)(t2, sel_getUid("rwaTexture"));   // next use, seed still 0
+      ((void * (*)(id, SEL, id))objc_msgSend)(t2, sel_getUid("chlTextureFor:"), nil);   // next use, seed still 0
       uint8_t px2[16] = { 0 };
       [t2 getBytes:px2 bytesPerRow:16 fromRegion:MTLRegionMake2D(3, 4, 1, 1) mipmapLevel:0];
       printf("seed %u surface, texel after the next use = %u %u %u %u (want 10 20 30 40)\n", IOSurfaceGetSeed(sf2), px2[0], px2[1], px2[2], px2[3]);

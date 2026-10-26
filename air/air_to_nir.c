@@ -254,8 +254,12 @@ static const struct glsl_type *
 param_glsl_type(struct air_ctx *c, const struct air_type *t)
 {
    unsigned bits = air_nir_bit_size(c, t);
+   /* the container's bit size is what has to match (a uchar or bool leaf in a 32-bit container was a store of 8 bits into
+    * 32, which NIR refuses: QuartzCore's path_stroke_curve_vert_lpf) */
    return glsl_vector_type(bits == 16 ? GLSL_TYPE_FLOAT16 :
-                           bits == 64 ? GLSL_TYPE_UINT64 : GLSL_TYPE_UINT,
+                           bits == 64 ? GLSL_TYPE_UINT64 :
+                           bits == 8 ? GLSL_TYPE_UINT8 :
+                           bits == 1 ? GLSL_TYPE_BOOL : GLSL_TYPE_UINT,
                            air_nir_components(t));
 }
 

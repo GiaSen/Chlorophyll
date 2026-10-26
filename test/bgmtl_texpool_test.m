@@ -18,7 +18,7 @@ make(id<MTLDevice> dev, unsigned w, unsigned h)
 static void *
 rwa_of(id t)
 {
-   return ((void * (*)(id, SEL))objc_msgSend)(t, sel_getUid("rwaTexture"));
+   return ((void * (*)(id, SEL))objc_msgSend)(t, sel_getUid("chlTexture"));
 }
 
 static int

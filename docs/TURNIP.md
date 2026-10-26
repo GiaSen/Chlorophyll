@@ -176,8 +176,17 @@ Stand-in: `drmSyncobjQuery2` stub (Mesa 26's `vk_drm_syncobj` references it).
 | render / compute / blit encoder | `chl_render_begin` (load/store/resolve actions) ... `chl_draw*` ... `chl_render_end`; `chl_compute_begin` ... `chl_dispatch`; `chl_copy_*`, `chl_fill_buffer`, `chl_generate_mipmaps` |
 
 **Binding model** (`air_nir_vk.c`):
-- One push-descriptor set. Each stage has its own range: [[buffer(n)]] at n, [[texture(n)]] at 32 + n, [[sampler(n)]] at 64 + n;
-  the fragment stage is offset by 80.
+- One push-descriptor set. Each stage has its own range: [[buffer(n)]] at n, [[texture(n)]] at 32 + n, [[sampler(n)]] at 64 + n,
+  a framebuffer-fetch read of [[color(n)]] at 80 + n; the fragment stage is offset by 88.
+- **Framebuffer fetch is an input attachment.** The frontend reads [[color(n)]] as `load_output` with `fb_fetch_output`, the GL
+  form. ir3 serves that only through a driver-supplied "fb read" descriptor; Gallium set one up, Turnip does not
+  (`bindless_fb_read_descriptor = -1`), so on Turnip the read returned nothing. The bridge rewrites it into a subpass image load
+  with InputAttachmentIndex n. Turnip's `nir_lower_input_attachments` makes that a fetch of colour attachment n (from GMEM when
+  the pass is tiled). chl enables `VK_KHR_dynamic_rendering_local_read`, so attachment n is input index n with no remapping. It
+  also enables `VK_EXT_rasterization_order_attachment_access` and sets the raster-order flag on pipelines that fetch, so a fetch
+  sees earlier primitives without a barrier between draws, as on Apple's tile memory. The pushed descriptor names the pass's
+  attachment view. Colour images also get `INPUT_ATTACHMENT` usage. QuartzCore has 16 such shaders: rounded-corner clips, masks
+  and backdrop materials.
 - A buffer is bound at its offset rounded down to 64. The shader adds the rest from push-constant word n of its stage (32 words a
   stage: 31 buffer slots plus the null-texture mask). So every multiple-of-4 offset Metal allows works, with no copies.
 - Constexpr samplers are immutable samplers in the set layout.
@@ -206,6 +215,38 @@ Stand-in: `drmSyncobjQuery2` stub (Mesa 26's `vk_drm_syncobj` references it).
   on every second draw): **5.0-7.5 us/draw**. For comparison: raw Turnip 3.4-4.3, Gallium `rwa_render_draw` 9-17, production
   bgmtl 100-200. The 2-3 us above raw Turnip is the push of every binding on every draw. Dirty tracking (push only what changed)
   is the next optimisation.
+
+### Metal on chl: `src/bgmtl.m` (2026-10-26)
+
+`bgmtl.m` was rewritten onto chl (the Gallium version is history in git):
+- Encoders record straight into the `chl_cmdbuf` of their `MTLCommandBuffer`. There is no BGWork replay and no global lock.
+- Textures are refreshed when first bound in a command buffer: IOSurface (seed-checked), XR10 two-plane decode, no-copy
+  memory, linear textures.
+- Completion handlers run from chl's completion thread.
+- `MTLLinkedFunctions` (RenderBox's effect functions) are passed through as linked AIR.
+
+Frontend and bridge fixes found by running CoreAnimation on it:
+- `param_glsl_type` gave i8/i1 parameters a 32-bit type. The frontend's validator then refused `path_stroke_curve_vert_lpf`.
+- Metal's `fma()` comes out exact. Mesa 26 leaves an exact `ffma` alone for a backend without fused FMA, and ir3 has no
+  `ffma`, so the bridge makes it `fmad`.
+- The completion thread now retires a command buffer before marking it done. Before that, a recycled command buffer could
+  race with its own retirement.
+
+Results on the phone (test tools in `/var/root/metal-turnip`):
+
+| probe | result |
+| --- | --- |
+| `bgmtl_probe` (Metal compute through MTLDevice) | 12/12 |
+| `bgmtl_render_probe` | 18/18 |
+| `bgmtl_carenderer_probe` (CARenderer against CoreAnimation's CPU renderer) | all 8 scenes render. Scenes 0, 3, 4, 7 match (diff 0.12-0.22; Gallium scene 3: 0.24). Scenes 5 and 6 (gaussian blur, backdrop blur + saturation) are blurred correctly; the CPU reference does not blur them, hence diffs 44 and 13. Scenes 1 and 2 (image contents, text) are flipped vertically against the reference: Gallium gives exactly the same diffs (18.35, 7.08), so it is the probe's reference orientation, not chl |
+| `bgmtl_layer_probe` (CAMetalLayer drawable, IOSurface read back by the CPU) | 3664/3664 pixels |
+| `bgmtl_xr2p_test` (two-plane XR10 surfaces: decode, write-back, seed 0) | pass |
+| `bgmtl_texpool_test` (`BGMTL_TEXPOOL_MB`: released render target reused) | pass |
+| `bgmtl_adddev` (MTLAddDevice / MTLCreateSystemDefaultDevice) | pass |
+
+Before the framebuffer-fetch fix, scene 3 (rounded clip) drew an octagon with black corners (diff 18.6) and scene 4 (circle
+mask) drew 2.98 (Gallium: 0.40). Scene 6 drew the stripes unblurred. All probes still hang at exit, spinning a CPU, until
+`timeout` kills them; Gallium does the same, so it is older than chl.
 
 ## 4. Port plan (Turnip only; Gallium is removed at the end)
 

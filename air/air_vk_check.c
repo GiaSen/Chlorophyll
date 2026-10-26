@@ -42,7 +42,14 @@ main(int argc, char **argv)
       void *mem = ralloc_context(NULL);
       struct air_metallib lib;
       const char *err = NULL;
-      if (!air_metallib_parse(mem, data, n, &lib, &err)) { printf("%s: %s\n", argv[a], err); continue; }
+      // a bare AIR module (bgmtl's BGMTL_DUMP output: NAME.v.bc / NAME.f.bc) is one function named after its file
+      struct air_metallib_function one;
+      if (n >= 4 && (!memcmp(data, "BC\xc0\xde", 4) || !memcmp(data, "\xde\xc0\x17\x0b", 4))) {
+         const char *base = strrchr(argv[a], '/') ? strrchr(argv[a], '/') + 1 : argv[a];
+         one = (struct air_metallib_function){ .name = ralloc_strndup(mem, base, strcspn(base, ".")), .bitcode = data, .bitcode_size = n };
+         lib.functions = &one;
+         lib.num_functions = 1;
+      } else if (!air_metallib_parse(mem, data, n, &lib, &err)) { printf("%s: %s\n", argv[a], err); continue; }
       for (unsigned i = 0; i < lib.num_functions; i++) {
          const struct air_metallib_function *fn = &lib.functions[i];
          struct air_constant_value *constants;

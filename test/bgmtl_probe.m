@@ -257,6 +257,7 @@ main(int argc, char **argv)
                [enc dispatchThreadgroups:MTLSizeMake(n / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                [enc endEncoding];
                [cb commit];
+               [cb waitUntilCompleted];   /* commit is asynchronous, as in Metal */
                if ([cb status] != 4) { printf("  round %u: status %ld\n", r, (long)[cb status]); break; }
                done++;
                for (unsigned i = 0; i < n; i++) if (fo[i] != fa[i] + 2.0f * fb[i]) total_bad++;

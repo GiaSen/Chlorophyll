@@ -336,6 +336,7 @@ struct chl_cmdbuf {
    VkPrimitiveTopology topology;
    bool topology_set;
    unsigned pass_width, pass_height;
+   VkImageView pass_color[8];   /* the render pass's colour attachments, for the framebuffer-fetch input attachments */
    bool vp_set, sc_set;
    struct chl_cmdbuf *next_free, *next_inflight;
 };
@@ -587,13 +588,19 @@ completion_thread(void *arg)
       d->inflight_head = cb->next_inflight;
       if (!d->inflight_head)
          d->inflight_tail = NULL;
-      cb->failed = r != VK_SUCCESS;
+      pthread_mutex_unlock(&d->done_lock);
+      /* what it held goes first: once it is reported done, its owner may recycle it (chl_cmdbuf_release) */
+      cb_retire(cb);
+      chl_done_fn fn = cb->done_fn;
+      void *ctx = cb->done_ctx;
+      bool failed = r != VK_SUCCESS;
+      pthread_mutex_lock(&d->done_lock);
+      cb->failed = failed;
       cb->done = true;
       pthread_cond_broadcast(&d->done_cv);
       pthread_mutex_unlock(&d->done_lock);
-      if (cb->done_fn)
-         cb->done_fn(cb->done_ctx, cb->failed ? -1 : 0, cb->failed ? "the GPU did not finish the command buffer" : NULL);
-      cb_retire(cb);
+      if (fn)
+         fn(ctx, failed ? -1 : 0, failed ? "the GPU did not finish the command buffer" : NULL);
       pthread_mutex_lock(&d->done_lock);
    }
    pthread_mutex_unlock(&d->done_lock);
@@ -653,7 +660,15 @@ chl_device_open(char *why, size_t why_size)
    if (d->align < 4)
       d->align = 4;
 
-   VkPhysicalDeviceRobustness2FeaturesEXT rob2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
+   /* Metal's framebuffer fetch ([[color(n)]] read in a fragment function): input attachments of the dynamic render pass,
+    * read in rasterization order with no barrier between draws (air_nir_vk.c, bridge_fb_fetch) */
+   VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT rao = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT };
+   rao.rasterizationOrderColorAttachmentAccess = VK_TRUE;
+   VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lread = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, &rao };
+   lread.dynamicRenderingLocalRead = VK_TRUE;
+   VkPhysicalDeviceRobustness2FeaturesEXT rob2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, &lread };
    rob2.nullDescriptor = VK_TRUE;
    VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &rob2 };
    f13.dynamicRendering = VK_TRUE;
@@ -676,13 +691,15 @@ chl_device_open(char *why, size_t why_size)
    feats.features.imageCubeArray = VK_TRUE;
    static const char *const exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
                                        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-                                       VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME };
+                                       VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME,
+                                       VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME };
    float prio = 1.0f;
    VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &prio };
-   VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feats, 0, 1, &qci, 0, NULL, 5, exts, NULL };
+   VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feats, 0, 1, &qci, 0, NULL, sizeof(exts) / sizeof(exts[0]), exts,
+                             NULL };
    VkResult r = d->vk.vkCreateDevice(d->pd, &dci, NULL, &d->dev);
    if (r != VK_SUCCESS) {
-      say(why, why_size, "%s would not make a Vulkan device with push descriptors, null descriptors and dynamic rendering "
+      say(why, why_size, "%s would not make a Vulkan device with push descriptors, null descriptors, dynamic rendering and local reads "
                          "(VkResult %d)", d->name, r);
       goto fail;
    }
@@ -957,7 +974,7 @@ chl_texture_create(struct chl_device *d, const struct chl_texture_desc *desc, ch
    if ((usage & CHL_USAGE_SHADER_WRITE) && !ds && !ms)
       vu |= VK_IMAGE_USAGE_STORAGE_BIT;
    if ((usage & CHL_USAGE_RENDER_TARGET) || ds)
-      vu |= ds ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      vu |= ds ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
    /* drop what the format cannot do here (a compressed format is never a render target); keep what was asked otherwise */
    VkFormatProperties fp;
@@ -966,7 +983,7 @@ chl_texture_create(struct chl_device *d, const struct chl_texture_desc *desc, ch
    if (!(ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
       vu &= ~VK_IMAGE_USAGE_STORAGE_BIT;
    if (!(ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
-      vu &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      vu &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
    if (!(ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
       say(why, why_size, "%s cannot sample %s", d->name, f->name);
       return NULL;
@@ -1085,7 +1102,7 @@ chl_texture_from_iosurface(struct chl_device *d, const struct chl_texture_desc *
    d->vk.vkGetPhysicalDeviceFormatProperties(d->pd, f->vk, &fp);
    t->vkusage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
    if (fp.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
-      t->vkusage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      t->vkusage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
    if ((t->usage & CHL_USAGE_SHADER_WRITE) && (fp.linearTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
       t->vkusage |= VK_IMAGE_USAGE_STORAGE_BIT;
 
@@ -1465,7 +1482,9 @@ translate(struct chl_device *d, void *mem_ctx, const struct chl_function *fn, me
    unsigned num_constants = fn->num_constants;
    if (!constants)
       num_constants = air_module_function_constants(mem_ctx, fn->bitcode, fn->size, &constants);
-   const struct air_to_nir_options opts = { .constants = constants, .num_constants = num_constants };
+   _Static_assert(sizeof(struct chl_linked_function) == sizeof(struct air_linked_function), "linked function layouts");
+   const struct air_to_nir_options opts = { .constants = constants, .num_constants = num_constants,
+                                            .linked = (const struct air_linked_function *)fn->linked, .num_linked = fn->num_linked };
    const char *error = NULL;
    out->nir = air_to_nir(mem_ctx, fn->bitcode, fn->size, fn->entry, &opts, d->nir_options, &out->info, &error);
    if (!out->nir) {
@@ -1819,10 +1838,10 @@ chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why,
    pthread_mutex_unlock(&d->queue_lock);
    if (r != VK_SUCCESS) {
       say(why, why_size, "the GPU did not take the command buffer (VkResult %d)", r);
+      cb_retire(cb);
       cb->failed = cb->done = true;
       if (done)
          done(ctx, -1, "submission failed");
-      cb_retire(cb);
       return -1;
    }
    return 0;
@@ -2006,6 +2025,16 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
          if (tx)
             v = t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? storage_view(tx, level) : tx->view;
          ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL };
+         w[nw].pImageInfo = &ii[nw];
+      } else if (local >= AIR_VK_INPUT_BINDING) {
+         /* a framebuffer fetch: the colour attachment itself (Turnip reads it from the attachment state, GMEM or sysmem;
+          * the descriptor still has to name it) */
+         unsigned n = local - AIR_VK_INPUT_BINDING;
+         if (cb->enc != ENC_RENDER || !cb->pass_color[n]) {
+            say(why, why_size, "the fragment stage reads [[color(%u)]] and the render pass has no colour attachment %u", n, n);
+            return -1;
+         }
+         ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, cb->pass_color[n], VK_IMAGE_LAYOUT_GENERAL };
          w[nw].pImageInfo = &ii[nw];
       } else {
          unsigned n = local - AIR_VK_SAMPLER_BINDING;

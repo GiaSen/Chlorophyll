@@ -13,6 +13,8 @@
  *   binding stage_base + n                    [[buffer(n)]]   UNIFORM_BUFFER (constant) or STORAGE_BUFFER (device)
  *   binding stage_base + 32 + n               [[texture(n)]]  SAMPLED_IMAGE, or STORAGE_IMAGE when the shader stores to it
  *   binding stage_base + 64 + n               [[sampler(n)]]  SAMPLER (immutable when it is the shader's constexpr sampler)
+ *   binding stage_base + 80 + n               [[color(n)]] read by the fragment shader (framebuffer fetch): INPUT_ATTACHMENT
+ *                                             with InputAttachmentIndex n, read in rasterization order (chl's render pipelines)
  * and gives every stage 32 push-constant words at byte stage_base_push: word n (n < 31) is the part of [[buffer(n)]]'s offset
  * below the descriptor alignment, added to every access of that buffer (Metal allows any multiple of 4, Vulkan wants 64 on
  * Turnip), and word 31 is the null-texture mask.
@@ -32,6 +34,7 @@ struct bridge {
    nir_variable *tex_var[AIR_VK_TEXTURE_SLOTS];
    nir_variable *img_var[AIR_VK_TEXTURE_SLOTS];
    nir_variable *smp_var[AIR_VK_SAMPLER_SLOTS];
+   nir_variable *input_var[AIR_VK_INPUT_SLOTS];
    char *why;
    size_t why_size;
    bool failed;
@@ -132,6 +135,44 @@ image_deref(nir_builder *b, struct bridge *br, unsigned slot, enum glsl_sampler_
          return NULL;
    }
    return nir_build_deref_var(b, br->img_var[slot]);
+}
+
+/* Metal's framebuffer fetch, the Vulkan way. The frontend reads a [[color(n)]] argument as load_output with
+ * io_semantics.fb_fetch_output (a GL/Gallium form: ir3 turns it into a fetch through a driver-supplied "fb read" descriptor,
+ * which Turnip does not set up). Turnip's own form is an input attachment: a subpass image read at the fragment, which
+ * nir_lower_input_attachments makes a fetch of the colour attachment itself (from GMEM when the pass is tiled). With
+ * dynamic rendering, InputAttachmentIndex n is colour attachment n unless a pipeline maps them otherwise, which matches
+ * Metal's [[color(n)]]. */
+static bool
+bridge_fb_fetch(nir_builder *b, nir_intrinsic_instr *in, struct bridge *br)
+{
+   nir_io_semantics sem = nir_intrinsic_io_semantics(in);
+   unsigned n = sem.location - FRAG_RESULT_DATA0;
+   if (sem.location < FRAG_RESULT_DATA0 || n >= AIR_VK_INPUT_SLOTS) {
+      fail(br, "a framebuffer fetch of output location %u (target %u) is not served", sem.location, n);
+      return false;
+   }
+   if (!br->input_var[n]) {
+      nir_alu_type t = nir_intrinsic_dest_type(in);
+      enum glsl_base_type bt = nir_alu_type_get_base_type(t) == nir_type_int ? GLSL_TYPE_INT
+                             : nir_alu_type_get_base_type(t) == nir_type_uint ? GLSL_TYPE_UINT : GLSL_TYPE_FLOAT;
+      nir_variable *v = nir_variable_create(b->shader, nir_var_image, glsl_image_type(GLSL_SAMPLER_DIM_SUBPASS, false, bt),
+                                            "air_color_in");
+      v->data.descriptor_set = 0;
+      v->data.binding = br->bind_base + AIR_VK_INPUT_BINDING + n;
+      v->data.index = n;   /* InputAttachmentIndex */
+      v->data.access = ACCESS_NON_WRITEABLE;
+      br->input_var[n] = v;
+      if (!declare(br, v->data.binding, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT))
+         return false;
+   }
+   nir_deref_instr *d = nir_build_deref_var(b, br->input_var[n]);
+   nir_def *v = nir_image_deref_load(b, in->def.num_components, in->def.bit_size, &d->def, nir_imm_ivec4(b, 0, 0, 0, 0),
+                                     nir_undef(b, 1, 32), nir_imm_int(b, 0), .image_dim = GLSL_SAMPLER_DIM_SUBPASS,
+                                     .dest_type = nir_intrinsic_dest_type(in), .access = ACCESS_NON_WRITEABLE);
+   nir_def_replace(&in->def, v);
+   b->shader->info.outputs_read &= ~BITFIELD64_BIT(sem.location);
+   return true;
 }
 
 static bool
@@ -275,6 +316,8 @@ bridge_intrinsic(nir_builder *b, nir_intrinsic_instr *in, struct bridge *br)
       br->layout->push_bytes = MAX2(br->layout->push_bytes, br->push_base + AIR_VK_PUSH_STAGE_BYTES);
       return true;
    }
+   case nir_intrinsic_load_output:
+      return nir_intrinsic_io_semantics(in).fb_fetch_output ? bridge_fb_fetch(b, in, br) : false;
    case nir_intrinsic_load_ubo:
       isrc = 0, osrc = 1, type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       break;
@@ -356,6 +399,13 @@ bridge_instr(nir_builder *b, nir_instr *instr, void *data)
    struct bridge *br = data;
    if (br->failed)
       return false;
+   /* The Adreno has no fused multiply-add, only mad (ir3 takes nir_op_fmad). Mesa 26 splits an ffma for such a backend
+    * unless the instruction is exact, and Metal's fma() comes out of the frontend exact: it reached ir3 as an ffma
+    * ("Unhandled ALU op: ffma", CoreAnimation's blur taps). It becomes the hardware's unfused mad here. */
+   if (instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == nir_op_ffma) {
+      nir_instr_as_alu(instr)->op = nir_op_fmad;
+      return true;
+   }
    if (instr->type == nir_instr_type_intrinsic)
       return bridge_intrinsic(b, nir_instr_as_intrinsic(instr), br);
    if (instr->type == nir_instr_type_tex)
@@ -382,5 +432,10 @@ air_nir_to_vulkan(nir_shader *nir, const struct air_shader_info *info, unsigned 
    nir->info.num_ssbos = 0;
    nir->info.num_textures = 0;
    nir->info.num_images = 0;
+   /* no output is read back any more: every fetch is an input attachment now */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir->info.fs.uses_fbfetch_output = false;
+      nir->info.fs.fbfetch_coherent = false;
+   }
    return true;
 }
