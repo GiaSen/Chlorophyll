@@ -2004,8 +2004,12 @@ bg_idle_trim_schedule(struct rwa_device *rwa)
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d
 {
    id<MTLTexture> t = d.colorAttachments[0].texture;
-   BG_TRACE("render pass: color0 %lux%lu fmt %lu load %lu store %lu\n", (unsigned long)t.width, (unsigned long)t.height,
-            (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction);
+   // the IOSurface the pass draws into, when it is one (an IOSurface ID ties another process's draws to this one's output)
+   unsigned surf0 = (t && [t respondsToSelector:@selector(iosurface)] && [(BGMTLTexture *)t iosurface])
+                       ? (unsigned)IOSurfaceGetID((IOSurfaceRef)[(BGMTLTexture *)t iosurface]) : 0;
+   BG_TRACE("render pass: color0 %lux%lu fmt %lu load %lu store %lu surface %u\n", (unsigned long)t.width, (unsigned long)t.height,
+            (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction,
+            surf0);
    if (bg_trace()) {
       for (unsigned i = 1; i < 8; i++)
          if (d.colorAttachments[i].texture)
