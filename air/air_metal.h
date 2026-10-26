@@ -1233,10 +1233,10 @@ void rwa_render_destroy(struct rwa_render *render);
  * nothing to bound it against: the shader reads its own buffer with it, and reading past
  * that buffer is the application's business, exactly as it is in Metal.
  *
- * Primitive restart is not in this contract because it is not in Metal: there is no
- * restart index anywhere in MTLRenderCommandEncoder, so 0xFFFF is an ordinary index
- * here, and Gallium's `primitive_restart` stays off. A driver ported from GL would get
- * that backwards.
+ * Primitive restart is always on for an indexed draw, as in Metal (drawIndexedPrimitives:
+ * the largest value of the index type, 0xFFFF or 0xFFFFFFFF, ends the primitive and the
+ * next index starts a new one; Metal has no switch for it). That index is no vertex, so
+ * it takes no part in the range checks above.
  */
 struct rwa_vertex_stream {
 	struct rwa_buffer *buffer;   /* NULL: nothing bound at this index */

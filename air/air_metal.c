@@ -4992,10 +4992,14 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, unsigne
       if (index_size == 2) {
          uint16_t u;
          memcpy(&u, indices + (size_t)i * 2, sizeof(u));
+         if (u == 0xffff)
+            continue;   /* Metal's restart index: no vertex (see rwa_render_draw) */
          v = u;
       } else {
          uint32_t u;
          memcpy(&u, indices + (size_t)i * 4, sizeof(u));
+         if (u == 0xffffffffu)
+            continue;
          v = u;
       }
       if (v < min)
@@ -5003,6 +5007,8 @@ index_range(const uint8_t *indices, unsigned count, unsigned index_size, unsigne
       if (v > max)
          max = v;
    }
+   if (min > max)
+      min = max = 0;   /* nothing but restarts */
    *min_out = min;
    *max_out = max;
 }
@@ -6996,7 +7002,14 @@ rwa_render_create(struct rwa_device *device,
       say(why, why_size, "a render pipeline with no attachment description");
       return NULL;
    }
-   if (!fragment_bitcode || fragment_size < 4) {
+   /* Chlorophyll: no fragment function is a pipeline that rasterizes for depth and stencil only (Metal allows it and writes
+    * no colour); RenderBox fills its icon glyphs' paths this way, stencil first, cover second. It gets an empty fragment
+    * stage below. It still needs a vertex function: with neither there is nothing to draw. */
+   if (!fragment_bitcode && !vertex_bitcode) {
+      say(why, why_size, "a render pipeline with neither a vertex nor a fragment function");
+      return NULL;
+   }
+   if (fragment_bitcode && fragment_size < 4) {
       say(why, why_size, "%zu bytes is not a fragment shader module", fragment_size);
       return NULL;
    }
@@ -7142,6 +7155,9 @@ rwa_render_create(struct rwa_device *device,
    render->device = device;
    render->mem_ctx = ralloc_context(NULL);
    render->shape = *shape;
+   if (!fragment_bitcode)   /* no fragment function writes no colour (the blend state below is made from this copy) */
+      for (unsigned i = 0; i < ARRAY_SIZE(render->shape.color_blend); i++)
+         render->shape.color_blend[i].write_mask = 0;
 
    struct rwa_render_info out = { 0 };
 
@@ -7150,6 +7166,15 @@ rwa_render_create(struct rwa_device *device,
     * error between the stages cannot surface until the draw, because ir3 compiles and
     * links at draw time (ir3_cache_lookup), so the two belong to two different calls.
     */
+   nir_shader *fs;
+   if (!fragment_bitcode) {
+      nir_builder nb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, device->nir_options, "no_fragment");
+      fs = nb.shader;
+      ralloc_steal(render->mem_ctx, fs);
+      render->finfo.stage = MESA_SHADER_FRAGMENT;
+      render->finfo.entry_point = "(no fragment function)";
+      goto fragment_done;
+   }
    struct air_constant_value *ffc;
    unsigned num_ffc =
       air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
@@ -7161,9 +7186,9 @@ rwa_render_create(struct rwa_device *device,
    const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc,
                                              .linked = flinked, .num_linked = num_linked[1] };
    const char *error;
-   nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
-                               fragment_entry, &fopts, device->nir_options, &render->finfo,
-                               &error);
+   fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
+                   fragment_entry, &fopts, device->nir_options, &render->finfo,
+                   &error);
    if (!fs) {
       say(why, why_size, "%s", error ? error : "the fragment module could not be translated");
       goto fail;
@@ -7177,6 +7202,7 @@ rwa_render_create(struct rwa_device *device,
              ? _mesa_shader_stage_to_string(render->finfo.stage) : "non-fragment");
       goto fail;
    }
+fragment_done:
    slot_shapes(fs, render->frag_slots, render->frag_compare_sampler);
    count_resources(&render->finfo, render->frag_slots, &out.fragment_buffers,
                    &out.fragment_textures, &out.fragment_samplers);
@@ -7395,7 +7421,7 @@ rwa_render_create(struct rwa_device *device,
    if (!blend_tables_are_shaped_right(why, why_size))
       goto fail;
    struct pipe_blend_state blend;
-   if (!blend_state_from_metal(shape, device->screen, &blend, &out.blend_enabled_mask,
+   if (!blend_state_from_metal(&render->shape, device->screen, &blend, &out.blend_enabled_mask,
                                &out.color_write_masks, why, why_size))
       goto fail;
    render->blend = device->pipe->create_blend_state(device->pipe, &blend);
@@ -8309,9 +8335,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * buffer's base), and `index_bias` is the base vertex. Nothing below is
        * conditional except what the index buffer itself provides.
        *
-       * primitive_restart stays off, and that is a decision: Metal has no restart index
-       * anywhere in MTLRenderCommandEncoder, so 0xFFFF is an ordinary index and a strip
-       * drawn with one would break into two primitives for nobody's reason.
+       * primitive_restart is ON for every indexed draw, with the largest index of the
+       * index type (0xFFFF, 0xFFFFFFFF) as the restart index: Metal's
+       * drawIndexedPrimitives always restarts there, it has no switch. (This said the
+       * opposite until RenderBox, iOS 26's icon renderer, drew triangle strips of quads
+       * separated by 0xFFFF: each one read as vertex 65535, far past the buffer, and the
+       * stray triangles wrecked its stencil-counted path fills.)
        *
        * take_index_buffer_ownership stays off as well: the reference belongs to the
        * caller's rwa_buffer, which outlives this draw and may be drawn with again.
@@ -8322,6 +8351,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .min_index = min_index, .max_index = max_index,
          .instance_count = instances,
          .start_instance = draw->base_instance,
+         .primitive_restart = index_size != 0,
+         .restart_index = index_size == 2 ? 0xffffu : 0xffffffffu,
       };
       if (index_size)
          info.index.resource = draw->index_buffer->res;

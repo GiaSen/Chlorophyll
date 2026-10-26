@@ -937,12 +937,14 @@ bg_air_slice(NSData *d)
       }
       BG_LOG("  pipe depth fmt %lu stencil fmt %lu\n", (unsigned long)descriptor.depthAttachmentPixelFormat, (unsigned long)descriptor.stencilAttachmentPixelFormat);
    }
-   if (!fragment) return [self bgFail:error with:@"a render pipeline needs a fragment function"];
+   // no fragment function: a depth/stencil-only pipeline (RenderBox's path fills write stencil this way); libbgair gives it an
+   // empty fragment stage and no colour writes
+   if (!fragment && !vertex) return [self bgFail:error with:@"a render pipeline needs a vertex or a fragment function"];
    /* no vertex function: libbgair supplies a pass-through stage over the whole attachment (a quad, 4 vertices as a strip) --
     * the road the fragment shaders of a library are exercised by, as air_run did */
    NSData *vair = vertex ? ((NSData * (*)(id, SEL))objc_msgSend)(vertex, bitcode) : nil;
    NSData *fair = ((NSData * (*)(id, SEL))objc_msgSend)(fragment, bitcode);
-   if (!fair.length || (vertex && !vair.length)) return [self bgFail:error with:@"a function has no bitcode"];
+   if ((fragment && !fair.length) || (vertex && !vair.length)) return [self bgFail:error with:@"a function has no bitcode"];
    if (bg_trace() && getenv("BGMTL_DUMP")) {   // the exact modules this pipeline is built from, for air2nir on the Mac
       mkdir(getenv("BGMTL_DUMP"), 0755);
       NSString *d = [NSString stringWithUTF8String:getenv("BGMTL_DUMP")];
@@ -1049,7 +1051,7 @@ bg_air_slice(NSData *d)
    {
       char dwhy[128] = { 0 };
       unsigned nd = 0;
-      if (rwa_module_textures(_rwa, fair.bytes, fair.length, [[fragment name] UTF8String], p->_decls, 16, &nd, dwhy, sizeof(dwhy)) == 0) p->_ndecls = nd;
+      if (fair && rwa_module_textures(_rwa, fair.bytes, fair.length, [[fragment name] UTF8String], p->_decls, 16, &nd, dwhy, sizeof(dwhy)) == 0) p->_ndecls = nd;
    }
    snprintf(p->_names, sizeof(p->_names), "%s+%s", vertex ? [[vertex name] UTF8String] : "gen", [[fragment name] UTF8String]);
    BG_LOG("render pipeline %s + %s: vertex_buffers=%u fragment_buffers=%u fragment_textures=%u samplers=%u streams=%u\n",
