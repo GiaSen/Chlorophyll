@@ -55,8 +55,11 @@ static char g_state[192] = F_STATE, g_off[192] = F_OFF;
 
 // iconservicesagent: iOS 26 renders every icon variant (tinted, dark, clear) with Metal; without a device each one failed with
 // IconRendering.TextureIOError 6 and was retried forever (169 % CPU, blank tinted icons).
+// com.apple.springboard (2026-10-26, user OK, one trial): iOS 26 SpringBoard draws the icon glyph layers itself with RenderBox
+// (RBSymbolDrawingLayer), which needs a Metal device; without one the home-screen icons are glass tiles with no glyph. Its
+// dead-man and kill switch are its own (bgmtl.off.com.apple.springboard); no chlorophyll=1 boot-arg is involved.
 static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider",
-                                      "com.apple.iconservicesagent", NULL };
+                                      "com.apple.iconservicesagent", "com.apple.springboard", NULL };
 static volatile int g_failures, g_registered, g_bb;
 static volatile unsigned g_completed;
 
