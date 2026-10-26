@@ -474,6 +474,7 @@ bg_install_fallback(Class c)
 - (struct rwa_texture *)rwaTextureSampled;   // also cleans the CPU cache of a surface another process wrote since
 - (void)bgLinearPending:(int)delta;
 - (void)bgLinearWriteBack;
+- (BOOL)bgXR10WriteBack;
 @end
 
 @interface BGMTLSampler : _MTLSamplerState {
@@ -1853,11 +1854,20 @@ bg_idle_trim_schedule(struct rwa_device *rwa)
    static int in_compositor = -1;
    if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
    if (_status == 4 && !in_compositor) {
-      NSMutableSet *written = nil;
+      NSMutableSet *written = nil, *xr = nil;
       for (BGWork *w in _work)
          if (w->kind == BG_WORK_DRAW || w->kind == BG_WORK_CLEAR || w->kind == BG_WORK_RESOLVE)
             for (unsigned i = 0; i < (w->kind == BG_WORK_RESOLVE ? 1 : w->color_count); i++) {
                BGMTLTexture *t = (BGMTLTexture *)(w->kind == BG_WORK_RESOLVE ? w->dst : w->color[i]);
+               // a two-plane XR10 surface drawn into through its own-memory copy: its pixels go back into the surface's
+               // planes once per command buffer, below (not through rwaTexture, which would decode the stale surface over them)
+               BGMTLTexture *root = t;
+               while (root && root->_parent) root = root->_parent;
+               if (root && root->_xr2p) {
+                  if (!xr) xr = [NSMutableSet set];
+                  [xr addObject:root];
+                  continue;
+               }
                rwa_texture_flush_surface([t rwaTexture]);
                if ([t iosurface]) {
                   if (!written) written = [NSMutableSet set];
@@ -1871,6 +1881,7 @@ bg_idle_trim_schedule(struct rwa_device *rwa)
          IOSurfaceLock((IOSurfaceRef)surf, 0, NULL);
          IOSurfaceUnlock((IOSurfaceRef)surf, 0, NULL);
       }
+      for (BGMTLTexture *t in xr) [t bgXR10WriteBack];   // the write unlock moves these surfaces' seeds
    }
    // Chlorophyll debugging (/private/var/tmp/bgmtl.dumpatt with the trace): the textures that "downsample" draws sample, read
    // sparsely (every Nth row and column, so the long side is ~256) into /private/var/tmp/att/src-SEQ-WxH-fmt.raw (BGRA).
@@ -2445,6 +2456,43 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       if (changed) rwa_texture_flush_surface(_tex);
    }
    return [self rwaTexture];
+}
+
+// Chlorophyll: the texture's pixels back into its two-plane RGB10A8_2P_XR10 surface (the encoding rwaTexture decodes: XR10
+// 384 + 2c per 8-bit channel, exact both ways; alpha into plane 1), after a command buffer drew into it. RenderBox's layer
+// surfaces in SpringBoard are drawn this way and composited by backboardd from the surface. YES if it was such a texture.
+- (BOOL)bgXR10WriteBack
+{
+   if (_parent) return [(BGMTLTexture *)_parent bgXR10WriteBack];
+   if (!_xr2p || !_tex || !_surface) return NO;
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   unsigned w = MIN(_shape.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0)), h = MIN(_shape.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
+   uint8_t *px = (w && h) ? malloc((size_t)w * h * 4) : NULL;
+   if (!px) return YES;
+   char why[256] = { 0 };
+   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+   bg_lock();
+   int rc = rwa_texture_read(_tex, 0, 0, o, sz, px, w * 4, why, sizeof(why));
+   bg_unlock();
+   if (rc != 0) { BG_LOG("XR10 write-back: %s\n", why); free(px); return YES; }
+   if (IOSurfaceLock(sf, 0, NULL) == 0) {
+      uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
+      size_t r0 = IOSurfaceGetBytesPerRowOfPlane(sf, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(sf, 1);
+      for (unsigned y = 0; p0 && p1 && y < h; y++) {
+         const uint8_t *s = px + (size_t)y * w * 4;
+         uint8_t *d0 = p0 + y * r0, *d1 = p1 + y * r1;
+         for (unsigned x = 0; x < w; x++) {
+            uint32_t v = (384u + 2u * s[4 * x]) | (384u + 2u * s[4 * x + 1]) << 10 | (384u + 2u * s[4 * x + 2]) << 20;
+            d0[4 * x] = (uint8_t)v; d0[4 * x + 1] = (uint8_t)(v >> 8); d0[4 * x + 2] = (uint8_t)(v >> 16); d0[4 * x + 3] = (uint8_t)(v >> 24);
+            d1[x] = s[4 * x + 3];
+         }
+      }
+      IOSurfaceUnlock(sf, 0, NULL);
+      _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture: no decode back at the next use
+      if (!_surfSeed) _surfSeed = 1;
+   }
+   free(px);
+   return YES;
 }
 
 - (struct rwa_texture *)rwaTexture
