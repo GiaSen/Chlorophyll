@@ -75,7 +75,7 @@ EOT
 [ -d build-ios ] || meson setup build-ios mesa --cross-file ios.cross --buildtype=release -Dgallium-drivers= -Dvulkan-drivers=freedreno \
   -Dfreedreno-kmds=msm -Dvulkan-layers= -Dplatforms= -Dllvm=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dglx=disabled \
   -Degl=disabled -Dgbm=disabled -Dtools= -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled \
-  -Dglvnd=disabled -Dlmsensors=disabled -Dbuild-tests=false -Dshader-cache=disabled -Dvideo-codecs= -Dperfetto=false -Dspirv-tools=disabled \
+  -Dglvnd=disabled -Dlmsensors=disabled -Dbuild-tests=false -Dshader-cache=enabled -Dvideo-codecs= -Dperfetto=false -Dspirv-tools=disabled \
   -Ddisplay-info=disabled -Dprefix=/ > setup-ios.log
 ninja -j"${JOBS:-8}" -C build-ios src/freedreno/vulkan/libvulkan_freedreno.dylib src/freedreno/vulkan/libchlorophyll.dylib
 ls -l build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib build-ios/src/freedreno/vulkan/libchlorophyll.dylib

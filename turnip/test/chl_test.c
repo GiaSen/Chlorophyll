@@ -544,6 +544,35 @@ test_render(void)
       CHECK(ok && !bad && checked > 3000, "triangle: %u of %u wrong%s%s", bad, checked, ok ? "" : ": ", ok ? "" : why);
       printf("  triangle (bg_vs + bg_fs_color): %u of %u checked pixels wrong\n", bad, checked);
    }
+   { // pipelines sharing one layout (same signature): release one, draw with the other, release it, build and draw again
+      struct chl_texture *rt = tex(80, 2, 16, 16, 1, 1, 5);
+      unsigned good = 0;
+      for (unsigned round = 0; rt && round < 3; round++) {
+         struct chl_render_pipeline *a = render_pipeline("bg_vs", "bg_fs_color", 80, false);
+         struct chl_render_pipeline *b = render_pipeline("bg_vs", "bg_fs_color", 80, round == 1);
+         if (a) chl_render_pipeline_release(a);
+         float verts[3 * 8] = { -1, -1, 0, 1,  1, 1, 1, 1,    3, -1, 0, 1,  1, 1, 1, 1,    -1, 3, 0, 1,  1, 1, 1, 1 };
+         bool ok = b != NULL;
+         struct chl_cmdbuf *cb = ok ? chl_cmdbuf_create(dev, why, sizeof(why)) : NULL;
+         struct chl_render_pass rp = { 0 };
+         rp.color[0] = (struct chl_attachment){ .texture = rt, .load_action = 2, .store_action = 1, .clear = { 0, 0, 0, 1 } };
+         ok = ok && cb && chl_render_begin(cb, &rp, why, sizeof(why)) == 0;
+         if (ok) {
+            chl_set_render_pipeline(cb, b);
+            chl_set_bytes(cb, CHL_STAGE_VERTEX, 0, verts, sizeof(verts));
+            ok = chl_draw(cb, 3, 0, 3, 1, 0, why, sizeof(why)) == 0;
+            chl_render_end(cb);
+            ok = ok && chl_cmdbuf_commit(cb, NULL, NULL, why, sizeof(why)) == 0 && chl_cmdbuf_wait(cb, why, sizeof(why)) == 0;
+         }
+         if (cb) chl_cmdbuf_release(cb);
+         if (b) chl_render_pipeline_release(b);
+         uint8_t px[16 * 16 * 4];
+         ok = ok && chl_texture_get(rt, 0, 0, NULL, NULL, px, 0, 0, why, sizeof(why)) == 0;
+         if (ok && px[0] == 255 && px[1] == 255 && px[2] == 255 && px[16 * 16 * 4 - 2] == 255) good++;
+      }
+      CHECK(good == 3, "shared-layout pipelines: %u of 3 rounds drew%s%s", good, good == 3 ? "" : ": ", good == 3 ? "" : why);
+      printf("  shared-layout pipelines (build two, release one, draw, release): %u of 3 rounds drew\n", good);
+   }
 }
 
 static void

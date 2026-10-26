@@ -1992,8 +1992,16 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       IOSurfaceRef sf = (IOSurfaceRef)surface;
       _desc.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (RenderTarget | ShaderRead) */
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
-      if (plane == 0 && IOSurfaceGetPlaneCount(sf) <= 1)
+      if (plane == 0 && IOSurfaceGetPlaneCount(sf) <= 1) {
          _tex = chl_texture_from_iosurface([device chl], &_desc, (int)IOSurfaceGetID(sf), why, sizeof(why));
+         static unsigned refusals;   // the first few refused imports, in bgmtl.log (which surfaces are copied instead)
+         if (!_tex && __atomic_add_fetch(&refusals, 1, __ATOMIC_RELAXED) <= 8) {
+            char line[640];
+            snprintf(line, sizeof(line), "IOSurface %u (%ux%u fmt %lu) copied, not imported: %s", IOSurfaceGetID(sf), _desc.width,
+                     _desc.height, (unsigned long)[d pixelFormat], why);
+            bgmtl_note_line(line);
+         }
+      }
       /* what cannot be imported (a pitch this GPU does not lay a linear image over, a second plane) gets its own memory and the
        * surface's pixels are copied in at each use; good for sampling, which is all CA does with those */
       if (!_tex && [d pixelFormat] == 550 && IOSurfaceGetPlaneCount(sf) >= 2) {

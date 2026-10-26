@@ -337,8 +337,27 @@ struct chl_cmdbuf {
    bool topology_set;
    unsigned pass_width, pass_height;
    VkImageView pass_color[8];   /* the render pass's colour attachments, for the framebuffer-fetch input attachments */
+   /* what flush_bindings last pushed, per bind point (0 graphics, 1 compute), valid while pushed_layout is the bound layout:
+    * a draw pushes only the descriptors and push constants that changed */
+   VkPipelineLayout pushed_layout[2];
+   struct { VkDescriptorBufferInfo b; VkDescriptorImageInfo i; } pushed[2][AIR_VK_MAX_BINDINGS];
+   uint32_t pushed_pc[2][64];
    bool vp_set, sc_set;
    struct chl_cmdbuf *next_free, *next_inflight;
+};
+
+struct chl_shared_layout {
+   struct chl_shared_layout *next;
+   size_t key_size;
+   void *key;
+   VkDescriptorSetLayout set;
+   VkPipelineLayout layout;
+};
+
+struct chl_shared_sampler {
+   struct chl_shared_sampler *next;
+   VkSamplerCreateInfo ci;
+   VkSampler sampler;
 };
 
 struct chl_device {
@@ -365,6 +384,12 @@ struct chl_device {
    struct chl_obj **pro_held;
    unsigned n_pro_held, cap_pro_held;
    struct { VkFence fence; VkCommandBuffer cb; struct chl_obj **held; unsigned n_held; } pro_inflight[8];
+
+   /* layouts and constexpr samplers shared by every pipeline with the same signature, kept until the device closes:
+    * pipelines that share a layout keep each other's push descriptors, so a switch between them pushes only what changed */
+   pthread_mutex_t share_lock;
+   struct chl_shared_layout *layouts;
+   struct chl_shared_sampler *samplers;
 
    /* free lists */
    pthread_mutex_t free_lock;
@@ -621,9 +646,25 @@ chl_device_open(char *why, size_t why_size)
    pthread_mutex_init(&d->queue_lock, NULL);
    pthread_mutex_init(&d->pro_lock, NULL);
    pthread_mutex_init(&d->free_lock, NULL);
+   pthread_mutex_init(&d->share_lock, NULL);
    pthread_mutex_init(&d->done_lock, NULL);
    pthread_cond_init(&d->done_cv, NULL);
    glsl_type_singleton_init_or_ref();
+
+   /* /private/var/tmp/chl.tudebug: Turnip's TU_DEBUG for every chl process (system daemons get no environment of ours),
+    * e.g. "sysmem" to render without GMEM tiles. Read once, before Turnip reads its debug flags. */
+   if (!getenv("TU_DEBUG")) {
+      FILE *f = fopen("/private/var/tmp/chl.tudebug", "r");
+      if (f) {
+         char flags[128] = "";
+         if (fgets(flags, sizeof(flags), f)) {
+            flags[strcspn(flags, "\r\n")] = 0;
+            if (flags[0])
+               setenv("TU_DEBUG", flags, 1);
+         }
+         fclose(f);
+      }
+   }
 
    d->vk.vkCreateInstance = (PFN_vkCreateInstance)vk_icdGetInstanceProcAddr(NULL, "vkCreateInstance");
    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "Chlorophyll", 1, "chl", 1, VK_API_VERSION_1_3 };
@@ -762,6 +803,20 @@ chl_device_close(struct chl_device *d)
    pthread_mutex_lock(&d->pro_lock);
    pro_reap(d, true);
    pthread_mutex_unlock(&d->pro_lock);
+   while (d->layouts) {
+      struct chl_shared_layout *sl = d->layouts;
+      d->layouts = sl->next;
+      d->vk.vkDestroyPipelineLayout(d->dev, sl->layout, NULL);
+      d->vk.vkDestroyDescriptorSetLayout(d->dev, sl->set, NULL);
+      free(sl->key);
+      free(sl);
+   }
+   while (d->samplers) {
+      struct chl_shared_sampler *ss = d->samplers;
+      d->samplers = ss->next;
+      d->vk.vkDestroySampler(d->dev, ss->sampler, NULL);
+      free(ss);
+   }
    d->vk.vkDestroyDevice(d->dev, NULL);
    d->vk.vkDestroyInstance(d->instance, NULL);
    glsl_type_singleton_decref();
@@ -1050,9 +1105,24 @@ struct chl_sbo {
    uint32_t surface_id, handle;
    uint64_t size, iova;
    uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
-   uint8_t rest[128 - 48];
+   uint32_t flags;               /* minor 1: SWEET_GPU_SBO_* */
+   uint8_t rest[128 - 52];
 };
+#define CHL_SBO_WRAPPED  0x4     /* SWEET_GPU_SBO_WRAPPED: another process's memory, mapped read-only, no tail */
+#define CHL_SBO_EXISTING 0x8     /* SWEET_GPU_SBO_EXISTING: this connection already had the BO (Turnip may hold it) */
 extern int sweet_drm_surface_prime(int surface_id, struct chl_sbo *out);
+extern int sweet_drm_gem_close(int fd, uint32_t handle);
+
+/* A refused import gives back the BO SURFACE_BO just made (it holds a reference on the surface), unless this connection
+ * already had it: then a texture of ours may be using it. */
+static void
+sbo_give_back(int pfd, const struct chl_sbo *sb)
+{
+   if (pfd >= 0)
+      close(pfd);
+   if (pfd >= 0 && sb->handle && !(sb->flags & CHL_SBO_EXISTING))
+      sweet_drm_gem_close(-1, sb->handle);
+}
 extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
 
 struct chl_texture *
@@ -1074,20 +1144,28 @@ chl_texture_from_iosurface(struct chl_device *d, const struct chl_texture_desc *
    if (pfd < 0 || !sb.bytes_per_row || sb.planes > 1) {
       say(why, why_size, "the kernel would not describe IOSurface %d (planes %u, %u bytes a row)", surface_id, sb.planes,
           sb.bytes_per_row);
-      if (pfd >= 0)
-         close(pfd);
+      sbo_give_back(pfd, &sb);
+      return NULL;
+   }
+   /* Client memory (another process's pages, CoreUI's icon images among them): the kernel maps it read-only and with no
+    * scratch tail after it, and the GPU's texture and tile fetches read past an image's last row, into the unmapped guard
+    * page after every BO (SMMU faults while SpringBoard drew icons, 2026-10-26). Such a surface is copied instead
+    * (bgmtl's own-memory fallback). */
+   if (sb.flags & CHL_SBO_WRAPPED) {
+      say(why, why_size, "IOSurface %d is another process's client memory (no tail page after it): copied, not mapped", surface_id);
+      sbo_give_back(pfd, &sb);
       return NULL;
    }
    unsigned w = desc->width ? desc->width : sb.width, h = desc->height ? desc->height : sb.height;
    if (sb.width < w || sb.height < h || sb.bytes_per_row < w * f->bytes) {
       say(why, why_size, "IOSurface %d is %ux%u with %u bytes a row and the texture asks for %ux%u of %s", surface_id, sb.width,
           sb.height, sb.bytes_per_row, w, h, f->name);
-      close(pfd);
+      sbo_give_back(pfd, &sb);
       return NULL;
    }
    struct chl_texture *t = calloc(1, sizeof(*t));
    if (!t) {
-      close(pfd);
+      sbo_give_back(pfd, &sb);
       return NULL;
    }
    obj_init(&t->o, d, K_TEXTURE);
@@ -1118,7 +1196,7 @@ chl_texture_from_iosurface(struct chl_device *d, const struct chl_texture_desc *
    if (r != VK_SUCCESS) {
       say(why, why_size, "%s would not lay a %ux%u %s over IOSurface %d (%u bytes a row from offset %u): VkResult %d", d->name, w, h,
           f->name, surface_id, sb.bytes_per_row, sb.offset, r);
-      close(pfd);
+      sbo_give_back(pfd, &sb);
       free(t);
       return NULL;
    }
@@ -1137,7 +1215,7 @@ chl_texture_from_iosurface(struct chl_device *d, const struct chl_texture_desc *
       say(why, why_size, "%s would not import IOSurface %d's memory (%llu bytes): VkResult %d", d->name, surface_id,
           (unsigned long long)sb.size, r);
       if (r != VK_SUCCESS)
-         close(pfd);
+         sbo_give_back(pfd, &sb);   /* not taken by Turnip; a failed bind gives it back through vkFreeMemory */
       if (t->mem)
          d->vk.vkFreeMemory(d->dev, t->mem, NULL);
       d->vk.vkDestroyImage(d->dev, t->image, NULL);
@@ -1466,8 +1544,24 @@ inline_sampler(struct chl_device *d, const struct air_resource *r, bool compare,
    if (!sampler_info(&s, &ci, why, why_size))
       return VK_NULL_HANDLE;
    ci.compareEnable = compare;
+   /* one VkSampler per distinct state, shared by every pipeline (so that their layouts can be shared too) */
+   pthread_mutex_lock(&d->share_lock);
    VkSampler out = VK_NULL_HANDLE;
-   d->vk.vkCreateSampler(d->dev, &ci, NULL, &out);
+   for (struct chl_shared_sampler *ss = d->samplers; ss && !out; ss = ss->next)
+      if (!memcmp(&ss->ci, &ci, sizeof(ci)))
+         out = ss->sampler;
+   if (!out) {
+      struct chl_shared_sampler *ss = calloc(1, sizeof(*ss));
+      if (ss && d->vk.vkCreateSampler(d->dev, &ci, NULL, &ss->sampler) == VK_SUCCESS) {
+         ss->ci = ci;
+         ss->next = d->samplers;
+         d->samplers = ss;
+         out = ss->sampler;
+      } else {
+         free(ss);
+      }
+   }
+   pthread_mutex_unlock(&d->share_lock);
    return out;
 }
 
@@ -1595,33 +1689,70 @@ make_layout(struct chl_device *d, struct chl_layout *l, struct chl_stage_info *c
       say(why, why_size, "the pipeline binds %u resources and a push-descriptor set holds 32", ndesc);
       return false;
    }
+   l->push_bytes = l->bindings.push_bytes;
+   /* the signature: stages, push-constant bytes and every binding (number, type, stages, immutable sampler); the same
+    * signature is the same VkPipelineLayout for every pipeline of the device */
+   struct { uint32_t binding, type, stages, pad; uint64_t sampler; } key_b[AIR_VK_MAX_BINDINGS];
+   struct { uint32_t all, push, nb, pad; } key_h = { all, l->push_bytes, nb, 0 };
+   memset(key_b, 0, sizeof(key_b));
+   for (unsigned k = 0; k < nb; k++) {
+      key_b[k].binding = b[k].binding;
+      key_b[k].type = b[k].descriptorType;
+      key_b[k].stages = b[k].stageFlags;
+      key_b[k].sampler = b[k].pImmutableSamplers ? (uint64_t)(uintptr_t)b[k].pImmutableSamplers[0] : 0;
+   }
+   size_t key_size = sizeof(key_h) + nb * sizeof(key_b[0]);
+   uint8_t key[sizeof(key_h) + sizeof(key_b)];
+   memcpy(key, &key_h, sizeof(key_h));
+   memcpy(key + sizeof(key_h), key_b, nb * sizeof(key_b[0]));
+   pthread_mutex_lock(&d->share_lock);
+   for (struct chl_shared_layout *sl = d->layouts; sl; sl = sl->next)
+      if (sl->key_size == key_size && !memcmp(sl->key, key, key_size)) {
+         l->set = sl->set;
+         l->layout = sl->layout;
+         pthread_mutex_unlock(&d->share_lock);
+         return true;
+      }
+   struct chl_shared_layout *sl = calloc(1, sizeof(*sl));
    VkDescriptorSetLayoutCreateInfo sci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL,
                                            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, nb, b };
-   if (d->vk.vkCreateDescriptorSetLayout(d->dev, &sci, NULL, &l->set) != VK_SUCCESS) {
-      say(why, why_size, "%s would not make the descriptor set layout of the pipeline", d->name);
-      return false;
-   }
-   l->push_bytes = l->bindings.push_bytes;
    VkPushConstantRange pr = { all, 0, l->push_bytes };
-   VkPipelineLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &l->set, l->push_bytes ? 1u : 0u,
-                                      &pr };
-   if (d->vk.vkCreatePipelineLayout(d->dev, &lci, NULL, &l->layout) != VK_SUCCESS) {
-      say(why, why_size, "%s would not make the pipeline layout", d->name);
+   VkPipelineLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, NULL, l->push_bytes ? 1u : 0u, &pr };
+   bool ok = sl && (sl->key = malloc(key_size)) != NULL &&
+             d->vk.vkCreateDescriptorSetLayout(d->dev, &sci, NULL, &sl->set) == VK_SUCCESS;
+   if (ok) {
+      lci.pSetLayouts = &sl->set;
+      ok = d->vk.vkCreatePipelineLayout(d->dev, &lci, NULL, &sl->layout) == VK_SUCCESS;
+   }
+   if (!ok) {
+      if (sl && sl->set)
+         d->vk.vkDestroyDescriptorSetLayout(d->dev, sl->set, NULL);
+      if (sl)
+         free(sl->key);
+      free(sl);
+      pthread_mutex_unlock(&d->share_lock);
+      say(why, why_size, "%s would not make the descriptor set layout or the pipeline layout of the pipeline", d->name);
       return false;
    }
+   memcpy(sl->key, key, key_size);
+   sl->key_size = key_size;
+   sl->next = d->layouts;
+   d->layouts = sl;
+   l->set = sl->set;
+   l->layout = sl->layout;
+   pthread_mutex_unlock(&d->share_lock);
    return true;
 }
 
 static void
 free_layout(struct chl_device *d, struct chl_layout *l)
 {
-   if (l->layout)
-      d->vk.vkDestroyPipelineLayout(d->dev, l->layout, NULL);
-   if (l->set)
-      d->vk.vkDestroyDescriptorSetLayout(d->dev, l->set, NULL);
-   for (unsigned i = 0; i < AIR_VK_MAX_BINDINGS; i++)
-      if (l->immutable[i])
-         d->vk.vkDestroySampler(d->dev, l->immutable[i], NULL);
+   /* the set layout, pipeline layout and constexpr samplers are the device's (shared by signature, make_layout and
+    * inline_sampler): they go when the device closes */
+   (void)d;
+   l->layout = VK_NULL_HANDLE;
+   l->set = VK_NULL_HANDLE;
+   memset(l->immutable, 0, sizeof(l->immutable));
 }
 
 static void
