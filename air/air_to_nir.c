@@ -2844,7 +2844,7 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
          /* Chlorophyll: two places in ONE buffer are one pointer whose offset is chosen, not a choice of pointers: a plain
           * pointer then, which a phi can carry (struct air_ptr_phi; iOS 26's RenderBox selects between elements and loops
           * over the result) and a load reads once */
-         if (pa->kind == AIR_VAL_PTR && same_resource(pa, pb) && offset_is_a_value(pa->ptr.class)) {
+         if (pa->kind == AIR_VAL_PTR && same_resource(pa, pb) && offset_is_a_value(pa->ptr.class) && !getenv("AIR_NO_PTR_OFFSET_PHI")) {
             nir_def *oa = pa->ptr.offset ? pa->ptr.offset : nir_imm_int(&c->b, 0);
             nir_def *ob = pb->ptr.offset ? pb->ptr.offset : nir_imm_int(&c->b, 0);
             if (oa->bit_size != 32) oa = air_u2u32(&c->b, oa);
@@ -4458,7 +4458,8 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
    if (!first)
       return air_error(c, "instruction: a phi of pointers with no reachable operand");
    if (loop_edge || offsets_differ) {
-      if (second || first->kind != AIR_VAL_PTR || !offset_is_a_value(first->ptr.class))
+      /* AIR_NO_PTR_OFFSET_PHI=1: refused as before (a measurement switch: backboardd's first frame hung once these went in) */
+      if (second || first->kind != AIR_VAL_PTR || !offset_is_a_value(first->ptr.class) || getenv("AIR_NO_PTR_OFFSET_PHI"))
          return air_error(c, "instruction: a phi of pointers whose operand comes in over "
                              "a loop edge, so which resource it is depends on the "
                              "iteration");

@@ -481,9 +481,36 @@ lower_tex_unit_cb(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* Chlorophyll: [[point_coord]] as an input varying (VARYING_SLOT_PNTC), the form freedreno serves for point sprites. The
+ * translator emits load_point_coord, which ir3 has no case for ("Unhandled intrinsic type: load_point_coord"): CoreAnimation
+ * 26's A2Xghfc reads it, and backboardd's first frame dumped that shader to the console for minutes. */
+static bool
+lower_point_coord_cb(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_point_coord)
+      return false;
+   nir_variable **var = data;
+   if (!*var) {
+      *var = nir_variable_create(b->shader, nir_var_shader_in, glsl_vec_type(2), "point_coord");
+      (*var)->data.location = VARYING_SLOT_PNTC;
+      (*var)->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+      (*var)->data.driver_location = b->shader->num_inputs++;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *v = nir_load_var(b, *var);
+   if (intr->def.bit_size != 32)
+      v = nir_f2fN(b, v, intr->def.bit_size);
+   nir_def_replace(&intr->def, v);
+   return true;
+}
+
 static void
 finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
 {
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir_variable *pntc = NULL;
+      nir_shader_intrinsics_pass(nir, lower_point_coord_cb, nir_metadata_control_flow, &pntc);
+   }
    if (!screen->caps.fs_position_is_sysval) {
       nir_shader_instructions_pass(nir, lower_tex_unit_cb, nir_metadata_all, NULL);
    }

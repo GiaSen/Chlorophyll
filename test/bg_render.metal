@@ -49,3 +49,7 @@ fragment float4 bg_fs_ca_color(CAV in [[stage_in]]) { return in.color; }
 // two colour outputs (CoreAnimation 26's blur downsample: a mip-level view and a full-size target in one pass)
 struct Two { float4 a [[color(0)]]; float4 b [[color(1)]]; };
 fragment Two bg_fs_two(V in [[stage_in]]) { Two o; o.a = in.color; o.b = in.color.bgra; return o; }
+
+// a fragment stage that reads [[point_coord]] (CoreAnimation 26's A2Xghfc does): it has to compile, whatever it reads for a triangle
+struct VP { float4 pos [[position]]; float4 color; float2 uv; };
+fragment float4 bg_fs_pointcoord(VP in [[stage_in]], float2 pc [[point_coord]]) { return float4(in.color.rgb, 1.0) + float4(pc * 0.0, 0.0, 0.0); }
