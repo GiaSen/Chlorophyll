@@ -1917,8 +1917,11 @@ bg_idle_trim_schedule(struct rwa_device *rwa)
          const unsigned pts[5][2] = { { wd / 2, ht / 2 }, { wd / 4, ht / 4 }, { 3 * wd / 4, ht / 4 }, { wd / 4, 3 * ht / 4 }, { 3 * wd / 4, 3 * ht / 4 } };
          char line[256]; size_t n = 0;
          for (unsigned k = 0; k < 5; k++) {
-            uint8_t px[4] = { 0 };
-            [t getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(pts[k][0], pts[k][1], 1, 1) mipmapLevel:0];
+            // room for one texel of any format (RGBA32Float is 16 bytes); the first four bytes are printed. It was px[4] with
+            // bytesPerRow 4: harmless while libbgair refused that for 8- and 16-byte texels, a stack overflow (SpringBoard and
+            // backboardd crash loops, initproc panic) the moment it did not.
+            uint8_t px[16] = { 0 };
+            [t getBytes:px bytesPerRow:sizeof(px) fromRegion:MTLRegionMake2D(pts[k][0], pts[k][1], 1, 1) mipmapLevel:0];
             n += snprintf(line + n, sizeof(line) - n, " (%u,%u,%u,%u)", px[0], px[1], px[2], px[3]);
          }
          BG_LOG("  attachment %p %ux%u:%s\n", t, wd, ht, line);
@@ -1958,8 +1961,8 @@ bg_idle_trim_schedule(struct rwa_device *rwa)
          const unsigned pts[5][2] = { { wd / 2, ht / 2 }, { wd / 4, ht / 4 }, { 3 * wd / 4, ht / 4 }, { wd / 4, 3 * ht / 4 }, { 3 * wd / 4, 3 * ht / 4 } };
          double sum = 0;
          for (unsigned k = 0; k < 5; k++) {
-            uint8_t px[4] = { 0 };
-            [last getBytes:px bytesPerRow:4 fromRegion:MTLRegionMake2D(pts[k][0], pts[k][1], 1, 1) mipmapLevel:0];
+            uint8_t px[16] = { 0 };   // one texel of any format (see the attachment readback above)
+            [last getBytes:px bytesPerRow:sizeof(px) fromRegion:MTLRegionMake2D(pts[k][0], pts[k][1], 1, 1) mipmapLevel:0];
             sum += (px[0] + px[1] + px[2]) / 3.0;
          }
          luma = sum / 5;
