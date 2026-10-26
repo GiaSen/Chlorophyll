@@ -148,6 +148,19 @@ bg_ctx_init(void)
 static void bg_lock(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, bg_ctx_init); pthread_mutex_lock(&bg_ctx_mutex); }
 // counts commits: a buffer-backed texture is filled from its buffer at most once per command buffer (BGMTLTexture _linSeq)
 static unsigned long g_bg_commit_seq;
+// Chlorophyll: what a process holds in Metal objects, for the idle-trim line (bgmtl.perf): textures with memory of their
+// own and buffers (count, bytes; texture bytes estimated from the shape), heap allocations, makeAliasable calls and
+// setPurgeableState requests by state (0..4: KeepCurrent is 1, NonVolatile 2, Volatile 3, Empty 4)
+static long g_bg_tex_n, g_bg_tex_bytes, g_bg_buf_n, g_bg_buf_bytes;
+static unsigned long g_bg_heap_allocs, g_bg_aliasable, g_bg_purge[5];
+static long
+bg_tex_bytes(const struct rwa_texture_shape *s)
+{
+   long layers = s->depth > s->array_length ? s->depth : s->array_length;
+   long b = (long)s->width * s->height * (layers ? layers : 1) * 4 * (s->sample_count ? s->sample_count : 1);
+   return s->mip_levels > 1 ? b + b / 3 : b;
+}
+static void bg_count_purge(NSUInteger state) { __atomic_add_fetch(&g_bg_purge[state < 5 ? state : 0], 1, __ATOMIC_RELAXED); }
 static void bg_unlock(void) { pthread_mutex_unlock(&bg_ctx_mutex); }
 
 #define BG_MAX_BINDINGS 16
@@ -1276,12 +1289,15 @@ bg_pipeline_queue(void)
 - (NSUInteger)usedSize { return 0; }
 - (NSUInteger)currentAllocatedSize { return _size; }
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment { (void)alignment; return _size; }
-- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return MTLPurgeableStateNonVolatile; }
-- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options { return [_owner newBufferWithLength:length options:options]; }
+- (NSUInteger)setPurgeableState:(NSUInteger)state { bg_count_purge(state); return MTLPurgeableStateNonVolatile; }
+- (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options
+{ __atomic_add_fetch(&g_bg_heap_allocs, 1, __ATOMIC_RELAXED); return [_owner newBufferWithLength:length options:options]; }
 - (id)newBufferWithLength:(NSUInteger)length options:(NSUInteger)options offset:(NSUInteger)offset
-{ (void)offset; return [_owner newBufferWithLength:length options:options]; }
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d { return [_owner newTextureWithDescriptor:d]; }
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset { (void)offset; return [_owner newTextureWithDescriptor:d]; }
+{ (void)offset; __atomic_add_fetch(&g_bg_heap_allocs, 1, __ATOMIC_RELAXED); return [_owner newBufferWithLength:length options:options]; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d
+{ __atomic_add_fetch(&g_bg_heap_allocs, 1, __ATOMIC_RELAXED); return [_owner newTextureWithDescriptor:d]; }
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset
+{ (void)offset; __atomic_add_fetch(&g_bg_heap_allocs, 1, __ATOMIC_RELAXED); return [_owner newTextureWithDescriptor:d]; }
 @end
 
 @implementation BGMTLBuffer
@@ -1300,6 +1316,8 @@ bg_pipeline_queue(void)
    _owner = device;
    _length = length;
    _contents = rwa_buffer_map(_buf);
+   __atomic_add_fetch(&g_bg_buf_n, 1, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&g_bg_buf_bytes, (long)length, __ATOMIC_RELAXED);
    return self;
 }
 // newBufferWithBytesNoCopy: contents is the caller's memory, as Metal promises; the GPU reads its own copy, refreshed from
@@ -1317,7 +1335,11 @@ bg_pipeline_queue(void)
 }
 - (void)dealloc
 {
-   if (_buf) { bg_lock(); rwa_buffer_destroy(_buf); bg_unlock(); }
+   if (_buf) {
+      bg_lock(); rwa_buffer_destroy(_buf); bg_unlock();
+      __atomic_sub_fetch(&g_bg_buf_n, 1, __ATOMIC_RELAXED);
+      __atomic_sub_fetch(&g_bg_buf_bytes, (long)_length, __ATOMIC_RELAXED);
+   }
    if (_deallocator) { _deallocator(_contents, _length); Block_release(_deallocator); }
    [super dealloc];
 }
@@ -1331,11 +1353,11 @@ bg_pipeline_queue(void)
 - (NSUInteger)cpuCacheMode { return 1; }
 - (NSUInteger)resourceOptions { return 0; }
 - (NSUInteger)hazardTrackingMode { return 0; }
-- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
+- (NSUInteger)setPurgeableState:(NSUInteger)state { bg_count_purge(state); return 2; }
 - (id)heap { return nil; }
 - (NSUInteger)heapOffset { return 0; }
 - (BOOL)isAliasable { return NO; }
-- (void)makeAliasable {}
+- (void)makeAliasable { __atomic_add_fetch(&g_bg_aliasable, 1, __ATOMIC_RELAXED); }
 - (BOOL)doesAliasResource:(id)r { (void)r; return NO; }
 - (BOOL)isComplete { return YES; }
 - (void)waitUntilComplete {}
@@ -1790,10 +1812,20 @@ bg_idle_trim_schedule(struct rwa_device *rwa)
       double before = bg_footprint_mb();
       bg_lock();
       rwa_device_trim(rwa);
+      struct rwa_memory m;
+      rwa_device_memory(rwa, &m);
       bg_unlock();
       if (bg_perf_on()) {
-         char line[120];
-         snprintf(line, sizeof(line), "idle trim: footprint %.1f -> %.1f MB", before, bg_footprint_mb());
+         task_vm_info_data_t vi;
+         mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+         task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n);
+         char line[400];
+         snprintf(line, sizeof(line), "idle trim: footprint %.1f -> %.1f MB (internal %.1f); GPU buffers %u live %.1f MB, %.1f mapped, "
+                  "%u cached %.1f MB; Metal: %ld textures ~%.1f MB, %ld buffers %.1f MB, %lu heap allocations, %lu makeAliasable, "
+                  "purgeable requests keep %lu nonvolatile %lu volatile %lu empty %lu", before, bg_footprint_mb(),
+                  vi.internal / 1048576.0, m.live_bos, m.live_bytes / 1048576.0, m.mapped_bytes / 1048576.0, m.cached_bos,
+                  m.cached_bytes / 1048576.0, g_bg_tex_n, g_bg_tex_bytes / 1048576.0, g_bg_buf_n, g_bg_buf_bytes / 1048576.0,
+                  g_bg_heap_allocs, g_bg_aliasable, g_bg_purge[1], g_bg_purge[2], g_bg_purge[3], g_bg_purge[4]);
          bgmtl_note_line(line);
       }
    });
@@ -2243,6 +2275,10 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
    }
    if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
    _owner = device;
+   if (!surface || _surfCopy) {
+      __atomic_add_fetch(&g_bg_tex_n, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&g_bg_tex_bytes, bg_tex_bytes(&_shape), __ATOMIC_RELAXED);
+   }
    // MTLTextureDescriptor.swizzle (QuartzCore 26 forces alpha to one for opaque content this way): applied when it is sampled
    _swizzle = [d swizzle];
    const unsigned char sw[4] = { (unsigned char)_swizzle.red, (unsigned char)_swizzle.green, (unsigned char)_swizzle.blue, (unsigned char)_swizzle.alpha };
@@ -2312,6 +2348,10 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
 - (void)dealloc
 {
    bg_lock(); if (_tex) rwa_texture_destroy(_tex); bg_unlock();
+   if (_tex && !_parent && (!_surface || _surfCopy)) {
+      __atomic_sub_fetch(&g_bg_tex_n, 1, __ATOMIC_RELAXED);
+      __atomic_sub_fetch(&g_bg_tex_bytes, bg_tex_bytes(&_shape), __ATOMIC_RELAXED);
+   }
    if (_surface) CFRelease(_surface);
    [_parent release];
    [_linSrc release];
@@ -2429,7 +2469,8 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
 - (NSUInteger)resourceOptions { return 0; }
 - (NSUInteger)hazardTrackingMode { return 0; }
 - (NSUInteger)allocatedSize { return 0; }
-- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
+- (NSUInteger)setPurgeableState:(NSUInteger)state { bg_count_purge(state); return 2; }
+- (void)makeAliasable { __atomic_add_fetch(&g_bg_aliasable, 1, __ATOMIC_RELAXED); }
 - (id)heap { return nil; }
 - (BOOL)isAliasable { return NO; }
 - (BOOL)isComplete { return YES; }

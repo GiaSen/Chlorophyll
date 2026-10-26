@@ -7642,6 +7642,11 @@ fragment_done:
       ralloc_free(vs);
    if (!render->vs_cso)
       goto fail;
+   /* Chlorophyll: the driver compiled its own clones; this library's NIR of both stages is not read again, and kept it was
+    * most of the ~330 KB every pipeline cost (iconservicesagent holds ~200 and must stay small: jetsam InactiveHard 17 MB) */
+   ralloc_free(fs);
+   if (!render->generated_vertex)
+      ralloc_free(vs);
    if (timing) {
       int64_t t_compiled = os_time_get_nano();
       fprintf(stderr, "RWA_TIMING %s: translate %.1f ms, stages %.1f ms\n", fragment_entry ? fragment_entry : "(none)",

@@ -10,6 +10,17 @@
 #include <string.h>
 #include <time.h>
 #include "air_metal.h"
+#include <mach/mach.h>
+/* BGSWEEP_KEEP=1: keep every pipeline alive and print the process's memory at the end (what N pipelines cost) */
+static void
+print_memory(const char *what, unsigned n)
+{
+   task_vm_info_data_t vi;
+   mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+   task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &c);
+   fprintf(stderr, "MEMORY %s (%u pipelines): footprint %.1f MB, internal %.1f MB\n", what, n, vi.phys_footprint / 1048576.0,
+           vi.internal / 1048576.0);
+}
 
 static uint64_t rd64(const uint8_t *p) { uint64_t v = 0; for (int i = 7; i >= 0; i--) v = v << 8 | p[i]; return v; }
 static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -61,6 +72,7 @@ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &
 int
 main(int argc, char **argv)
 {
+   unsigned kept = 0;
    if (argc < 3) { fprintf(stderr, "usage: bgair_sweep lib.mtlb out.tsv [--only NAME]\n"); return 2; }
    const char *only = NULL;
    for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
@@ -73,6 +85,7 @@ main(int argc, char **argv)
    parse(data, n);
    char why[512] = { 0 };
    struct rwa_device *dev = rwa_device_open(why, sizeof(why));
+   if (getenv("BGSWEEP_KEEP")) print_memory("device open", 0);
    if (!dev) { fprintf(stderr, "device: %s\n", why); return 3; }
    FILE *out = fopen(argv[2], only ? "a" : "w");
    enum { W = 32 };
@@ -178,8 +191,10 @@ next:
       fflush(out);
       for (unsigned i = 0; i < 16; i++) if (texs[i]) rwa_texture_destroy(texs[i]);
       for (unsigned i = 0; i < 32; i++) if (bufs[i]) rwa_buffer_destroy(bufs[i]);
-      rwa_render_destroy(r);
+      if (getenv("BGSWEEP_KEEP")) kept++;
+      else rwa_render_destroy(r);
    }
+   if (getenv("BGSWEEP_KEEP")) print_memory("all kept", kept);
    fclose(out);
    return 0;
 }
