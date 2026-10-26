@@ -130,10 +130,10 @@ index ab27798..2268451 100644
  
     bo->map = NULL;
 diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
-index 4c2bf6a..3c1b0f2 100644
+index 4c2bf6a..b53b28c 100644
 --- a/src/freedreno/vulkan/tu_knl.h
 +++ b/src/freedreno/vulkan/tu_knl.h
-@@ -16,6 +16,18 @@
+@@ -16,6 +16,19 @@
  #include "util/u_atomic.h"
  #include "vulkan/vulkan_core.h"
  
@@ -144,6 +144,7 @@ index 4c2bf6a..3c1b0f2 100644
 +#endif
 +void *sweet_drm_mmap(int fd, size_t len, uint64_t off);
 +int sweet_drm_munmap(void *addr, size_t len);
++int64_t sweet_drm_prime_size(int prime_fd);
 +#ifdef __cplusplus
 +}
 +#endif
@@ -153,10 +154,25 @@ index 4c2bf6a..3c1b0f2 100644
  struct tu_queue;
  struct vdrm_bo;
 diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
-index 84ab61f..309cba6 100644
+index 84ab61f..85e51bb 100644
 --- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
 +++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
-@@ -1037,10 +1037,18 @@ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+@@ -970,9 +970,14 @@ msm_bo_init_dmabuf(struct tu_device *dev,
+ {
+    flags = (enum tu_bo_alloc_flags)(flags | TU_BO_ALLOC_DMABUF);
+ 
++#ifdef __APPLE__
++   /* Chlorophyll: a "prime fd" of the libdrm stand-in (an IOSurface made a BO by SURFACE_BO) knows its size there */
++   off_t real_size = (off_t)sweet_drm_prime_size(prime_fd);
++#else
+    /* lseek() to get the real size */
+    off_t real_size = lseek(prime_fd, 0, SEEK_END);
+    lseek(prime_fd, 0, SEEK_SET);
++#endif
+    if (real_size < 0 || (uint64_t) real_size < size)
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+ 
+@@ -1037,10 +1042,18 @@ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
     if (!offset)
        return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
  
@@ -175,7 +191,7 @@ index 84ab61f..309cba6 100644
     if (map == MAP_FAILED)
        return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
  
-@@ -1136,7 +1144,11 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1136,7 +1149,11 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
     if (bo->map) {
        TU_RMV(bo_unmap, dev, bo);
@@ -187,7 +203,7 @@ index 84ab61f..309cba6 100644
     }
  
     TU_RMV(bo_destroy, dev, bo);
-@@ -1594,7 +1606,12 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+@@ -1594,7 +1611,12 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
  
     /* Version 1.6 added SYNCOBJ support. */
     const int min_version_major = 1;
@@ -200,7 +216,7 @@ index 84ab61f..309cba6 100644
  
     if (version->version_major != min_version_major ||
         version->version_minor < min_version_minor) {
-@@ -1651,6 +1668,11 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+@@ -1651,6 +1673,11 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
  
     device->has_set_iova = !tu_drm_get_va_prop(device, &device->va_start,
                                                &device->va_size);

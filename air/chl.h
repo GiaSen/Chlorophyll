@@ -78,6 +78,11 @@ struct chl_texture_desc {
    unsigned char swizzle[4];/* MTLTextureSwizzle (0 zero, 1 one, 2 red .. 5 alpha); all zero = identity */
 };
 struct chl_texture *chl_texture_create(struct chl_device *dev, const struct chl_texture_desc *desc, char *why, size_t why_size);
+/* -newTextureWithDescriptor:iosurface:plane: (plane 0): the texture IS the surface's memory, linear with the surface's pitch.
+ * chl_texture_flush_surface makes what the GPU wrote visible to the processor and to the compositor (the kernel's cache clean). */
+struct chl_texture *chl_texture_from_iosurface(struct chl_device *dev, const struct chl_texture_desc *desc, int surface_id,
+                                               char *why, size_t why_size);
+int chl_texture_flush_surface(struct chl_texture *tex);
 /* -[MTLTexture newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:] */
 struct chl_texture *chl_texture_view(struct chl_texture *parent, unsigned pixel_format, unsigned type, unsigned base_level,
                                      unsigned level_count, unsigned base_slice, unsigned slice_count,

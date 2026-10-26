@@ -10,6 +10,8 @@
 #include <string.h>
 #include <time.h>
 #include "chl.h"
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurfaceRef.h>
 
 static int pass, fail;
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -524,6 +526,73 @@ test_render(void)
 }
 
 static void
+cfset(CFMutableDictionaryRef d, CFStringRef k, int v)
+{
+   CFNumberRef n = CFNumberCreate(NULL, kCFNumberIntType, &v);
+   CFDictionarySetValue(d, k, n);
+   CFRelease(n);
+}
+
+static void
+test_iosurface(void)
+{
+   enum { W = 64, H = 32 };
+   CFMutableDictionaryRef props = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+   cfset(props, kIOSurfaceWidth, W);
+   cfset(props, kIOSurfaceHeight, H);
+   cfset(props, kIOSurfaceBytesPerElement, 4);
+   cfset(props, kIOSurfaceBytesPerRow, W * 4);
+   cfset(props, kIOSurfacePixelFormat, 0x42475241 /* 'BGRA' */);
+   IOSurfaceRef sf = IOSurfaceCreate(props);
+   CFRelease(props);
+   if (!sf) { printf("  IOSurfaceCreate failed\n"); fail++; return; }
+   size_t bpr = IOSurfaceGetBytesPerRow(sf);
+   IOSurfaceLock(sf, 0, NULL);
+   uint8_t *base = IOSurfaceGetBaseAddress(sf);
+   for (unsigned y = 0; y < H; y++)
+      for (unsigned x = 0; x < W; x++) {
+         uint8_t *q = base + y * bpr + 4 * x;
+         q[0] = (uint8_t)(x * 4); q[1] = (uint8_t)(y * 8); q[2] = 0x55; q[3] = 0xff;
+      }
+   IOSurfaceUnlock(sf, 0, NULL);
+   struct chl_texture_desc d = { .pixel_format = 80, .type = 2, .width = W, .height = H, .depth = 1, .array_length = 1, .mip_levels = 1,
+                                 .sample_count = 1, .usage = 5 };
+   struct chl_texture *t = chl_texture_from_iosurface(dev, &d, (int)IOSurfaceGetID(sf), why, sizeof(why));
+   if (!t) { printf("  IOSurface import: %s\n", why); fail++; CFRelease(sf); return; }
+   /* read through a kernel: what the processor wrote */
+   struct chl_compute_pipeline *c = kernel("bg_tex_read");
+   struct chl_buffer *o = buf(W * H * 16);
+   struct binding bd = { .b = { o }, .nb = 1, .t = { t }, .nt = 1 };
+   bool ok = c && o && dispatch(c, &bd, W / 16, H / 8, 16, 8);
+   unsigned bad = 0;
+   const float *po = ok ? chl_buffer_contents(o) : NULL;
+   for (unsigned y = 0; ok && y < H; y++)
+      for (unsigned x = 0; x < W; x++) {
+         const float *p = po + 4 * (y * W + x);   /* RGBA */
+         if (fabsf(p[2] - (x * 4) / 255.0f) > 0.002f || fabsf(p[1] - (y * 8) / 255.0f) > 0.002f || fabsf(p[0] - 0x55 / 255.0f) > 0.002f) {
+            if (bad++ < 3) printf("    (%u,%u) = %g %g %g %g\n", x, y, p[0], p[1], p[2], p[3]);
+         }
+      }
+   CHECK(ok && !bad, "IOSurface read by a kernel: %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why);
+   printf("  IOSurface (%zu bytes a row) read by a kernel: %u wrong\n", bpr, bad);
+   /* render into it, flush, and read it as the processor */
+   static const float green[4] = { 0, 1, 0, 1 };
+   ok = clear_pass(t, 0, green, NULL) && chl_texture_flush_surface(t) == 0;
+   bad = 0;
+   IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL);
+   for (unsigned y = 0; ok && y < H; y++)
+      for (unsigned x = 0; x < W; x++) {
+         const uint8_t *q = base + y * bpr + 4 * x;
+         if (q[0] != 0 || q[1] != 255 || q[2] != 0 || q[3] != 255) { if (bad++ < 3) printf("    (%u,%u) = B%u G%u R%u A%u\n", x, y, q[0], q[1], q[2], q[3]); }
+      }
+   IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+   CHECK(ok && !bad, "render into an IOSurface: %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why);
+   printf("  render into an IOSurface, read by the processor: %u wrong\n", bad);
+   chl_texture_release(t);
+   CFRelease(sf);
+}
+
+static void
 bench(unsigned draws, unsigned frames)
 {
    struct chl_render_pipeline *pc = render_pipeline("bg_vs", "bg_fs_color", 70, false);
@@ -579,6 +648,7 @@ main(int argc, char **argv)
    printf("device: %s (%.1f ms)\n", chl_device_name(dev), now_ms() - t0);
    if (!getenv("CHL_NO_COMPUTE")) test_compute();
    if (!getenv("CHL_NO_RENDER")) test_render();
+   if (!getenv("CHL_NO_SURFACE")) test_iosurface();
    if (getenv("CHL_BENCH")) bench(200, 100);
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    chl_device_close(dev);

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define VK_NO_PROTOTYPES
 #include "vulkan/vulkan_core.h"
@@ -239,6 +240,7 @@ struct chl_texture {
    struct chl_view_cache att[8];  /* single-level single-layer attachment views */
    unsigned n_att;
    unsigned char swizzle[4];
+   uint32_t surface_handle;       /* an IOSurface's BO (chl_texture_from_iosurface), for the cache clean */
 };
 
 struct chl_sampler {
@@ -672,10 +674,12 @@ chl_device_open(char *why, size_t why_size)
    feats.features.sampleRateShading = VK_TRUE;
    feats.features.depthBiasClamp = VK_TRUE;
    feats.features.imageCubeArray = VK_TRUE;
-   static const char *const exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME };
+   static const char *const exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+                                       VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+                                       VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME };
    float prio = 1.0f;
    VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &prio };
-   VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feats, 0, 1, &qci, 0, NULL, 2, exts, NULL };
+   VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feats, 0, 1, &qci, 0, NULL, 5, exts, NULL };
    VkResult r = d->vk.vkCreateDevice(d->pd, &dci, NULL, &d->dev);
    if (r != VK_SUCCESS) {
       say(why, why_size, "%s would not make a Vulkan device with push descriptors, null descriptors and dynamic rendering "
@@ -1021,6 +1025,121 @@ chl_texture_create(struct chl_device *d, const struct chl_texture_desc *desc, ch
    t->view = make_view(t, view_type(t->type), 0, mips, 0, layers, true);
    transition_new_image(d, t);
    return t;
+}
+
+/* The libdrm stand-in's IOSurface import (gpu/freedreno-sweet): SURFACE_BO's answer, as the kernel ABI lays it out
+ * (xnu/gpu-abi/sweet_adreno_abi.h, struct sweet_gpu_surface_bo; the first fields, the same in every minor). */
+struct chl_sbo {
+   uint32_t surface_id, handle;
+   uint64_t size, iova;
+   uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
+   uint8_t rest[128 - 48];
+};
+extern int sweet_drm_surface_prime(int surface_id, struct chl_sbo *out);
+extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
+
+struct chl_texture *
+chl_texture_from_iosurface(struct chl_device *d, const struct chl_texture_desc *desc, int surface_id, char *why, size_t why_size)
+{
+   const struct chl_format *f = desc ? chl_format(desc->pixel_format) : NULL;
+   if (!f || (f->aspects & ~ASPECT_COLOR) || f->bw != 1) {
+      say(why, why_size, "an IOSurface as pixel format %u: only uncompressed colour formats can be laid over one",
+          desc ? desc->pixel_format : 0);
+      return NULL;
+   }
+   if (desc->type != CHL_TEX_2D || (desc->mip_levels > 1) || (desc->array_length > 1)) {
+      say(why, why_size, "an IOSurface is one level of one 2D image (type %u, %u levels, %u slices asked)", desc->type,
+          desc->mip_levels, desc->array_length);
+      return NULL;
+   }
+   struct chl_sbo sb;
+   int pfd = sweet_drm_surface_prime(surface_id, &sb);
+   if (pfd < 0 || !sb.bytes_per_row || sb.planes > 1) {
+      say(why, why_size, "the kernel would not describe IOSurface %d (planes %u, %u bytes a row)", surface_id, sb.planes,
+          sb.bytes_per_row);
+      if (pfd >= 0)
+         close(pfd);
+      return NULL;
+   }
+   unsigned w = desc->width ? desc->width : sb.width, h = desc->height ? desc->height : sb.height;
+   if (sb.width < w || sb.height < h || sb.bytes_per_row < w * f->bytes) {
+      say(why, why_size, "IOSurface %d is %ux%u with %u bytes a row and the texture asks for %ux%u of %s", surface_id, sb.width,
+          sb.height, sb.bytes_per_row, w, h, f->name);
+      close(pfd);
+      return NULL;
+   }
+   struct chl_texture *t = calloc(1, sizeof(*t));
+   if (!t) {
+      close(pfd);
+      return NULL;
+   }
+   obj_init(&t->o, d, K_TEXTURE);
+   t->fmt = f;
+   t->vkfmt = f->vk;
+   t->type = CHL_TEX_2D;
+   t->width = w, t->height = h, t->depth = 1, t->levels = 1, t->layers = 1, t->samples = 1;
+   t->usage = desc->usage ? desc->usage : (CHL_USAGE_SHADER_READ | CHL_USAGE_RENDER_TARGET);
+   t->surface_handle = sb.handle;
+   memcpy(t->swizzle, desc->swizzle, 4);
+   VkFormatProperties fp;
+   d->vk.vkGetPhysicalDeviceFormatProperties(d->pd, f->vk, &fp);
+   t->vkusage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+   if (fp.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
+      t->vkusage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   if ((t->usage & CHL_USAGE_SHADER_WRITE) && (fp.linearTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+      t->vkusage |= VK_IMAGE_USAGE_STORAGE_BIT;
+
+   VkSubresourceLayout plane = { sb.offset, 0, sb.bytes_per_row, 0, 0 };
+   VkImageDrmFormatModifierExplicitCreateInfoEXT mod = { VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT, NULL,
+                                                        0 /* DRM_FORMAT_MOD_LINEAR */, 1, &plane };
+   VkExternalMemoryImageCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, &mod,
+                                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+   VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext, 0, VK_IMAGE_TYPE_2D, f->vk, { w, h, 1 }, 1, 1,
+                             VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, t->vkusage, VK_SHARING_MODE_EXCLUSIVE, 0,
+                             NULL, VK_IMAGE_LAYOUT_UNDEFINED };
+   VkResult r = d->vk.vkCreateImage(d->dev, &ici, NULL, &t->image);
+   if (r != VK_SUCCESS) {
+      say(why, why_size, "%s would not lay a %ux%u %s over IOSurface %d (%u bytes a row from offset %u): VkResult %d", d->name, w, h,
+          f->name, surface_id, sb.bytes_per_row, sb.offset, r);
+      close(pfd);
+      free(t);
+      return NULL;
+   }
+   VkMemoryRequirements req;
+   d->vk.vkGetImageMemoryRequirements(d->dev, t->image, &req);
+   VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, t->image, VK_NULL_HANDLE };
+   VkImportMemoryFdInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, &ded, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                                   pfd };
+   uint32_t mt = d->mt_host;
+   if (!(req.memoryTypeBits & (1u << mt)))
+      for (mt = 0; mt < d->memprops.memoryTypeCount && !(req.memoryTypeBits & (1u << mt)); mt++)
+         ;
+   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, req.size, mt };
+   r = d->vk.vkAllocateMemory(d->dev, &ai, NULL, &t->mem);   /* takes the fd */
+   if (r != VK_SUCCESS || d->vk.vkBindImageMemory(d->dev, t->image, t->mem, 0) != VK_SUCCESS) {
+      say(why, why_size, "%s would not import IOSurface %d's memory (%llu bytes): VkResult %d", d->name, surface_id,
+          (unsigned long long)sb.size, r);
+      if (r != VK_SUCCESS)
+         close(pfd);
+      if (t->mem)
+         d->vk.vkFreeMemory(d->dev, t->mem, NULL);
+      d->vk.vkDestroyImage(d->dev, t->image, NULL);
+      free(t);
+      return NULL;
+   }
+   sweet_drm_bo_sync(-1, sb.handle, 0, 0);   /* the processor's dirty lines out before the GPU first reads or writes */
+   t->view = make_view(t, VK_IMAGE_VIEW_TYPE_2D, 0, 1, 0, 1, true);
+   transition_new_image(d, t);
+   return t;
+}
+
+int
+chl_texture_flush_surface(struct chl_texture *t)
+{
+   struct chl_texture *root = t && t->parent ? t->parent : t;
+   if (!root || !root->surface_handle)
+      return 0;
+   return sweet_drm_bo_sync(-1, root->surface_handle, 0, 0);
 }
 
 struct chl_texture *

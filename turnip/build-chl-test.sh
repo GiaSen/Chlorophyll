@@ -20,7 +20,7 @@ for m in bg_kernels bg_render; do
   xcrun -sdk iphoneos metallib "$OUT/$m.air" -o "$OUT/$m.metallib"
 done
 $CC -O2 -g -Wall -I"$HERE/../air" "$HERE/test/chl_test.c" -o "$OUT/chl_test" "$OUT/libchlorophyll.dylib" "$OUT/libdrm.2.dylib" \
-    -Wl,-rpath,@executable_path
+    -framework IOSurface -framework CoreFoundation -Wl,-rpath,@executable_path
 codesign -f -s - --entitlements "$HERE/entitlements.plist" "$OUT/chl_test" 2>/dev/null
 for f in chl_test libchlorophyll.dylib libdrm.2.dylib; do python3 "$BG_GPU/../tools/renegade/pacstrip.py" --sign "$OUT/$f" >/dev/null; done
 ls -l "$OUT"
