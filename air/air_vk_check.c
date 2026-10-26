@@ -46,6 +46,8 @@ main(int argc, char **argv)
       struct air_metallib_function one;
       if (n >= 4 && (!memcmp(data, "BC\xc0\xde", 4) || !memcmp(data, "\xde\xc0\x17\x0b", 4))) {
          const char *base = strrchr(argv[a], '/') ? strrchr(argv[a], '/') + 1 : argv[a];
+         if (strchr(base, '+'))   /* VERTEX+FRAGMENT.f.bc (bgmtl.refuse dumps): the fragment's name */
+            base = strchr(base, '+') + 1;
          one = (struct air_metallib_function){ .name = ralloc_strndup(mem, base, strcspn(base, ".")), .bitcode = data, .bitcode_size = n };
          lib.functions = &one;
          lib.num_functions = 1;

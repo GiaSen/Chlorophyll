@@ -5459,6 +5459,11 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     * point, which every consumer of this NIR assumes.
     */
    if (_mesa_hash_table_num_entries(c.fns)) {
+      /* A callee's early `ret` is a jump_return after nir_lower_goto_ifs, and nir_inline_functions copies the body in as is:
+       * the caller would return there instead of the callee (a debug build asserts in nir_inline_function_impl). Returns
+       * are lowered first, as nir_functions.c prescribes. RenderBox's uber fragments (fa16*mha4) took 7 s in ir3 and hung
+       * the GPU on Turnip without this. */
+      NIR_PASS(_, c.nir, nir_lower_returns);
       NIR_PASS(_, c.nir, nir_inline_functions);
       NIR_PASS(_, c.nir, nir_opt_deref);
       nir_remove_non_entrypoints(c.nir);

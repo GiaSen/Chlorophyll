@@ -164,6 +164,27 @@ test_compute(void)
          printf("  bg_groupsum: %u of %u correct\n", ok ? groups - bad : 0, groups);
       } else fail++;
    }
+   { // bg_scratch: a run-time-indexed thread array in private memory (scratch)
+      struct chl_compute_pipeline *c = kernel("bg_scratch");
+      const unsigned n = 4096, salt = 7;
+      if (c) {
+         struct chl_buffer *o = buf(n * 4), *k = buf(16);
+         uint32_t *po = chl_buffer_contents(o);
+         for (unsigned i = 0; i < n; i++) po[i] = 0xdeadbeef;
+         *(uint32_t *)chl_buffer_contents(k) = salt;
+         struct binding bd = { .b = { o, k }, .nb = 2 };
+         bool ok = dispatch(c, &bd, n / 64, 1, 64, 1);
+         unsigned bad = 0;
+         for (unsigned g = 0; ok && g < n; g++) {
+            uint32_t a[96], want = 0;
+            for (unsigned i = 0; i < 96; i++) a[i] = g * 31u + i * salt;
+            for (unsigned i = 0; i < 96; i++) want += a[(i * 37u + g) % 96u] ^ i;
+            if (po[g] != want) { if (bad++ < 3) printf("    out[%u]=%u want %u\n", g, po[g], want); }
+         }
+         CHECK(ok && !bad, "bg_scratch %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why);
+         printf("  bg_scratch: %u of %u correct\n", ok ? n - bad : 0, n);
+      } else fail++;
+   }
    { // bg_tex_write: an image store at level 0 into RGBA32Float
       struct chl_compute_pipeline *c = kernel("bg_tex_write");
       struct chl_texture *t = c ? tex(125, 2, 16, 8, 1, 1, 3) : NULL;

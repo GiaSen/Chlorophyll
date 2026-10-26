@@ -160,3 +160,16 @@ kernel void bg_ptr_select_walk(device const float *in [[buffer(0)]], device floa
    }
    out[gid] = s;
 }
+
+// A thread-local array indexed at run time, too big for registers: private memory (scratch) on the GPU. RenderBox's uber
+// fragments (fa16*mha4) keep 168 bytes this way.
+kernel void bg_scratch(device uint *out [[buffer(0)]], constant uint &salt [[buffer(1)]], uint gid [[thread_position_in_grid]])
+{
+   uint a[96];
+   for (uint i = 0; i < 96; i++)
+      a[i] = gid * 31u + i * salt;
+   uint s = 0;
+   for (uint i = 0; i < 96; i++)
+      s += a[(i * 37u + gid) % 96u] ^ i;
+   out[gid] = s;
+}

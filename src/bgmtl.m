@@ -125,6 +125,44 @@ bg_fail_dump(const char *reason, NSData *vair, NSString *vname, NSData *air, NSS
    fclose(f);
 }
 
+// /private/var/tmp/bgmtl.refuse: fragment-function name prefixes, one per line. A render pipeline whose fragment function starts
+// with one is not built: its AIR (vertex, fragment and the linked functions) goes to /private/var/tmp/bgmtl-refused/ and the
+// pipeline is refused. A diagnostic for a shader that hangs the GPU: the process keeps running and the shader can be examined
+// on the Mac (air_vk_check) without spending one of the kernel's GPU recoveries. Read once per process.
+static BOOL
+bg_refused(NSString *fname)
+{
+   static NSArray *prefixes;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{
+      NSString *t = [NSString stringWithContentsOfFile:@"/private/var/tmp/bgmtl.refuse" encoding:NSUTF8StringEncoding error:NULL];
+      NSMutableArray *a = [NSMutableArray array];
+      for (NSString *l in [t componentsSeparatedByString:@"\n"]) {
+         NSString *w = [l stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+         if (w.length && ![w hasPrefix:@"#"]) [a addObject:w];
+      }
+      prefixes = [a copy];
+   });
+   for (NSString *p in prefixes)
+      if (fname && [fname hasPrefix:p]) return YES;
+   return NO;
+}
+
+static void
+bg_refuse_dump(NSData *vair, NSString *vname, NSData *fair, NSString *fname, const struct chl_linked_function *lk, unsigned nvl, unsigned nfl)
+{
+   NSString *dir = @"/private/var/tmp/bgmtl-refused";
+   mkdir(dir.UTF8String, 01777);
+   chmod(dir.UTF8String, 01777);
+   NSString *stem = [dir stringByAppendingFormat:@"/%@+%@", vname, fname];
+   if (access([stem stringByAppendingString:@".f.bc"].UTF8String, F_OK) == 0) return;   // one copy of each pipeline
+   [vair writeToFile:[stem stringByAppendingString:@".v.bc"] atomically:NO];
+   [fair writeToFile:[stem stringByAppendingString:@".f.bc"] atomically:NO];
+   for (unsigned i = 0; i < nvl + nfl; i++)
+      [[NSData dataWithBytes:lk[i].bitcode length:lk[i].size]
+         writeToFile:[stem stringByAppendingFormat:@".%s.%s.bc", i < nvl ? "lv" : "lf", lk[i].name ? lk[i].name : "linked"] atomically:NO];
+}
+
 // BGMTL_TRACE=1 or /private/var/tmp/bgmtl.trace (or bgmtl.tracing): one line per command buffer, render pass, pipeline build and commit
 // (what a client such as CoreAnimation sends)
 static int
@@ -1059,6 +1097,28 @@ bg_air_slice(NSData *d)
          if (!l) continue;
          pd.layout[k] = (struct chl_vertex_layout){ (unsigned)[l stride], (unsigned)[l stepFunction], (unsigned)[l stepRate] };
       }
+   }
+   if (fragment && bg_refused([fragment name])) {
+      struct chl_linked_function all[32];
+      memcpy(all, vlk, nvl * sizeof(vlk[0]));
+      memcpy(all + nvl, flk, nfl * sizeof(flk[0]));
+      bg_refuse_dump(vair, [vertex name], fair, [fragment name], all, nvl, nfl);
+      char line[512], bwhy[256] = "";
+      // /private/var/tmp/bgmtl.refuse.build: build it all the same (how long it takes, whether it compiles), never draw it
+      if (access("/private/var/tmp/bgmtl.refuse.build", F_OK) == 0) {
+         struct chl_pipeline_info binfo;
+         uint64_t b0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+         struct chl_render_pipeline *br = chl_render_pipeline_create(_dev, &pd, &binfo, bwhy, sizeof(bwhy));
+         uint64_t b1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+         if (br) chl_render_pipeline_release(br);
+         snprintf(line, sizeof(line), "refused pipeline %s + %s built in %.1f ms: %s", [[vertex name] UTF8String],
+                  [[fragment name] UTF8String], (b1 - b0) / 1e6, br ? "ok" : bwhy);
+         bgmtl_note_line(line);
+      }
+      snprintf(line, sizeof(line), "render pipeline %s + %s refused by bgmtl.refuse (AIR in /private/var/tmp/bgmtl-refused)",
+               [[vertex name] UTF8String], [[fragment name] UTF8String]);
+      bgmtl_note_line(line);
+      return [self bgFail:error with:@"refused by /private/var/tmp/bgmtl.refuse"];
    }
    char why[512] = { 0 };
    struct chl_pipeline_info info;
