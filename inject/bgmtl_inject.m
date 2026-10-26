@@ -58,8 +58,11 @@ static char g_state[192] = F_STATE, g_off[192] = F_OFF;
 // com.apple.springboard (2026-10-26, user OK, one trial): iOS 26 SpringBoard draws the icon glyph layers itself with RenderBox
 // (RBSymbolDrawingLayer), which needs a Metal device; without one the home-screen icons are glass tiles with no glyph. Its
 // dead-man and kill switch are its own (bgmtl.off.com.apple.springboard); no chlorophyll=1 boot-arg is involved.
+// com.apple.PosterBoard (2026-10-26, user: "PosterBoard should run on Chlorophyll"): it hosts the wallpaper posters for
+// SpringBoard and lived without a Metal device; after a SpringBoard restart the wallpaper stayed the poster's flat placeholder
+// colour while Mercury kept rendering frames nobody composited.
 static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider",
-                                      "com.apple.iconservicesagent", "com.apple.springboard", NULL };
+                                      "com.apple.iconservicesagent", "com.apple.springboard", "com.apple.PosterBoard", NULL };
 static volatile int g_failures, g_registered, g_bb;
 static volatile unsigned g_completed;
 
@@ -384,6 +387,33 @@ bb_env(void)
    fclose(f);
 }
 
+// SpringBoard: a PosterBoard left over from the previous SpringBoard (it outlives a SpringBoard restart) never hosts its wallpaper
+// poster for the new one: the screen keeps the poster's flat placeholder colour while MercuryPosterExtension renders frames that
+// backboardd never composites (2026-10-26, boot 46; a fresh PosterBoard always shows the wallpaper, on Chlorophyll or not).
+// Such a PosterBoard is ended here, before SpringBoard's main, and SpringBoard launches a fresh one. At boot PosterBoard starts
+// after SpringBoard, so nothing is touched then. /private/var/tmp/bgmtl.nopbrestart turns this off.
+static void
+restart_stale_posterboard(void)
+{
+   if (exists("/private/var/tmp/bgmtl.nopbrestart")) return;
+   struct kinfo_proc me;
+   size_t n = sizeof(me);
+   int mself[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+   if (sysctl(mself, 4, &me, &n, NULL, 0) != 0 || n == 0) return;
+   int mall[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+   if (sysctl(mall, 3, NULL, &n, NULL, 0) != 0) return;
+   n += 16 * sizeof(struct kinfo_proc);
+   struct kinfo_proc *all = malloc(n);
+   if (!all || sysctl(mall, 3, all, &n, NULL, 0) != 0) { free(all); return; }
+   for (size_t i = 0; i < n / sizeof(struct kinfo_proc); i++) {
+      struct kinfo_proc *k = &all[i];
+      if (strcmp(k->kp_proc.p_comm, "PosterBoard") != 0 || !timercmp(&k->kp_proc.p_starttime, &me.kp_proc.p_starttime, <)) continue;
+      ilog("SpringBoard: PosterBoard %d predates this SpringBoard: ended, so a fresh one hosts the wallpaper", k->kp_proc.p_pid);
+      kill(k->kp_proc.p_pid, SIGTERM);
+   }
+   free(all);
+}
+
 __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
@@ -401,6 +431,7 @@ bgmtl_inject_init(void)
       for (const char *const *a = kAllow; *a; a++)
          if (bid && !strcmp([bid UTF8String], *a)) allowed = 1;
       if (!allowed) return;                                   // gate 1: silent in every other process
+      if (!strcmp([bid UTF8String], "com.apple.springboard")) restart_stale_posterboard();   // not a GPU matter: before the gates
       // /private/var/tmp/bgmtl.mesalog: Mesa's own log (ir3 compile errors, with the failing shader printed) to a file of
       // its own -- these processes' stderr goes nowhere
       if (exists("/private/var/tmp/bgmtl.mesalog") && !getenv("MESA_LOG_FILE")) {
