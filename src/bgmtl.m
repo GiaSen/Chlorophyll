@@ -132,8 +132,9 @@ bg_trace(void)
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
 
-// /private/var/tmp/bgmtl.xr10log: one line per two-plane XR10 surface wrapped, written back and decoded (surface ID, texture,
-// seed, texels with alpha). Its own switch: the trace's can be hidden by the kernel's sweetdenypath (and traces a lot more).
+// /private/var/tmp/bgmtl.xr10log: into bgmtl.log, one line per two-plane XR10 surface wrapped, written back and decoded (surface
+// ID, texture, seed, texels with alpha), and per IOSurface texture refused. Its own switch: the trace's can be hidden by the
+// kernel's sweetdenypath (and traces a lot more).
 static int
 bg_xr10log(void)
 {
@@ -142,6 +143,19 @@ bg_xr10log(void)
    time_t now = time(NULL);
    if (t < 0 || now >= next) { t = access("/private/var/tmp/bgmtl.xr10log", F_OK) == 0; next = now + 1; }
    return t;
+}
+
+void bgmtl_note_line(const char *line);
+// one bgmtl.xr10log line into bgmtl.log (bg_log only reaches stderr and the trace file, which daemons do not have)
+static void __attribute__((format(printf, 1, 2)))
+bg_xr10_note(const char *fmt, ...)
+{
+   char line[320];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+   bgmtl_note_line(line);
 }
 
 // texels of a BGRA8 image whose alpha is not 0
@@ -2351,7 +2365,7 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
          if (_tex) { _surfCopy = YES; _xr2p = YES; }
       }
       if (bg_xr10log() && [d pixelFormat] == 550)
-         bg_log("xr10 wrap surface %u tex %p %ux%u planes %zu usage 0x%lx: %s\n", IOSurfaceGetID((IOSurfaceRef)surface), (void *)self,
+         bg_xr10_note("xr10 wrap surface %u tex %p %ux%u planes %zu usage 0x%lx: %s", IOSurfaceGetID((IOSurfaceRef)surface), (void *)self,
                 _shape.width, _shape.height, IOSurfaceGetPlaneCount((IOSurfaceRef)surface), (unsigned long)[d usage],
                 !_tex ? "no texture" : _xr2p ? "own memory, XR10 decode/write-back" : _surfCopy ? "own memory, plain copy" : "imported (plane 0 only)");
       bg_unlock();
@@ -2362,7 +2376,14 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       _tex = rwa_texture_create([device rwa], &_shape, why, sizeof(why));
       bg_unlock();
    }
-   if (!_tex) { BG_LOG("texture refused: %s\n", why); [self release]; return nil; }
+   if (!_tex) {
+      BG_LOG("texture refused: %s\n", why);
+      if (surface && bg_xr10log())
+         bg_xr10_note("surface texture refused: surface %u %ux%u fmt %lu planes %zu: %s", IOSurfaceGetID((IOSurfaceRef)surface),
+                      _shape.width, _shape.height, (unsigned long)[d pixelFormat], IOSurfaceGetPlaneCount((IOSurfaceRef)surface), why);
+      [self release];
+      return nil;
+   }
    _owner = device;
    if (!surface || _surfCopy) {
       __atomic_add_fetch(&g_bg_tex_n, 1, __ATOMIC_RELAXED);
@@ -2517,7 +2538,7 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture: no decode back at the next use
       if (!_surfSeed) _surfSeed = 1;
       if (bg_xr10log())
-         bg_log("xr10 write-back surface %u tex %p %ux%u seed %u alpha %u\n", IOSurfaceGetID(sf), (void *)self, w, h, _surfSeed,
+         bg_xr10_note("xr10 write-back surface %u tex %p %ux%u seed %u alpha %u", IOSurfaceGetID(sf), (void *)self, w, h, _surfSeed,
                 bg_alpha_count(px, (size_t)w * h));
    }
    free(px);
@@ -2566,7 +2587,7 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
             if (rwa_texture_write(_tex, 0, 0, o, sz, out, w * 4, why, sizeof(why)) != 0) BG_LOG("XR10 surface refresh: %s\n", why);
             bg_unlock();
             if (bg_xr10log())
-               bg_log("xr10 decode surface %u tex %p %ux%u seed %u (had %u, used %u times since) alpha %u\n", IOSurfaceGetID(sf),
+               bg_xr10_note("xr10 decode surface %u tex %p %ux%u seed %u (had %u, used %u times since) alpha %u", IOSurfaceGetID(sf),
                       (void *)self, w, h, seed, _surfSeed, _xrUses - 1, bg_alpha_count(out, (size_t)w * h));
             _xrUses = 0;
             free(out);
