@@ -81,6 +81,14 @@ bg_log(const char *fmt, ...)
    // /private/var/tmp/bgmtl.trace: the log also goes to bgmtl-trace-<pid>.txt there (daemons and extensions whose stderr
    // nobody reads and whose environment launchd sets, such as the wallpaper poster)
    (void)tf_tried;
+   // a trace file deleted while open (rm between two traces) would take every later line with it: reopen it then
+   static time_t tf_checked;
+   time_t now = time(NULL);
+   if (tf && now != tf_checked) {
+      struct stat st;
+      tf_checked = now;
+      if (fstat(fileno(tf), &st) == 0 && st.st_nlink == 0) { fclose(tf); tf = NULL; }
+   }
    if (bg_trace() && !tf) {          // the trace file follows the live switch (bg_trace)
       char path[96];
       snprintf(path, sizeof(path), "/private/var/tmp/bgmtl-trace-%d.txt", getpid());
