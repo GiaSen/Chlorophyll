@@ -1,0 +1,99 @@
+diff -ruN a/src/freedreno/drm/freedreno_bo_cache.c b/src/freedreno/drm/freedreno_bo_cache.c
+--- a/src/freedreno/drm/freedreno_bo_cache.c	2026-10-26 10:46:48
++++ b/src/freedreno/drm/freedreno_bo_cache.c	2026-10-26 10:46:48
+@@ -307,3 +307,42 @@
+    return -1;
+ }
+ 
++/* Chlorophyll: what a device holds in buffers (alive, mapped into the process, kept in the two caches for reuse), and
++ * a way to give back every cached one. iOS charges a process for its mapped GPU memory and kills an idle
++ * iconservicesagent above 17 MB, so an idle process empties the caches (fd_screen_trim). */
++void
++fd_device_memory_stats(struct fd_device *dev, unsigned *live_bos, uint64_t *live_bytes, uint64_t *mapped_bytes,
++                       unsigned *cached_bos, uint64_t *cached_bytes)
++{
++   *live_bos = *cached_bos = 0;
++   *live_bytes = *mapped_bytes = *cached_bytes = 0;
++   simple_mtx_lock(&table_lock);
++   hash_table_foreach (dev->handle_table, e) {
++      const struct fd_bo *bo = e->data;
++      if (p_atomic_read(&bo->refcnt) == 0) {
++         (*cached_bos)++;
++         *cached_bytes += bo->size;
++      } else {
++         (*live_bos)++;
++         *live_bytes += bo->size;
++      }
++      if (bo->map)
++         *mapped_bytes += bo->size;
++      if (getenv("FD_MEMSTATS_LIST"))
++         fprintf(stderr, "  bo handle %u: %u bytes, refcnt %d, alloc_flags 0x%x, %s, iova 0x%llx\n", bo->handle, bo->size,
++                 bo->refcnt, bo->alloc_flags, bo->map ? "mapped" : "not mapped", (unsigned long long)bo->iova);
++   }
++   simple_mtx_unlock(&table_lock);
++}
++
++void
++fd_device_trim_caches(struct fd_device *dev)
++{
++   /* any time far past every buffer's free_time frees them all; each cache's own clock is put back so its next timed
++    * cleanup is not skipped as "already done" */
++   time_t t0 = dev->bo_cache.time, t1 = dev->ring_cache.time;
++   fd_bo_cache_cleanup(&dev->bo_cache, (time_t)INT32_MAX);
++   fd_bo_cache_cleanup(&dev->ring_cache, (time_t)INT32_MAX);
++   dev->bo_cache.time = t0;
++   dev->ring_cache.time = t1;
++}
+diff -ruN a/src/freedreno/drm/freedreno_drmif.h b/src/freedreno/drm/freedreno_drmif.h
+--- a/src/freedreno/drm/freedreno_drmif.h	2026-10-26 10:46:48
++++ b/src/freedreno/drm/freedreno_drmif.h	2026-10-26 10:46:48
+@@ -312,4 +312,9 @@
+ } /* end of extern "C" */
+ #endif
+ 
++/* Chlorophyll (freedreno_bo_cache.c) */
++void fd_device_memory_stats(struct fd_device *dev, unsigned *live_bos, uint64_t *live_bytes, uint64_t *mapped_bytes,
++                            unsigned *cached_bos, uint64_t *cached_bytes);
++void fd_device_trim_caches(struct fd_device *dev);
++
+ #endif /* FREEDRENO_DRMIF_H_ */
+diff -ruN a/src/freedreno/drm/freedreno_priv.h b/src/freedreno/drm/freedreno_priv.h
+--- a/src/freedreno/drm/freedreno_priv.h	2026-10-26 10:46:48
++++ b/src/freedreno/drm/freedreno_priv.h	2026-10-26 10:46:48
+@@ -121,7 +121,10 @@
+  * and SMMU support, 2MB is that overlap.  (Well, 4kb is as well, but
+  * too small to be practical ;-))
+  */
+-#define FD_BO_HEAP_BLOCK_SIZE (4 * 1024 * 1024)
++/* Chlorophyll: 512 KB, not 4 MB. Each block is backed and mapped whole, and iOS charges a process for it: a fresh device
++ * held three blocks (12 MB) for a few KB of small buffers, over the 17 MB an idle iconservicesagent may keep (jetsam
++ * InactiveHard). The heap still spans 256 blocks (128 MB of small buffers); larger allocations never come from it. */
++#define FD_BO_HEAP_BLOCK_SIZE (512 * 1024)
+ 
+ /* Zero is an invalid handle, use it to indicate buffers that have been sub-
+  * allocated from a larger backing heap block buffer.
+diff -ruN a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c	2026-10-26 10:46:48
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c	2026-10-26 10:46:48
+@@ -1162,3 +1162,21 @@
+    simple_mtx_unlock(&screen->aux_ctx_lock);
+ }
+ 
++/* Chlorophyll: the screen's GPU buffer totals and the trim of its caches, for a user of the screen that sees only
++ * struct pipe_screen (libbgair's rwa_device_memory / rwa_device_trim) */
++void fd_screen_memory_stats(struct pipe_screen *pscreen, unsigned *live_bos, uint64_t *live_bytes, uint64_t *mapped_bytes,
++                            unsigned *cached_bos, uint64_t *cached_bytes);
++void fd_screen_trim(struct pipe_screen *pscreen);
++
++void
++fd_screen_memory_stats(struct pipe_screen *pscreen, unsigned *live_bos, uint64_t *live_bytes, uint64_t *mapped_bytes,
++                       unsigned *cached_bos, uint64_t *cached_bytes)
++{
++   fd_device_memory_stats(fd_screen(pscreen)->dev, live_bos, live_bytes, mapped_bytes, cached_bos, cached_bytes);
++}
++
++void
++fd_screen_trim(struct pipe_screen *pscreen)
++{
++   fd_device_trim_caches(fd_screen(pscreen)->dev);
++}

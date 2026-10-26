@@ -891,6 +891,21 @@ struct rwa_render_shape {
 /* Chlorophyll: the functions the NEXT rwa_render_create links into each stage (vertexLinkedFunctions /
  * fragmentLinkedFunctions); a call the stage only declares is resolved against them. Consumed (and forgotten) by that
  * call; the arrays and bitcode must stay valid until it returns. Kept out of rwa_render_shape, whose size is fixed. */
+/* Chlorophyll: the GPU memory this device holds, as freedreno counts it: buffers alive (and how much of them is mapped
+ * into the process, which is what jetsam charges it for), buffers kept in freedreno's caches for reuse, and libbgair's
+ * own pool of released textures. All zero on the software screen. */
+struct rwa_memory {
+	unsigned live_bos, cached_bos;
+	uint64_t live_bytes, mapped_bytes, cached_bytes, tex_pool_bytes;
+};
+void rwa_device_memory(struct rwa_device *device, struct rwa_memory *out);
+
+/* Chlorophyll: give back what an idle process does not need -- the texture pool, freedreno's buffer caches, free malloc
+ * pages -- after waiting for the GPU. Nothing the caller holds is touched; the next use only costs fresh allocations. iOS
+ * kills an idle iconservicesagent above 17 MB (jetsam InactiveHard), so a process calls this when it goes quiet. Under
+ * the caller's own lock, like every other call. */
+void rwa_device_trim(struct rwa_device *device);
+
 void rwa_device_set_linked_functions(struct rwa_device *device,
 				     const struct rwa_linked_function *vertex, unsigned vertex_count,
 				     const struct rwa_linked_function *fragment, unsigned fragment_count);

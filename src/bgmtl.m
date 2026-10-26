@@ -26,6 +26,7 @@
 #include <time.h>
 #import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1761,6 +1762,43 @@ bg_linear_written(BGWork *w, NSMutableSet *into)
 }
 
 // What follows a completed (or failed) command buffer; run by the completion queue, or inline when tracing.
+// Chlorophyll: give memory back once the process goes quiet. iOS kills an idle iconservicesagent above 17 MB (jetsam
+// InactiveHard) and it went idle right after each icon render holding the texture pool and freedreno's buffer caches;
+// so 1.5 s after a command buffer completes with nothing committed since, the device is trimmed (rwa_device_trim). Not
+// backboardd (never idle that long, a much higher limit, and its caches save it real time); /private/var/tmp/bgmtl.notrim
+// turns it off everywhere.
+static unsigned long g_bg_trimmed_seq = (unsigned long)-1;
+
+static double
+bg_footprint_mb(void)
+{
+   task_vm_info_data_t vi;
+   mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+   return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
+}
+
+static void
+bg_idle_trim_schedule(struct rwa_device *rwa)
+{
+   static int skip = -1;
+   if (skip < 0) skip = !strcmp(getprogname(), "backboardd") || access("/private/var/tmp/bgmtl.notrim", F_OK) == 0;
+   if (skip || !rwa) return;
+   unsigned long seq = __atomic_load_n(&g_bg_commit_seq, __ATOMIC_RELAXED);
+   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+      if (__atomic_load_n(&g_bg_commit_seq, __ATOMIC_RELAXED) != seq) return;   // busy again: a later completion re-arms
+      if (__atomic_exchange_n(&g_bg_trimmed_seq, seq, __ATOMIC_RELAXED) == seq) return;   // already trimmed at this point
+      double before = bg_footprint_mb();
+      bg_lock();
+      rwa_device_trim(rwa);
+      bg_unlock();
+      if (bg_perf_on()) {
+         char line[120];
+         snprintf(line, sizeof(line), "idle trim: footprint %.1f -> %.1f MB", before, bg_footprint_mb());
+         bgmtl_note_line(line);
+      }
+   });
+}
+
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
    bg_return_slot(self, _queue);
@@ -1914,6 +1952,7 @@ bg_linear_written(BGWork *w, NSMutableSet *into)
    [_presents removeAllObjects];
    for (void (^h)(id) in _completed) h(self);
    [_completed removeAllObjects];
+   bg_idle_trim_schedule([(BGMTLDevice *)[self device] rwa]);
 }
 
 - (void)waitUntilCompleted { if (_status >= 2) dispatch_group_wait(_done, DISPATCH_TIME_FOREVER); }

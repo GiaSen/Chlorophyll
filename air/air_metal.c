@@ -53,6 +53,11 @@
 #include "util/driconf.h"
 #include "util/xmlconfig.h"
 #include <xf86drm.h>
+#include <malloc/malloc.h>
+/* Chlorophyll: freedreno's buffer totals and cache trim (patches/fd-screen-trim.patch) */
+void fd_screen_memory_stats(struct pipe_screen *pscreen, unsigned *live_bos, uint64_t *live_bytes, uint64_t *mapped_bytes,
+                            unsigned *cached_bos, uint64_t *cached_bytes);
+void fd_screen_trim(struct pipe_screen *pscreen);
 #endif
 #include "util/format/u_format.h"
 #include "util/half_float.h"
@@ -164,6 +169,9 @@ struct rwa_device {
 
    /* Chlorophyll: AIR -> NIR translations kept on disk (air_to_nir_cached), NULL when off */
    struct disk_cache *air_cache;
+
+   /* Chlorophyll: the screen is freedreno's (rwa_device_memory, rwa_device_trim), not softpipe */
+   bool hw;
 };
 
 /* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
@@ -649,6 +657,7 @@ rwa_device_open(char *why, size_t why_size)
       }
 
       device->screen = fd_drm_screen_create_renderonly(fd, NULL, &config);
+      device->hw = device->screen != NULL;
       if (!device->screen) {
          say(why, why_size, "the kernel's msm device opened but freedreno made no screen "
                             "for it, so this GPU is present and unusable");
@@ -4977,6 +4986,39 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
    int rc = device->dispatch_no_wait ? 0 : finish_or_say_why(device, true, "dispatch", why, why_size);
    unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
    return rc;
+}
+
+void
+rwa_device_memory(struct rwa_device *device, struct rwa_memory *out)
+{
+   memset(out, 0, sizeof(*out));
+   if (!device)
+      return;
+   for (unsigned k = 0; k < TEX_POOL_N; k++)
+      if (tex_pool[k].res && tex_pool[k].dev == device)
+         out->tex_pool_bytes += tex_pool[k].bytes;
+#ifdef GALLIUM_FREEDRENO
+   if (device->hw)
+      fd_screen_memory_stats(device->screen, &out->live_bos, &out->live_bytes, &out->mapped_bytes, &out->cached_bos,
+                             &out->cached_bytes);
+#endif
+}
+
+void
+rwa_device_trim(struct rwa_device *device)
+{
+   if (!device)
+      return;
+   for (unsigned k = 0; k < TEX_POOL_N; k++)
+      if (tex_pool[k].res && tex_pool[k].dev == device)
+         tex_pool_drop(k);
+   char why[128];
+   rwa_finish(device, why, sizeof(why));   /* nothing in flight still references what is freed below */
+#ifdef GALLIUM_FREEDRENO
+   if (device->hw)
+      fd_screen_trim(device->screen);
+   malloc_zone_pressure_relief(NULL, 0);
+#endif
 }
 
 void
