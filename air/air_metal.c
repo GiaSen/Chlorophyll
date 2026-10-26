@@ -2504,6 +2504,13 @@ caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, siz
       *out = least;
       return true;
    }
+   /* Chlorophyll: a region one row of blocks tall has no second row for the stride to place, and Metal does not look at it
+    * there; iOS 26's RenderBox reads single RGBA16F texels back with bytesPerRow 4 (thousands of times per icon render),
+    * and every one of those was refused and left its destination unread. */
+   if (stride < least && util_format_get_nblocksy(texture->res->format, box->height) <= 1 && box->depth <= 1) {
+      *out = least;
+      return true;
+   }
    if (stride < least) {
       say(why, why_size, "%zu bytes per row for %u texels of %s, which need %zu", stride,
           box->width, texture->format_name, least);
