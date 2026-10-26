@@ -1,6 +1,8 @@
 // xr2ptest: a two-plane 'b3a8' IOSurface (XR10 RGB + A8, MTLPixelFormatRGB10A8_2P_XR10) wrapped by Chlorophyll's device
 // must read back as BGRA8 with the decoded colour: R = 894 (1.0), G = 384 (0.0), B = 639 (0.5), A = 200 -> (127,0,255,200);
-// a render pass into it (clear to 0.25 0.5 1.0 0.75) must land in the surface's planes: B 512, G 640, R 894 (= 384 + 2c), A 191
+// a render pass into it (clear to 0.25 0.5 1.0 0.75) must land in the surface's planes: B 512, G 640, R 894 (= 384 + 2c), A 191;
+// and on a new surface (seed 0, like CA's icon atlases) what was drawn into the texture must survive its next use: the
+// surface may not be decoded over it again while its seed has not changed
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -61,6 +63,17 @@ main(void)
       unsigned B = v & 1023, G = v >> 10 & 1023, R = v >> 20 & 1023;
       printf("rendered = B %u G %u R %u A %u (want about 512 640 894 191)\n", B, G, R, a);
       bad |= !(B >= 510 && B <= 514 && G >= 638 && G <= 642 && R == 894 && a >= 190 && a <= 192);
+      // seed 0: a surface nobody has written yet
+      IOSurfaceRef sf2 = IOSurfaceCreate((CFDictionaryRef)props);
+      id<MTLTexture> t2 = [dev newTextureWithDescriptor:d iosurface:sf2 plane:0];
+      ((void * (*)(id, SEL))objc_msgSend)(t2, sel_getUid("rwaTexture"));   // first use: decoded (empty)
+      const uint8_t mark[4] = { 10, 20, 30, 40 };   // stands in for a draw not written back yet
+      [t2 replaceRegion:MTLRegionMake2D(3, 4, 1, 1) mipmapLevel:0 withBytes:mark bytesPerRow:4];
+      ((void * (*)(id, SEL))objc_msgSend)(t2, sel_getUid("rwaTexture"));   // next use, seed still 0
+      uint8_t px2[16] = { 0 };
+      [t2 getBytes:px2 bytesPerRow:16 fromRegion:MTLRegionMake2D(3, 4, 1, 1) mipmapLevel:0];
+      printf("seed %u surface, texel after the next use = %u %u %u %u (want 10 20 30 40)\n", IOSurfaceGetSeed(sf2), px2[0], px2[1], px2[2], px2[3]);
+      bad |= !(px2[0] == 10 && px2[1] == 20 && px2[2] == 30 && px2[3] == 40);
       return bad;
    }
 }

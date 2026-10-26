@@ -510,6 +510,7 @@ bg_install_fallback(Class c)
    BOOL _surfCopy;       // an IOSurface the GPU could not import (row pitch not 64-aligned): own memory, refreshed from the surface at each use
    BOOL _xr2p;           // ... a two-plane RGB10A8_2P_XR10 one ('b3a8': XR10 RGB + A8 alpha), decoded into BGRA8 at each refresh
    uint32_t _surfSeed;   // the surface's seed at the last refresh (an unchanged surface is not copied again)
+   BOOL _surfFresh;      // _surfSeed is valid: the surface was decoded or written back at least once (a seed may be 0)
    uint32_t _xrUses;     // rwaTexture calls since the last XR10 decode (bgmtl.xr10log)
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
@@ -2549,7 +2550,7 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       }
       IOSurfaceUnlock(sf, 0, NULL);
       _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture: no decode back at the next use
-      if (!_surfSeed) _surfSeed = 1;
+      _surfFresh = YES;
       if (bg_xr10log())
          bg_xr10_note("xr10 write-back surface %u tex %p %ux%u seed %u alpha %u", IOSurfaceGetID(sf), (void *)self, w, h, _surfSeed,
                 bg_alpha_count(px, (size_t)w * h));
@@ -2565,7 +2566,9 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       uint32_t seed = IOSurfaceGetSeed(sf);
       _xrUses++;
-      if ((seed != _surfSeed || !_surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
+      // A new surface's seed is 0 until its first write unlock (CA's icon atlases stay at 0 until Chlorophyll's first write-back),
+      // so 0 is not "never decoded": treating it so re-decoded the empty atlas over every icon drawn but not yet written back.
+      if ((!_surfFresh || seed != _surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
          // plane 0: one little-endian word per texel, B bits 0-9, G 10-19, R 20-29 in XR10 (384 = 0.0, 894 = 1.0, the
          // extended range clamped here); plane 1: one alpha byte per texel. Out: BGRA8, the stand-in format of 550.
          const uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
@@ -2604,7 +2607,8 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
                       (void *)self, w, h, seed, _surfSeed, _xrUses - 1, bg_alpha_count(out, (size_t)w * h));
             _xrUses = 0;
             free(out);
-            _surfSeed = seed ? seed : 1;
+            _surfSeed = seed;
+            _surfFresh = YES;
          }
       }
    } else if (_surfCopy && _tex && _surface) {
