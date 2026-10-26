@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 // [[point_coord]] in a fragment stage (bg_fs_pointcoord): it compiles and draws (ir3 had no case for load_point_coord)
-// mip level 1 (16x8) of a 32x16 texture, colour 1 a whole 32x16 texture. Metal renders the area both cover (16x8): level 1 and
-// the top-left 16x8 of the second target get the colour, the rest of either texture stays as it was.
-//   bgair_mrt_test bg_render.metallib
+// (CoreAnimation 26's A2Xghfc reads it). A red triangle over a 32x16 BGRA8 target; pixel 0 must come out red.
+//   bgair_pntc_test bg_render.metallib
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
