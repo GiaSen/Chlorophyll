@@ -6,7 +6,8 @@
 #   GPU_METAL_WORK=/Users/zesmoi/git/iAndroid/work-chlorophyll gpu/metal/turnip/build-turnip.sh
 # Needs: TURNIP_MESA (pristine 26.2.5 checkout, default $WORK/mesa-src-26.2.5, cloned when missing), GPU_EAGL_LIBDRM (libdrm 2.4.124 source, default
 # $WORK/libdrm-src), GPU_EAGL_VENV (mako, pyyaml, meson; default $WORK/venv), brew bison and glslang (glslangValidator).
-# Produces $WORK/mesa-turnip26/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib (the ICD) and the libdrm stand-in in drm-ios/.
+# Produces $WORK/mesa-turnip26/build-ios/src/freedreno/vulkan/libchlorophyll.dylib (Turnip + the AIR frontend + Chlorophyll's runtime,
+# air/chl.h), libvulkan_freedreno.dylib (the plain ICD, for turnip/test/tu_smoke.c) and the libdrm stand-in in drm-ios/.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 BG_GPU="${BERGAMOTA_GPU:-$HERE/..}"
@@ -76,5 +77,5 @@ EOT
   -Degl=disabled -Dgbm=disabled -Dtools= -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled \
   -Dglvnd=disabled -Dlmsensors=disabled -Dbuild-tests=false -Dshader-cache=disabled -Dvideo-codecs= -Dperfetto=false -Dspirv-tools=disabled \
   -Ddisplay-info=disabled -Dprefix=/ > setup-ios.log
-ninja -j"${JOBS:-8}" -C build-ios src/freedreno/vulkan/libvulkan_freedreno.dylib src/compiler/air/libair.a
-ls -l build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib build-ios/src/compiler/air/libair.a
+ninja -j"${JOBS:-8}" -C build-ios src/freedreno/vulkan/libvulkan_freedreno.dylib src/freedreno/vulkan/libchlorophyll.dylib
+ls -l build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib build-ios/src/freedreno/vulkan/libchlorophyll.dylib

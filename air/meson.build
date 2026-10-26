@@ -53,3 +53,7 @@ air2nir = executable(
   build_by_default : false,
   install : false,
 )
+
+# Chlorophyll on Turnip: the GPU runtime (chl.h) and the binding bridge, linked into one dylib with Turnip
+# (src/freedreno/vulkan/meson.build, libchlorophyll) so that the NIR the frontend makes is the NIR Turnip takes.
+files_chl = files('chl_vk.c', 'air_nir_vk.c')

@@ -268,6 +268,7 @@ struct air_vertex_attribute {
 
 #define AIR_DELTA_UBO 15          /* Chlorophyll: the runtime's delta table (air_metal.c, CB_DELTA_SLOT) */
 #define AIR_NULL_MASK_WORD 32     /* ... and in it, the null-texture mask (air.is_null_texture) */
+#define AIR_PUSH_NULL_MASK_WORD 31 /* Chlorophyll on Turnip: the null-texture mask as push-constant word 31 of the stage */
 
 struct air_shader_info {
    mesa_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */

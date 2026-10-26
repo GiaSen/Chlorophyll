@@ -15,10 +15,10 @@ index 5f19ef9..bc14e62 100644
  gallium_drivers = get_option('gallium-drivers')
  if gallium_drivers.contains('auto')
 diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
-index b019710..e18dcf2 100644
+index b019710..8793448 100644
 --- a/src/freedreno/vulkan/meson.build
 +++ b/src/freedreno/vulkan/meson.build
-@@ -228,6 +228,8 @@ libvulkan_freedreno = shared_library(
+@@ -228,9 +228,51 @@ libvulkan_freedreno = shared_library(
    gnu_symbol_visibility : 'hidden',
    link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
    link_depends : vulkan_icd_link_depends,
@@ -27,6 +27,49 @@ index b019710..e18dcf2 100644
    install : true,
  )
  
++# Chlorophyll (iOS): Turnip, the AIR frontend and Chlorophyll's GPU runtime (src/compiler/air/chl_vk.c) in one dylib, so
++# that the runtime hands Turnip NIR made with the same Mesa (one NIR, one set of glsl_type singletons).
++if host_machine.system() == 'darwin'
++  libchlorophyll = shared_library(
++    'chlorophyll',
++    [libtu_files, tu_drirc, tu_entrypoints, tu_tracepoints, freedreno_xml_header_files, sha1_h, u_format_pack_h, bvh_spv, files_chl],
++    include_directories : [libtu_includes, include_directories('../../compiler/air')],
++    link_with : [
++      libfreedreno_ir3,
++      libfreedreno_layout,
++      libfreedreno_perfcntrs,
++      tu_link_with,
++    ],
++    dependencies : [
++      idep_libfreedreno_common,
++      dep_dl,
++      dep_elf,
++      dep_m,
++      dep_thread,
++      dep_valgrind,
++      idep_nir,
++      idep_air,
++      tu_deps,
++      idep_vulkan_util,
++      idep_vulkan_runtime,
++      idep_vulkan_wsi,
++      idep_mesautil,
++    ],
++    c_args : [no_override_init_args, tu_flags, soong_compat_c_args],
++    cpp_args : [tu_cpp_args, tu_flags, soong_compat_cpp_args],
++    gnu_symbol_visibility : 'hidden',
++    link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id,
++                 '-Wl,-install_name,@rpath/libchlorophyll.dylib'],
++    link_depends : vulkan_icd_link_depends,
++    override_options : ['b_lundef=false'],
++    build_by_default : false,
++    install : false,
++  )
++endif
++
+ if with_symbols_check
+   test(
+     'tu symbols check',
 diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
 index e8ef940..147ae9c 100644
 --- a/src/freedreno/vulkan/tu_device.cc
