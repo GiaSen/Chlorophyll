@@ -952,6 +952,26 @@ bg_air_slice(NSData *d)
    struct rwa_render_shape shape;
    memset(&shape, 0, sizeof(shape));
    shape.sample_count = (unsigned)[descriptor sampleCount];
+   // Chlorophyll: the functions each stage links in (MTLLinkedFunctions: iOS 26's RenderBox supplies its effect functions this way
+   // and the stage only declares them), as their AIR; the translator resolves the stage's declared calls against them
+   struct rwa_linked_function vlk[16], flk[16];
+   unsigned nvl = 0, nfl = 0;
+   for (int st = 0; st < 2; st++) {
+      SEL which = st ? sel_getUid("fragmentLinkedFunctions") : sel_getUid("vertexLinkedFunctions");
+      id lf = [descriptor respondsToSelector:which] ? ((id (*)(id, SEL))objc_msgSend)(descriptor, which) : nil;
+      for (int kind = 0; lf && kind < 2; kind++) {
+         SEL list = kind ? sel_getUid("privateFunctions") : sel_getUid("functions");
+         NSArray *fns = [lf respondsToSelector:list] ? ((id (*)(id, SEL))objc_msgSend)(lf, list) : nil;
+         for (id fn in fns) {
+            NSData *b = [fn respondsToSelector:bitcode] ? ((NSData * (*)(id, SEL))objc_msgSend)(fn, bitcode) : nil;
+            unsigned *n = st ? &nfl : &nvl;
+            if (!b.length || *n >= 16) continue;
+            (st ? flk : vlk)[(*n)++] = (struct rwa_linked_function){ b.bytes, b.length, [[fn name] UTF8String] };
+            BG_TRACE("  linked %s function %s: %lu bytes of AIR\n", st ? "fragment" : "vertex", [[fn name] UTF8String],
+                     (unsigned long)b.length);
+         }
+      }
+   }
    for (unsigned i = 0; i < 8; i++) {
       MTLRenderPipelineColorAttachmentDescriptor *a = [[descriptor colorAttachments] objectAtIndexedSubscript:i];
       shape.color_format[i] = a ? (unsigned)[a pixelFormat] : 0;
@@ -995,6 +1015,7 @@ bg_air_slice(NSData *d)
    uint64_t pt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    bg_lock();
    uint64_t pt1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   rwa_device_set_linked_functions(_rwa, nvl ? vlk : NULL, nvl, nfl ? flk : NULL, nfl);   // consumed by the create below
    struct rwa_render *r = rwa_render_create(_rwa, vair ? vair.bytes : NULL, vair ? vair.length : 0, vertex ? [[vertex name] UTF8String] : NULL, fair.bytes, fair.length,
                                             [[fragment name] UTF8String], &shape, &info, why, sizeof(why));
    bg_unlock();
@@ -1013,6 +1034,13 @@ bg_air_slice(NSData *d)
    }
    if (!r) {
       bg_fail_dump(why, vair, vertex ? [vertex name] : nil, fair, [fragment name], "f");
+      // and the functions it linked in, as <pid>-<name>.lv.bc / .lf.bc (no line in refused.txt: the one above covers them)
+      for (unsigned i = 0; i < nvl + nfl && access("/private/var/tmp/bgmtl.faildump", F_OK) == 0; i++) {
+         const struct rwa_linked_function *l = i < nvl ? &vlk[i] : &flk[i - nvl];
+         [[NSData dataWithBytesNoCopy:(void *)l->bitcode length:l->size freeWhenDone:NO]
+            writeToFile:[NSString stringWithFormat:@"/private/var/tmp/bgmtl-fail/%d-%s.%s.bc", getpid(), l->name ? l->name : "linked",
+                                                  i < nvl ? "lv" : "lf"] atomically:NO];
+      }
       return [self bgFail:error with:[NSString stringWithUTF8String:why]];
    }
    BGMTLRenderPipeline *p = [[BGMTLRenderPipeline alloc] initWithDevice:self pipelineStateDescriptor:descriptor];

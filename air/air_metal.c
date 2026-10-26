@@ -152,6 +152,10 @@ struct rwa_device {
 
    /* Chlorophyll: whether a dispatch returns without waiting for the GPU (rwa_device_set_dispatch_wait). */
    bool dispatch_no_wait;
+
+   /* Chlorophyll: the linked functions for the next rwa_render_create (rwa_device_set_linked_functions) */
+   const struct rwa_linked_function *linked[2];
+   unsigned num_linked[2];
 };
 
 /* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
@@ -4780,6 +4784,19 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
 }
 
 void
+rwa_device_set_linked_functions(struct rwa_device *device,
+                                const struct rwa_linked_function *vertex, unsigned vertex_count,
+                                const struct rwa_linked_function *fragment, unsigned fragment_count)
+{
+   if (!device)
+      return;
+   device->linked[0] = vertex;
+   device->num_linked[0] = vertex ? vertex_count : 0;
+   device->linked[1] = fragment;
+   device->num_linked[1] = fragment ? fragment_count : 0;
+}
+
+void
 rwa_device_set_dispatch_wait(struct rwa_device *device, bool wait)
 {
    if (device)
@@ -6964,6 +6981,17 @@ rwa_render_create(struct rwa_device *device,
                   const struct rwa_render_shape *shape,
                   struct rwa_render_info *info, char *why, size_t why_size)
 {
+   /* the linked functions are this call's alone (rwa_device_set_linked_functions): taken, and forgotten on every path */
+   const struct rwa_linked_function *linked[2] = { NULL, NULL };
+   unsigned num_linked[2] = { 0, 0 };
+   if (device) {
+      for (unsigned st = 0; st < 2; st++) {
+         linked[st] = device->linked[st];
+         num_linked[st] = device->num_linked[st];
+         device->linked[st] = NULL;
+         device->num_linked[st] = 0;
+      }
+   }
    if (!shape) {
       say(why, why_size, "a render pipeline with no attachment description");
       return NULL;
@@ -7125,7 +7153,13 @@ rwa_render_create(struct rwa_device *device,
    struct air_constant_value *ffc;
    unsigned num_ffc =
       air_module_function_constants(render->mem_ctx, fragment_bitcode, fragment_size, &ffc);
-   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc };
+   struct air_linked_function *flinked = num_linked[1]
+      ? rzalloc_array(render->mem_ctx, struct air_linked_function, num_linked[1]) : NULL;
+   for (unsigned i = 0; i < num_linked[1]; i++)
+      flinked[i] = (struct air_linked_function){ linked[1][i].bitcode, linked[1][i].size,
+                                                 linked[1][i].name };
+   const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc,
+                                             .linked = flinked, .num_linked = num_linked[1] };
    const char *error;
    nir_shader *fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
                                fragment_entry, &fopts, device->nir_options, &render->finfo,
@@ -7186,7 +7220,13 @@ rwa_render_create(struct rwa_device *device,
       struct air_constant_value *vfc;
       unsigned num_vfc =
          air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
-      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
+      struct air_linked_function *vlinked = num_linked[0]
+         ? rzalloc_array(render->mem_ctx, struct air_linked_function, num_linked[0]) : NULL;
+      for (unsigned i = 0; i < num_linked[0]; i++)
+         vlinked[i] = (struct air_linked_function){ linked[0][i].bitcode, linked[0][i].size,
+                                                    linked[0][i].name };
+      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc,
+                                                .linked = vlinked, .num_linked = num_linked[0] };
       vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
                       device->nir_options, &render->vinfo, &error);
       if (!vs) {

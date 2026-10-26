@@ -383,9 +383,21 @@ struct air_constant_value {
    uint64_t bits;      /* its value, as the bits of its type */
 };
 
+/* Chlorophyll: a function a pipeline links in (MTLRenderPipelineDescriptor.vertexLinkedFunctions / fragmentLinkedFunctions):
+ * its module's bitcode and its Metal name. A call of a function the stage only declares, named by its module's
+ * air.visible_function_references, is resolved against these (iOS 26's RenderBox links its effect functions this way). */
+struct air_linked_function {
+   const void *bitcode;
+   size_t size;
+   const char *name;
+};
+
 struct air_to_nir_options {
    const struct air_constant_value *constants;
    unsigned num_constants;
+
+   const struct air_linked_function *linked;
+   unsigned num_linked;
 
    /* Translate an air.visible library function by generating an entry point
     * that calls it: argument i read from device buffer 0 at byte 16*i, the

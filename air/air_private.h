@@ -152,6 +152,8 @@ struct air_ctx {
    nir_builder b;
 
    const struct air_to_nir_options *options;
+   const struct air_module **linked_m;   /* Chlorophyll: options->linked, read when first needed (linked_callee) */
+   struct air_global_plan **linked_plan; /* Chlorophyll: each linked module's globals, planned when first called into */
    struct air_shader_info *info;
 
    /* translated values, keyed on const struct air_value * */

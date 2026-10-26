@@ -3820,6 +3820,91 @@ ptr_offset_arg(struct air_val **argv, unsigned i)
    return argv && argv[i] && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset;
 }
 
+/* Chlorophyll: the body of a function the stage only declares, from a module the pipeline links in. The stage's
+ * air.visible_function_references pairs the declaration (`custom_fn.MTL_VISIBLE_FN_REF`) with the name it links by
+ * (`custom_fn`); the linked function of that name is taken, or the only one linked when no name matches. */
+static const struct air_function *
+linked_callee(struct air_ctx *c, const struct air_function *f, const struct air_module **out_m, unsigned *out_i)
+{
+   if (!c->options || !c->options->num_linked)
+      return NULL;
+   const char *want = NULL;
+   const struct air_named_md *refs = named_md(c->m, "air.visible_function_references");
+   for (unsigned i = 0; refs && i < refs->num_ops && !want; i++) {
+      const struct air_md *n = refs->ops[i];
+      if (n && n->kind == AIR_MD_NODE && n->num_ops >= 3 && n->ops[1] && n->ops[1]->kind == AIR_MD_VALUE &&
+          n->ops[1]->value == &f->base)
+         want = md_str(n, 2);
+   }
+   if (!want)
+      return NULL;
+   if (!c->linked_m)
+      c->linked_m = rzalloc_array(c->mem_ctx, const struct air_module *, c->options->num_linked);
+   const struct air_function *only = NULL;
+   const struct air_module *only_m = NULL;
+   unsigned candidates = 0, only_i = 0;
+   for (unsigned i = 0; i < c->options->num_linked; i++) {
+      const struct air_linked_function *lk = &c->options->linked[i];
+      if (!c->linked_m[i]) {
+         const char *err = NULL;
+         c->linked_m[i] = air_module_read(c->mem_ctx, lk->bitcode, lk->size, &err);
+         if (!c->linked_m[i])
+            continue;
+      }
+      const struct air_module *m = c->linked_m[i];
+      for (unsigned k = 0; k < m->num_functions; k++) {
+         const struct air_function *g = m->functions[k];
+         const char *nm = g->base.name;
+         if (g->is_declaration || !g->num_blocks || !nm)
+            continue;
+         if (!strcmp(nm, want)) {
+            *out_m = m;
+            *out_i = i;
+            return g;
+         }
+         if (lk->name && !strcmp(nm, lk->name)) {
+            only = g;
+            only_m = m;
+            only_i = i;
+            candidates++;
+         }
+      }
+   }
+   if (candidates != 1)
+      return NULL;
+   *out_m = only_m;
+   *out_i = only_i;
+   return only;
+}
+
+static void plan_globals(struct air_ctx *c);
+
+/* Chlorophyll: a linked module's globals, planned the first time a call enters it: its constexpr samplers
+ * (`__air_sampler_state`) take sampler slots after those already taken, its threadgroup and program-scope variables
+ * space after the stage's. An initialised program-scope variable is refused: its initialiser would have to be written
+ * at the entry point, which is the stage's. */
+static struct air_global_plan *
+linked_plan(struct air_ctx *c, const struct air_module *lm, unsigned i)
+{
+   if (!c->linked_plan)
+      c->linked_plan = rzalloc_array(c->mem_ctx, struct air_global_plan *, c->options->num_linked);
+   if (c->linked_plan[i])
+      return c->linked_plan[i];
+   const struct air_module *saved_m = c->m;
+   struct air_global_plan *saved_plan = c->global_plan;
+   c->m = lm;
+   plan_globals(c);
+   for (unsigned k = 0; k < lm->num_globals && !c->error[0]; k++) {
+      const struct air_global_plan *pl = &c->global_plan[k];
+      if (!pl->skip && pl->class == AIR_PTR_SCRATCH && lm->globals[k]->init)
+         air_error(c, "interface: an initialised program-scope variable in a linked function");
+   }
+   c->linked_plan[i] = c->global_plan;
+   c->m = saved_m;
+   c->global_plan = saved_plan;
+   return c->error[0] ? NULL : c->linked_plan[i];
+}
+
 static nir_function *
 translate_callee(struct air_ctx *c, const struct air_function *f,
                  struct air_val **argv, bool *is_param)
@@ -3868,8 +3953,26 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       return e->data;
 
    if (f->is_declaration || !f->num_blocks) {
-      air_error(c, "intrinsic: a call of %s, which the module only declares",
-                f->base.name ? f->base.name : "a function");
+      /* Chlorophyll: a linked function's body, translated with its own module current */
+      const struct air_module *lm = NULL;
+      unsigned li = 0;
+      const struct air_function *lf = linked_callee(c, f, &lm, &li);
+      if (lf) {
+         struct air_global_plan *plan = linked_plan(c, lm, li);
+         if (!plan)
+            return NULL;
+         const struct air_module *saved_m = c->m;
+         struct air_global_plan *saved_plan = c->global_plan;
+         c->m = lm;
+         c->global_plan = plan;
+         nir_function *r = translate_callee(c, lf, argv, is_param);
+         c->m = saved_m;
+         c->global_plan = saved_plan;
+         return r;
+      }
+      air_error(c, "intrinsic: a call of %s, which the module only declares%s",
+                f->base.name ? f->base.name : "a function",
+                c->options && c->options->num_linked ? " and no linked function matches" : "");
       return NULL;
    }
 

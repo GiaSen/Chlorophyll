@@ -837,6 +837,13 @@ struct rwa_color_blend {
 	unsigned write_mask;
 };
 
+/* Chlorophyll: a function a pipeline links in (MTLLinkedFunctions): its module's AIR and its Metal name */
+struct rwa_linked_function {
+	const void *bitcode;
+	size_t size;
+	const char *name;
+};
+
 struct rwa_render_shape {
 	unsigned color_format[8];      /* MTLPixelFormat per colour attachment */
 	unsigned color_count;
@@ -880,6 +887,13 @@ struct rwa_render_shape {
 	struct rwa_color_blend color_blend[8];
 	unsigned color_blend_count;
 };
+
+/* Chlorophyll: the functions the NEXT rwa_render_create links into each stage (vertexLinkedFunctions /
+ * fragmentLinkedFunctions); a call the stage only declares is resolved against them. Consumed (and forgotten) by that
+ * call; the arrays and bitcode must stay valid until it returns. Kept out of rwa_render_shape, whose size is fixed. */
+void rwa_device_set_linked_functions(struct rwa_device *device,
+				     const struct rwa_linked_function *vertex, unsigned vertex_count,
+				     const struct rwa_linked_function *fragment, unsigned fragment_count);
 
 /*
  * ONE THING ABOUT THE FOUR COUNTS BELOW, now that an argument buffer's members are
