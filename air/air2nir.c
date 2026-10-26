@@ -314,7 +314,7 @@ eval_module(const struct module_ref *mod)
    }
 
    printf("eval: %s (%s), buffers filled with (i * 7 + 13) & 0xff\n", info.entry_point,
-          gl_shader_stage_name(info.stage));
+          mesa_shader_stage_name(info.stage));
    for (unsigned i = 0; i < info.num_resources; i++) {
       const struct air_resource *r = &info.resources[i];
       if (r->kind == AIR_RESOURCE_CONSTANT_BUFFER || r->kind == AIR_RESOURCE_DEVICE_BUFFER)
@@ -406,7 +406,7 @@ interface_module(const struct module_ref *mod)
       return 1;
    }
 
-   printf("entry=%s\tstage=%s\n", info.entry_point, gl_shader_stage_name(info.stage));
+   printf("entry=%s\tstage=%s\n", info.entry_point, mesa_shader_stage_name(info.stage));
    printf("inputs_read=0x%" PRIx64 "\n", (uint64_t)nir->info.inputs_read);
    printf("vertex_attributes=%u\tvertex_attributes_read=0x%x\n",
           info.num_vertex_attributes, info.vertex_attributes_read);

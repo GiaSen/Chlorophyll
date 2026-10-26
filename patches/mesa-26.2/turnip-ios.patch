@@ -1,0 +1,219 @@
+diff --git a/meson.build b/meson.build
+index 5f19ef9..bc14e62 100644
+--- a/meson.build
++++ b/meson.build
+@@ -160,6 +160,11 @@ pre_args += '-DHAVE_OPENGL_ES_2=@0@'.format(with_gles2.to_int())
+ with_any_opengl = with_opengl or with_gles1 or with_gles2
+ 
+ system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++# Chlorophyll: iOS has no DRM, but Turnip's msm backend runs over Bergamota's libdrm stand-in (gpu/freedreno-sweet), which turns the
++# msm requests into SweetAdrenoUserClient calls
++if host_machine.system() == 'darwin' and get_option('vulkan-drivers').contains('freedreno')
++  system_has_kms_drm = true
++endif
+ 
+ gallium_drivers = get_option('gallium-drivers')
+ if gallium_drivers.contains('auto')
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index b019710..e18dcf2 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -228,6 +228,8 @@ libvulkan_freedreno = shared_library(
+   gnu_symbol_visibility : 'hidden',
+   link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
+   link_depends : vulkan_icd_link_depends,
++  # Chlorophyll (iOS): the optional entrypoints are weak references, which Mach-O resolves at run time only (as lavapipe does)
++  override_options : ['b_lundef=@0@'.format(host_machine.system() == 'darwin' ? 'false' : get_option('b_lundef').to_string())],
+   install : true,
+ )
+ 
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index e8ef940..147ae9c 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3174,6 +3174,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
++#ifndef __APPLE__
++   /* Chlorophyll: Darwin has no pthread_condattr_setclock; only the kgsl backend waits on this condition */
+    if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -3181,6 +3183,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                                  "pthread condattr clock setup");
+       goto fail_timeline_cond;
+    }
++#endif
+    if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
+index ab27798..2268451 100644
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -152,13 +152,20 @@ tu_bo_unmap(struct tu_device *dev, struct tu_bo *bo, bool reserve)
+    TU_RMV(bo_unmap, dev, bo);
+ 
+    if (reserve) {
++#ifdef __APPLE__
++      sweet_drm_munmap(bo->map, bo->size);   /* Chlorophyll: release the IOKit mapping first */
++#endif
+       void *map = mmap(bo->map, bo->size, PROT_NONE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+       if (map == MAP_FAILED)
+          return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                           "Failed to replace mapping with reserved memory");
+    } else {
++#ifdef __APPLE__
++      sweet_drm_munmap(bo->map, bo->size);   /* Chlorophyll: IOKit mapping (libdrm stand-in) */
++#else
+       munmap(bo->map, bo->size);
++#endif
+    }
+ 
+    bo->map = NULL;
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index 4c2bf6a..3c1b0f2 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -16,6 +16,18 @@
+ #include "util/u_atomic.h"
+ #include "vulkan/vulkan_core.h"
+ 
++#ifdef __APPLE__
++/* Chlorophyll: BO maps are IOConnectMapMemory64 mappings made by Bergamota's libdrm stand-in (gpu/freedreno-sweet) */
++#ifdef __cplusplus
++extern "C" {
++#endif
++void *sweet_drm_mmap(int fd, size_t len, uint64_t off);
++int sweet_drm_munmap(void *addr, size_t len);
++#ifdef __cplusplus
++}
++#endif
++#endif
++
+ struct tu_u_trace_syncobj;
+ struct tu_queue;
+ struct vdrm_bo;
+diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+index 84ab61f..309cba6 100644
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -1037,10 +1037,18 @@ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+    if (!offset)
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+ 
++#ifdef __APPLE__
++   /* Chlorophyll: a BO map is an IOConnectMapMemory64 mapping made by the libdrm stand-in (gpu/freedreno-sweet), which
++    * cannot be placed at a fixed address */
++   if (placed_addr != NULL)
++      return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
++   void *map = sweet_drm_mmap(dev->fd, bo->size, offset);
++#else
+    /* TODO: Should we use the wrapper os_mmap() like Freedreno does? */
+    void *map = mmap(placed_addr, bo->size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | (placed_addr != NULL ? MAP_FIXED : 0),
+                     dev->fd, offset);
++#endif
+    if (map == MAP_FAILED)
+       return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
+ 
+@@ -1136,7 +1144,11 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+    if (bo->map) {
+       TU_RMV(bo_unmap, dev, bo);
++#ifdef __APPLE__
++      sweet_drm_munmap(bo->map, bo->size);   /* Chlorophyll: IOKit mapping (libdrm stand-in) */
++#else
+       munmap(bo->map, bo->size);
++#endif
+    }
+ 
+    TU_RMV(bo_destroy, dev, bo);
+@@ -1594,7 +1606,12 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+ 
+    /* Version 1.6 added SYNCOBJ support. */
+    const int min_version_major = 1;
++#ifdef __APPLE__
++   /* Chlorophyll: the libdrm stand-in reports 1.4 and emulates syncobjs on top of the kernel's fences itself */
++   const int min_version_minor = 4;
++#else
+    const int min_version_minor = 6;
++#endif
+ 
+    if (version->version_major != min_version_major ||
+        version->version_minor < min_version_minor) {
+@@ -1651,6 +1668,11 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+ 
+    device->has_set_iova = !tu_drm_get_va_prop(device, &device->va_start,
+                                               &device->va_size);
++#ifdef __APPLE__
++   /* Chlorophyll: one GPU address space for every process (PP_PGTABLE 0) with kernel-assigned addresses, so Turnip takes
++    * the kernel's addresses too (GET_IOVA) instead of picking its own */
++   device->has_set_iova = false;
++#endif
+    device->has_lazy_bos = device->has_set_iova;
+    device->has_raytracing = tu_drm_get_raytracing(device);
+    device->has_sparse_prr = tu_drm_get_prr(device);
+diff --git a/src/util/cache_ops_aarch64.c b/src/util/cache_ops_aarch64.c
+index d56ab8a..ff7706a 100644
+--- a/src/util/cache_ops_aarch64.c
++++ b/src/util/cache_ops_aarch64.c
+@@ -26,12 +26,29 @@
+ #include "util/macros.h"
+ #include "util/u_atomic.h"
+ 
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#endif
++
+ static uint32_t
+ get_ctr_el0(void)
+ {
++#ifdef __APPLE__
++   /* Chlorophyll: Bergamota's XNU traps EL0 reads of CTR_EL0 (SIGILL). Build the fields read here (CWG [27:24],
++    * DminLine [19:16], IminLine [3:0], all log2 of words) from the line size the kernel reports. */
++   uint64_t line = 0;
++   size_t len = sizeof(line);
++   if (sysctlbyname("hw.cachelinesize", &line, &len, NULL, 0) != 0 || line < 16)
++      line = 64;
++   uint32_t lg = 0;
++   while ((4u << lg) < line)
++      lg++;
++   return lg << 24 | lg << 16 | lg;
++#else
+    uint32_t ctr_el0;
+    __asm("mrs\t%x0, ctr_el0" : "=r"(ctr_el0));
+    return ctr_el0;
++#endif
+ }
+ 
+ static uint32_t
+diff --git a/src/vulkan/meson.build b/src/vulkan/meson.build
+index 614a33a..f9a7af1 100644
+--- a/src/vulkan/meson.build
++++ b/src/vulkan/meson.build
+@@ -54,7 +54,7 @@ if with_platform_wayland
+   vulkan_wsi_deps += dep_wayland_client
+   vulkan_wsi_list += '-DVK_USE_PLATFORM_WAYLAND_KHR'
+ endif
+-if system_has_kms_drm and not with_platform_android
++if system_has_kms_drm and not with_platform_android and host_machine.system() != 'darwin'   # Chlorophyll: no KMS on iOS
+   vulkan_wsi_deps += [dep_libdrm, dep_display_info]
+   vulkan_wsi_list += '-DVK_USE_PLATFORM_DISPLAY_KHR'
+ endif
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 80925d1..6480332 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -38,7 +38,8 @@ if with_platform_macos
+   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
+ endif
+ 
+-if system_has_kms_drm and not with_platform_android
++# Chlorophyll: no KMS on iOS (the libdrm stand-in has no drmMode*), so no VK_KHR_display
++if system_has_kms_drm and not with_platform_android and host_machine.system() != 'darwin'
+   files_vulkan_wsi += files('wsi_common_display.c')
+ endif
+ 

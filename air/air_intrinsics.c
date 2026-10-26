@@ -208,8 +208,8 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    *handled = true;
 
    /* fast math is what every one of these means: Metal's "fast" library */
-   bool was_exact = c->b.exact;
-   c->b.exact = false;
+   bool was_exact = air_b_exact(&c->b);
+   air_b_set_exact(&c->b, false);
 
    if (!strcmp(op, "fast_fabs") || !strcmp(op, "fabs")) {
       r = nir_fabs(&c->b, a[0]);
@@ -372,11 +372,11 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
                                             nir_imm_floatN_t(&c->b, bits > 16 ? -10.0 : -4.2, bits)),
                             nir_imm_floatN_t(&c->b, bits > 16 ? 10.0 : 4.2, bits));
       nir_def *ex = nir_fexp(&c->b, x), *enx = nir_fexp(&c->b, nir_fneg(&c->b, x));
-      bool was = c->b.exact;
-      c->b.exact = true;
+      bool was = air_b_exact(&c->b);
+      air_b_set_exact(&c->b, true);
       nir_def *regular = nir_fge_imm(&c->b, nir_fabs(&c->b, a[0]),
                                      bits > 16 ? 0x1p-12 : 0x1p-5);
-      c->b.exact = was;
+      air_b_set_exact(&c->b, was);
       r = nir_bcsel(&c->b, regular,
                     nir_fdiv(&c->b, nir_fsub(&c->b, ex, enx), nir_fadd(&c->b, ex, enx)),
                     a[0]);
@@ -574,7 +574,7 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "convert")) {
       /* air.convert.<dst sign>.<dst type>.<src sign>.<src type> */
       if (n->num < 5) {
-         c->b.exact = was_exact;
+         air_b_set_exact(&c->b, was_exact);
          return air_error(c, "intrinsic: %s (a convert without both types)", op);
       }
       const struct air_type *dt = in->base.type;
@@ -610,7 +610,7 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       *handled = false;
    }
 
-   c->b.exact = was_exact;
+   air_b_set_exact(&c->b, was_exact);
    if (!*handled)
       return true;
    if (!r)
@@ -882,7 +882,7 @@ discard_op(struct air_ctx *c, const struct air_inst *in)
 {
    if (c->nir->info.stage != MESA_SHADER_FRAGMENT)
       return air_error(c, "intrinsic: air.discard_fragment in a %s shader",
-                       gl_shader_stage_name(c->nir->info.stage));
+                       mesa_shader_stage_name(c->nir->info.stage));
    nir_demote(&c->b);
    c->nir->info.fs.uses_discard = true;
    return true;
@@ -963,7 +963,7 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       if (c->nir->info.stage != MESA_SHADER_FRAGMENT)
          return air_error(c, "intrinsic: air.simd_is_helper_thread in a %s shader "
                              "(there are no helper threads outside the fragment "
-                             "stage)", gl_shader_stage_name(c->nir->info.stage));
+                             "stage)", mesa_shader_stage_name(c->nir->info.stage));
       air_set(c, &in->base, air_val_ssa(c, nir_is_helper_invocation(&c->b, 1)));
       return true;
    }

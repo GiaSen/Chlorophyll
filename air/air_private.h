@@ -14,6 +14,22 @@
 #include "nir.h"
 #include "nir_builder.h"
 
+/* Mesa 26 folded nir_builder's `exact` flag into fp_math_ctrl (nir_fp_exact = no contract, no reassociation, no transform). */
+static inline bool
+air_b_exact(const nir_builder *b)
+{
+   return (b->fp_math_ctrl & nir_fp_exact) == nir_fp_exact;
+}
+
+static inline void
+air_b_set_exact(nir_builder *b, bool exact)
+{
+   if (exact)
+      b->fp_math_ctrl |= nir_fp_exact;
+   else
+      b->fp_math_ctrl &= ~(uint32_t)nir_fp_exact;
+}
+
 /* Chlorophyll: an unsigned widening or narrowing of an integer that may be a BOOLEAN. LLVM's i1 is NIR's 1-bit bool, which
  * u2u cannot take: ir3 rejects the conversion ("invalid src bit size: 1", and before the ir3 patch spun its compile thread
  * forever). A bool zero-extends as b2i. iOS 26's RenderBox indexes two-element arrays and vectors with an i1. */

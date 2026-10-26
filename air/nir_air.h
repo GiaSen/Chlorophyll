@@ -270,7 +270,7 @@ struct air_vertex_attribute {
 #define AIR_NULL_MASK_WORD 32     /* ... and in it, the null-texture mask (air.is_null_texture) */
 
 struct air_shader_info {
-   gl_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
+   mesa_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
    const char *entry_point;
    unsigned num_resources;
    struct air_resource *resources;

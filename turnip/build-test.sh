@@ -7,7 +7,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BG_GPU="${BERGAMOTA_GPU:-$HERE/../..}"
 WORK="${GPU_METAL_WORK:?set GPU_METAL_WORK}"
-D="$WORK/mesa-turnip"
+D="${TURNIP_TREE:-$WORK/mesa-turnip26}"
 OUT="${1:-$WORK/out-turnip}"
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 CC="xcrun --sdk iphoneos clang -arch arm64e -miphoneos-version-min=18.0 -isysroot $SDK"

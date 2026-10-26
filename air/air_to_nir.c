@@ -849,7 +849,7 @@ named_md(const struct air_module *m, const char *name)
 /* -- stage -------------------------------------------------------------- */
 
 struct stage_md {
-   gl_shader_stage stage;
+   mesa_shader_stage stage;
    const char *md_name;
 };
 
@@ -1913,7 +1913,7 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
     * the members are read off air.struct_type_info (type name, member name, "air.render_target", n). */
    if (md_key(node, "air.imageblock") >= 0) {
       if (c->nir->info.stage != MESA_SHADER_COMPUTE)
-         return air_error(c, "interface: air.imageblock in a %s shader", gl_shader_stage_name(c->nir->info.stage));
+         return air_error(c, "interface: air.imageblock in a %s shader", mesa_shader_stage_name(c->nir->info.stage));
       int ik = md_key(node, "air.imageblock");
       const char *layout = md_str(node, ik + 1);
       if (!layout || strcmp(layout, "implicit"))
@@ -2048,7 +2048,7 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          return true;
       }
       return air_error(c, "interface: air.position as an input of a %s shader",
-                       gl_shader_stage_name(c->nir->info.stage));
+                       mesa_shader_stage_name(c->nir->info.stage));
    }
 
    /* Metal's `[[color(n)]]` argument to a fragment function: the value render target n
@@ -2088,7 +2088,7 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
    if (rt_in >= 0) {
       if (c->nir->info.stage != MESA_SHADER_FRAGMENT)
          return air_error(c, "interface: air.render_target as an input of a %s shader",
-                          gl_shader_stage_name(c->nir->info.stage));
+                          mesa_shader_stage_name(c->nir->info.stage));
       /* An argument nothing reads must not turn the shader into a framebuffer-fetch
        * shader: info.fs.uses_fbfetch_output alone makes a6xx flush the pipeline per
        * overlapping primitive (fd6_emit.cc, build_prim_mode), and an unused argument
@@ -2484,9 +2484,9 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
     * instruction. Without the flags the arithmetic must not be reassociated,
     * so the builder is told to keep it exact.
     */
-   bool was_exact = c->b.exact;
+   bool was_exact = air_b_exact(&c->b);
    if (is_float)
-      c->b.exact = !(in->flags & (AIR_FMF_UNSAFE_ALGEBRA | AIR_FMF_REASSOC));
+      air_b_set_exact(&c->b, !(in->flags & (AIR_FMF_UNSAFE_ALGEBRA | AIR_FMF_REASSOC)));
 
    switch (in->sub) {
    case AIR_BINOP_ADD: res = is_float ? nir_fadd(&c->b, x, y) : nir_iadd(&c->b, x, y); break;
@@ -2503,10 +2503,10 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
    case AIR_BINOP_OR: res = nir_ior(&c->b, x, y); break;
    case AIR_BINOP_XOR: res = nir_ixor(&c->b, x, y); break;
    default:
-      c->b.exact = was_exact;
+      air_b_set_exact(&c->b, was_exact);
       return air_error(c, "instruction: binary operator %u", in->sub);
    }
-   c->b.exact = was_exact;
+   air_b_set_exact(&c->b, was_exact);
    air_set(c, &in->base, air_val_ssa(c, res));
    return true;
 }
@@ -3147,7 +3147,7 @@ nir_block_of(struct air_ctx *c, const struct air_block *b)
    struct hash_entry *e = _mesa_hash_table_search(c->blocks, b);
    if (e)
       return e->data;
-   nir_block *n = nir_block_create(c->nir);
+   nir_block *n = nir_block_create(c->b.impl);
    exec_list_push_tail(&c->b.impl->body, &n->cf_node.node);
    n->cf_node.parent = &c->b.impl->cf_node;
    _mesa_hash_table_insert(c->blocks, b, n);
@@ -4781,7 +4781,7 @@ translate_body(struct air_ctx *c)
             bool last = k + 1 == n;
             nir_block *next = deflt;
             if (!last) {
-               next = nir_block_create(c->nir);
+               next = nir_block_create(c->b.impl);
                exec_list_push_tail(&c->b.impl->body, &next->cf_node.node);
                next->cf_node.parent = &c->b.impl->cf_node;
             }
@@ -5302,7 +5302,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    }
    c.fn = fn;
 
-   c.nir = nir_shader_create(mem_ctx, stage, nir_options, NULL);
+   c.nir = nir_shader_create(mem_ctx, stage, nir_options);
    c.nir->info.name = ralloc_strdup(c.nir, fn->base.name ? fn->base.name : "air");
    c.nir->info.internal = false;
    c.fns = _mesa_pointer_hash_table_create(ctx);

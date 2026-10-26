@@ -1,0 +1,14 @@
+diff --git a/src/freedreno/ir3/ir3_context.c b/src/freedreno/ir3/ir3_context.c
+index 1d6acf2..3a830b8 100644
+--- a/src/freedreno/ir3/ir3_context.c
++++ b/src/freedreno/ir3/ir3_context.c
+@@ -348,7 +348,8 @@ ir3_context_error(struct ir3_context *ctx, const char *format, ...)
+    nir_log_shader_annotated(ctx->s, errors);
+    ralloc_free(errors);
+    ctx->error = true;
+-   UNREACHABLE("");
++   /* Chlorophyll: return, and let the compile fail on ctx->error. UNREACHABLE("") is undefined behaviour in a release
++    * build, and on the A630 it spun the compile thread forever (iOS 26's RenderBox shaders in iconservicesagent). */
+ }
+ 
+ static struct ir3_instruction *
