@@ -460,6 +460,8 @@ bg_install_fallback(Class c)
    int _linPending;       // command buffers in flight that write it: no fill from the buffer until they wrote back
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    BOOL _surfCopy;       // an IOSurface the GPU could not import (row pitch not 64-aligned): own memory, refreshed from the surface at each use
+   BOOL _xr2p;           // ... a two-plane RGB10A8_2P_XR10 one ('b3a8': XR10 RGB + A8 alpha), decoded into BGRA8 at each refresh
+   uint32_t _surfSeed;   // the surface's seed at the last refresh (an unchanged surface is not copied again)
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
    BGMTLTexture *_parent;  // a texture view (newTextureViewWith...): the texture whose memory it shows (retained)
@@ -2259,6 +2261,40 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
    _shape.sample_count = (unsigned)[d sampleCount];
    _shape.usage = (unsigned)[d usage];
    char why[512] = { 0 };
+   // /private/var/tmp/bgmtl.surfdump (ONE SHOT: removed before anything is read, so a fault here cannot repeat at the next
+   // start): the layout of the first two-plane IOSurface this process is asked to wrap -- its pixel format, every plane's
+   // geometry and offset, and the planes' bytes in /private/var/tmp/surfdump-<pid>-p<N>.raw
+   if (surface && IOSurfaceGetPlaneCount((IOSurfaceRef)surface) > 1 && unlink("/private/var/tmp/bgmtl.surfdump") == 0) {
+      IOSurfaceRef sf = (IOSurfaceRef)surface;
+      OSType pf = IOSurfaceGetPixelFormat(sf);
+      size_t np = IOSurfaceGetPlaneCount(sf);
+      bgmtl_note_line("surfdump: armed");
+      char line[400];
+      int n = snprintf(line, sizeof(line), "surfdump: surface %u '%c%c%c%c' (0x%08x) %zux%zu, %zu planes, alloc %zu, Metal format %lu, plane %lu:",
+                       (unsigned)IOSurfaceGetID(sf), (char)(pf >> 24), (char)(pf >> 16), (char)(pf >> 8), (char)pf, (unsigned)pf,
+                       IOSurfaceGetWidth(sf), IOSurfaceGetHeight(sf), np, IOSurfaceGetAllocSize(sf), (unsigned long)[d pixelFormat],
+                       (unsigned long)plane);
+      if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
+         const uint8_t *base = IOSurfaceGetBaseAddress(sf);
+         for (size_t k = 0; k < np && k < 4; k++) {
+            const uint8_t *pb = IOSurfaceGetBaseAddressOfPlane(sf, k);
+            size_t pw = IOSurfaceGetWidthOfPlane(sf, k), ph = IOSurfaceGetHeightOfPlane(sf, k);
+            size_t bpe = IOSurfaceGetBytesPerElementOfPlane(sf, k), bpr = IOSurfaceGetBytesPerRowOfPlane(sf, k);
+            n += snprintf(line + n, sizeof(line) - n, " [%zu: %zux%zu bpe %zu bpr %zu off %ld]", k, pw, ph, bpe, bpr,
+                          (long)(base && pb ? pb - base : -1));
+            if (pb && bpr && ph) {
+               char path[96];
+               snprintf(path, sizeof(path), "/private/var/tmp/surfdump-%d-p%zu.raw", getpid(), k);
+               FILE *f = fopen(path, "wb");
+               if (f) { fwrite(pb, 1, bpr * ph, f); fclose(f); }
+            }
+         }
+         IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+      } else {
+         n += snprintf(line + n, sizeof(line) - n, " (lock failed)");
+      }
+      bgmtl_note_line(line);
+   }
    if (surface) {
       _shape.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (MTLTextureUsageRenderTarget | ShaderRead) */
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
@@ -2271,6 +2307,15 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
          char why2[512] = { 0 };
          _tex = rwa_texture_create([device rwa], &_shape, why2, sizeof(why2));
          if (_tex) _surfCopy = YES;
+      }
+      /* Chlorophyll: CoreAnimation's backing stores of transparent layers (iOS 26 SpringBoard's icon glyphs among them) are
+       * two-plane MTLPixelFormatRGB10A8_2P_XR10 surfaces: XR10 RGB in plane 0, 8-bit alpha in plane 1. The Adreno has no such
+       * format and libbgair imports one plane at most, so the texture gets its own BGRA8 memory (550's stand-in) and the
+       * surface is decoded into it when it changes (rwaTexture). Refused before: ~600 layers in 2 minutes, all dropped. */
+      if (!_tex && [d pixelFormat] == 550 && IOSurfaceGetPlaneCount((IOSurfaceRef)surface) >= 2) {
+         char why2[512] = { 0 };
+         _tex = rwa_texture_create([device rwa], &_shape, why2, sizeof(why2));
+         if (_tex) { _surfCopy = YES; _xr2p = YES; }
       }
       bg_unlock();
       _surface = CFRetain(surface);
@@ -2405,7 +2450,48 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
 - (struct rwa_texture *)rwaTexture
 {
    if (_parent) { [_parent rwaTexture]; return _tex; }
-   if (_surfCopy && _tex && _surface) {
+   if (_xr2p && _tex && _surface) {
+      IOSurfaceRef sf = (IOSurfaceRef)_surface;
+      uint32_t seed = IOSurfaceGetSeed(sf);
+      if ((seed != _surfSeed || !_surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
+         // plane 0: one little-endian word per texel, B bits 0-9, G 10-19, R 20-29 in XR10 (384 = 0.0, 894 = 1.0, the
+         // extended range clamped here); plane 1: one alpha byte per texel. Out: BGRA8, the stand-in format of 550.
+         const uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
+         size_t r0 = IOSurfaceGetBytesPerRowOfPlane(sf, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(sf, 1);
+         unsigned w = MIN(_shape.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0));
+         unsigned h = MIN(_shape.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
+         uint8_t *out = (p0 && p1 && w && h) ? malloc((size_t)w * h * 4) : NULL;
+         if (out) {
+            static uint8_t lut[1024];
+            static int lut_ready;
+            if (!lut_ready) {
+               for (int v = 0; v < 1024; v++) { int c = (v - 384) * 255 / 510; lut[v] = (uint8_t)(c < 0 ? 0 : c > 255 ? 255 : c); }
+               lut_ready = 1;
+            }
+            for (unsigned y = 0; y < h; y++) {
+               const uint8_t *s0 = p0 + y * r0, *s1 = p1 + y * r1;
+               uint8_t *o = out + (size_t)y * w * 4;
+               for (unsigned x = 0; x < w; x++) {
+                  uint32_t v = (uint32_t)s0[4 * x] | (uint32_t)s0[4 * x + 1] << 8 | (uint32_t)s0[4 * x + 2] << 16 | (uint32_t)s0[4 * x + 3] << 24;
+                  o[4 * x] = lut[v & 0x3ff];
+                  o[4 * x + 1] = lut[(v >> 10) & 0x3ff];
+                  o[4 * x + 2] = lut[(v >> 20) & 0x3ff];
+                  o[4 * x + 3] = s1[x];
+               }
+            }
+         }
+         IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+         if (out) {
+            bg_lock();
+            char why[256] = { 0 };
+            const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+            if (rwa_texture_write(_tex, 0, 0, o, sz, out, w * 4, why, sizeof(why)) != 0) BG_LOG("XR10 surface refresh: %s\n", why);
+            bg_unlock();
+            free(out);
+            _surfSeed = seed ? seed : 1;
+         }
+      }
+   } else if (_surfCopy && _tex && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
          bg_lock();
