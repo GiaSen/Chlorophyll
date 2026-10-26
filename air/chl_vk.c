@@ -44,6 +44,9 @@ extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const c
 #define CHL_FENCE_TIMEOUT_NS 5000000000ull
 #define CHL_RING_SLAB (256u << 10)
 
+static int chl_trace = -1;
+#define TRACE(...) do { if (chl_trace < 0) chl_trace = getenv("CHL_TRACE") != NULL; if (chl_trace) { fprintf(stderr, "chl: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
+
 static void
 say(char *why, size_t why_size, const char *fmt, ...)
 {
@@ -255,6 +258,8 @@ struct chl_layout {
    VkPipelineLayout layout;
    struct air_vk_layout bindings;
    VkSampler immutable[AIR_VK_MAX_BINDINGS];
+   /* a level slot (air_resource.level_slots): the texture slot + 1 it is a level of, and which level */
+   uint8_t level_src[AIR_VK_MAX_BINDINGS], level[AIR_VK_MAX_BINDINGS];
    unsigned push_bytes;
 };
 
@@ -1377,7 +1382,7 @@ translate(struct chl_device *d, void *mem_ctx, const struct chl_function *fn, me
          break;
       }
    }
-   if (!air_nir_to_vulkan(out->nir, stage, layout, why, why_size))
+   if (!air_nir_to_vulkan(out->nir, &out->info, stage, layout, why, why_size))
       return false;
    out->nir->options = NULL;   /* Turnip sets its own when it takes the shader */
    return true;
@@ -1431,6 +1436,17 @@ make_layout(struct chl_device *d, struct chl_layout *l, struct chl_stage_info *c
                }
             }
             b[nb].pImmutableSamplers = &l->immutable[i];
+         }
+      }
+      if (t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && stage < n_stages) {
+         unsigned slot = i - stage * AIR_VK_STAGE_BINDINGS - AIR_VK_TEXTURE_BINDING;
+         const struct air_shader_info *ai = &stages[stage]->info;
+         for (unsigned k = 0; k < ai->num_resources; k++) {
+            const struct air_resource *r = &ai->resources[k];
+            if (r->kind == AIR_RESOURCE_IMAGE && r->level_slots && slot >= r->level_base && slot < r->level_base + r->level_slots) {
+               l->level_src[i] = (uint8_t)(r->index + 1);
+               l->level[i] = (uint8_t)(slot - r->level_base + 1);
+            }
          }
       }
       if (!b[nb].pImmutableSamplers)
@@ -1862,11 +1878,14 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
       } else if (local < AIR_VK_SAMPLER_BINDING) {
          unsigned n = local - AIR_VK_TEXTURE_BINDING;
          struct chl_texture *tx = sb->tex[n];
+         unsigned level = 0;
+         if (l->level_src[i]) {   /* a level slot: that level of the texture it stands for (its last one past the chain) */
+            tx = sb->tex[l->level_src[i] - 1];
+            level = tx && l->level[i] >= tx->levels ? tx->levels - 1 : l->level[i];
+         }
          VkImageView v = VK_NULL_HANDLE;
          if (tx)
-            v = t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? storage_view(tx, 0) : tx->view;
-         else
-            push[stage * 32 + AIR_PUSH_NULL_MASK_WORD] |= 1u << n;   /* air.is_null_texture */
+            v = t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? storage_view(tx, level) : tx->view;
          ii[nw] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, v, VK_IMAGE_LAYOUT_GENERAL };
          w[nw].pImageInfo = &ii[nw];
       } else {
@@ -1932,12 +1951,15 @@ chl_dispatch(struct chl_cmdbuf *cb, const unsigned groups[3], const unsigned thr
    if (p->dynamic_threadgroup)
       for (unsigned i = 0; i < AIR_VK_BUFFER_SLOTS; i++)
          dyn += (cb->tg_len[i] + 15) & ~15u;
+   TRACE("dispatch %s %ux%ux%u: compiling variant", p->cs.info.entry_point, threads[0], threads[1], threads[2]);
    VkPipeline v = compute_variant(p, threads, dyn, why, why_size);
    if (!v)
       return -1;
+   TRACE("variant ready, binding");
    d->vk.vkCmdBindPipeline(cb->cb, VK_PIPELINE_BIND_POINT_COMPUTE, v);
    if (flush_bindings(cb, VK_PIPELINE_BIND_POINT_COMPUTE, &p->layout, why, why_size) != 0)
       return -1;
+   TRACE("bound, dispatching");
    d->vk.vkCmdDispatch(cb->cb, groups[0], groups[1], groups[2]);
    /* the dispatches of a compute encoder are ordered in Metal: what one writes the next reads */
    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_SHADER_WRITE_BIT,

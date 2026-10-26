@@ -27,6 +27,7 @@
 
 struct bridge {
    struct air_vk_layout *layout;
+   const struct air_shader_info *info;
    unsigned bind_base, push_base;
    nir_variable *tex_var[AIR_VK_TEXTURE_SLOTS];
    nir_variable *img_var[AIR_VK_TEXTURE_SLOTS];
@@ -81,7 +82,9 @@ texture_deref(nir_builder *b, struct bridge *br, unsigned slot, enum glsl_sample
       return NULL;
    }
    if (!br->tex_var[slot]) {
-      const struct glsl_type *t = glsl_texture_type(dim, is_array, nir_get_glsl_base_type_for_nir_type(type));
+      /* a void result type: one slot is read by fetches of its element type and by size queries (int), and a void type
+       * is the one NIR accepts with both; Turnip's descriptors do not depend on it */
+      const struct glsl_type *t = glsl_texture_type(dim, is_array, GLSL_TYPE_VOID);
       nir_variable *v = nir_variable_create(b->shader, nir_var_uniform, t, "air_texture");
       v->data.descriptor_set = 0;
       v->data.binding = br->bind_base + AIR_VK_TEXTURE_BINDING + slot;
@@ -119,7 +122,7 @@ image_deref(nir_builder *b, struct bridge *br, unsigned slot, enum glsl_sampler_
       return NULL;
    }
    if (!br->img_var[slot]) {
-      const struct glsl_type *t = glsl_image_type(dim, is_array, nir_get_glsl_base_type_for_nir_type(type));
+      const struct glsl_type *t = glsl_image_type(dim, is_array, GLSL_TYPE_VOID);
       nir_variable *v = nir_variable_create(b->shader, nir_var_image, t, "air_image");
       v->data.descriptor_set = 0;
       v->data.binding = br->bind_base + AIR_VK_TEXTURE_BINDING + slot;
@@ -149,27 +152,108 @@ is_image_index_op(nir_intrinsic_op op)
    }
 }
 
+/* image_<op>(index, ...) as image_deref_<op>(deref, ...) at the cursor, `in` left in place; returns its def (NULL for a store).
+ * nir_rewrite_image_intrinsic has no deref direction. */
+static nir_def *
+emit_image_deref(nir_builder *b, nir_intrinsic_instr *in, nir_deref_instr *d)
+{
+   nir_intrinsic_op op;
+   switch (in->intrinsic) {
+   case nir_intrinsic_image_load: op = nir_intrinsic_image_deref_load; break;
+   case nir_intrinsic_image_sparse_load: op = nir_intrinsic_image_deref_sparse_load; break;
+   case nir_intrinsic_image_store: op = nir_intrinsic_image_deref_store; break;
+   case nir_intrinsic_image_atomic: op = nir_intrinsic_image_deref_atomic; break;
+   case nir_intrinsic_image_atomic_swap: op = nir_intrinsic_image_deref_atomic_swap; break;
+   case nir_intrinsic_image_size: op = nir_intrinsic_image_deref_size; break;
+   case nir_intrinsic_image_levels: op = nir_intrinsic_image_deref_levels; break;
+   default: op = nir_intrinsic_image_deref_samples; break;
+   }
+   const nir_intrinsic_info *info = &nir_intrinsic_infos[op];
+   nir_intrinsic_instr *n = nir_intrinsic_instr_create(b->shader, op);
+   n->num_components = in->num_components;
+   n->src[0] = nir_src_for_ssa(&d->def);
+   for (unsigned i = 1; i < info->num_srcs; i++)
+      n->src[i] = nir_src_for_ssa(in->src[i].ssa);
+   nir_intrinsic_set_image_dim(n, nir_intrinsic_image_dim(in));
+   nir_intrinsic_set_image_array(n, nir_intrinsic_image_array(in));
+   nir_intrinsic_set_format(n, nir_intrinsic_format(in));
+   nir_intrinsic_set_access(n, nir_intrinsic_access(in));
+   if (nir_intrinsic_has_dest_type(in))
+      nir_intrinsic_set_dest_type(n, nir_intrinsic_dest_type(in));
+   if (nir_intrinsic_has_src_type(in))
+      nir_intrinsic_set_src_type(n, nir_intrinsic_src_type(in));
+   if (nir_intrinsic_has_atomic_op(in))
+      nir_intrinsic_set_atomic_op(n, nir_intrinsic_atomic_op(in));
+   if (info->has_dest)
+      nir_def_init(&n->instr, &n->def, in->def.num_components, in->def.bit_size);
+   nir_builder_instr_insert(b, &n->instr);
+   return info->has_dest ? &n->def : NULL;
+}
+
+static nir_alu_type
+image_type(nir_intrinsic_instr *in)
+{
+   if (nir_intrinsic_has_dest_type(in))
+      return nir_intrinsic_dest_type(in);
+   if (nir_intrinsic_has_src_type(in))
+      return nir_intrinsic_src_type(in);
+   if (nir_intrinsic_has_atomic_op(in))
+      return nir_atomic_op_type(nir_intrinsic_atomic_op(in)) == nir_type_float ? nir_type_float32 : nir_type_uint32;
+   return nir_type_float32;
+}
+
 static bool
 bridge_image(nir_builder *b, nir_intrinsic_instr *in, struct bridge *br)
 {
-   if (!nir_src_is_const(in->src[0])) {
-      /* Mercury's level slots: a run-time choice among slot images. Not served yet. */
-      fail(br, "an image chosen at run time (intrinsic %u%c) is not served on Turnip yet", in->intrinsic, ' ');
-      return false;
+   bool has_dest = nir_intrinsic_infos[in->intrinsic].has_dest;
+   nir_def *result = NULL;
+   if (nir_src_is_const(in->src[0])) {
+      nir_deref_instr *d = image_deref(b, br, nir_src_as_uint(in->src[0]), nir_intrinsic_image_dim(in),
+                                       nir_intrinsic_image_array(in), image_type(in), nir_intrinsic_format(in));
+      if (!d)
+         return false;
+      result = emit_image_deref(b, in, d);
+   } else {
+      /* An image chosen at run time. Mercury's VariableBlurrer::downsample writes the level `lods.y`: the frontend gives
+       * each level L >= 1 an image slot of its own (level_base + L - 1) and indexes them. One copy of the access per slot
+       * the index can be, under an if-chain, each on a constant slot (Turnip's own pattern for a run-time set index). */
+      unsigned cand[AIR_VK_TEXTURE_SLOTS], nc = 0;
+      for (unsigned i = 0; br->info && i < br->info->num_resources; i++) {
+         const struct air_resource *r = &br->info->resources[i];
+         if (r->kind != AIR_RESOURCE_IMAGE)
+            continue;
+         if (r->index < AIR_VK_TEXTURE_SLOTS && nc < AIR_VK_TEXTURE_SLOTS)
+            cand[nc++] = r->index;
+         for (unsigned l = 0; l < r->level_slots && nc < AIR_VK_TEXTURE_SLOTS; l++)
+            if (r->level_base + l < AIR_VK_TEXTURE_SLOTS)
+               cand[nc++] = r->level_base + l;
+      }
+      if (!nc) {
+         fail(br, "an image chosen at run time and no image it can be (intrinsic %u%c)", in->intrinsic, ' ');
+         return false;
+      }
+      nir_def *index = in->src[0].ssa;
+      nir_def *v[AIR_VK_TEXTURE_SLOTS];
+      for (unsigned k = 0; k < nc; k++) {
+         nir_push_if(b, nir_ieq_imm(b, index, cand[k]));
+         nir_deref_instr *d = image_deref(b, br, cand[k], nir_intrinsic_image_dim(in), nir_intrinsic_image_array(in),
+                                          image_type(in), nir_intrinsic_format(in));
+         if (!d)
+            return false;
+         v[k] = emit_image_deref(b, in, d);
+         nir_push_else(b, NULL);
+      }
+      if (has_dest)
+         result = nir_undef(b, in->def.num_components, in->def.bit_size);
+      for (int k = (int)nc - 1; k >= 0; k--) {
+         nir_pop_if(b, NULL);
+         if (has_dest)
+            result = nir_if_phi(b, v[k], result);
+      }
    }
-   unsigned slot = nir_src_as_uint(in->src[0]);
-   nir_alu_type t = nir_type_float32;
-   if (nir_intrinsic_has_dest_type(in))
-      t = nir_intrinsic_dest_type(in);
-   else if (nir_intrinsic_has_src_type(in))
-      t = nir_intrinsic_src_type(in);
-   else if (nir_intrinsic_has_atomic_op(in))
-      t = nir_atomic_op_type(nir_intrinsic_atomic_op(in)) == nir_type_float ? nir_type_float32 : nir_type_uint32;
-   nir_deref_instr *d = image_deref(b, br, slot, nir_intrinsic_image_dim(in), nir_intrinsic_image_array(in), t,
-                                    nir_intrinsic_format(in));
-   if (!d)
-      return false;
-   nir_rewrite_image_intrinsic(in, &d->def, nir_image_intrinsic_type_deref);
+   if (has_dest)
+      nir_def_rewrite_uses(&in->def, result);
+   nir_instr_remove(&in->instr);
    return true;
 }
 
@@ -180,11 +264,17 @@ bridge_intrinsic(nir_builder *b, nir_intrinsic_instr *in, struct bridge *br)
    int isrc = -1, osrc = -1;
    VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
    switch (in->intrinsic) {
-   case nir_intrinsic_load_push_constant:
-      /* the frontend's push constants (the null mask) are the stage's: rebase them */
-      nir_intrinsic_set_base(in, nir_intrinsic_base(in) + br->push_base);
+   case nir_intrinsic_load_push_constant: {
+      /* the frontend's push constants (the null mask) are the stage's: rebase them. The byte offset goes into the source
+       * with base 0: Turnip's lower_load_push_constant reads `base` as dwords where gather_push_constants reads it as bytes,
+       * and its own SPIR-V path always has base 0. */
+      nir_def *off = nir_iadd_imm(b, in->src[0].ssa, nir_intrinsic_base(in) + br->push_base);
+      nir_src_rewrite(&in->src[0], off);
+      nir_intrinsic_set_base(in, 0);
+      nir_intrinsic_set_range(in, br->push_base + AIR_VK_PUSH_STAGE_BYTES);
       br->layout->push_bytes = MAX2(br->layout->push_bytes, br->push_base + AIR_VK_PUSH_STAGE_BYTES);
       return true;
+   }
    case nir_intrinsic_load_ubo:
       isrc = 0, osrc = 1, type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       break;
@@ -219,7 +309,8 @@ bridge_intrinsic(nir_builder *b, nir_intrinsic_instr *in, struct bridge *br)
 
    if (osrc >= 0) {
       /* the part of Metal's offset below the descriptor alignment */
-      nir_def *delta = nir_load_push_constant(b, 1, 32, nir_imm_int(b, 0), .base = br->push_base + 4 * n, .range = 4);
+      nir_def *delta = nir_load_push_constant(b, 1, 32, nir_imm_int(b, br->push_base + 4 * n), .base = 0,
+                                              .range = br->push_base + AIR_VK_PUSH_STAGE_BYTES);
       nir_src_rewrite(&in->src[osrc], nir_iadd(b, in->src[osrc].ssa, delta));
       if (nir_intrinsic_has_align_mul(in) && nir_intrinsic_align_mul(in) > 4) {
          nir_intrinsic_set_align_mul(in, 4);
@@ -273,10 +364,12 @@ bridge_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 bool
-air_nir_to_vulkan(nir_shader *nir, unsigned stage, struct air_vk_layout *layout, char *why, size_t why_size)
+air_nir_to_vulkan(nir_shader *nir, const struct air_shader_info *info, unsigned stage, struct air_vk_layout *layout, char *why,
+                  size_t why_size)
 {
    struct bridge br = {
       .layout = layout,
+      .info = info,
       .bind_base = stage * AIR_VK_STAGE_BINDINGS,
       .push_base = stage * AIR_VK_PUSH_STAGE_BYTES,
       .why = why,

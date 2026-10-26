@@ -178,6 +178,35 @@ test_compute(void)
       CHECK(ok && !bad, "bg_tex_write %u wrong%s%s", bad, ok ? "" : ": ", ok ? "" : why);
       printf("  bg_tex_write: %u texels wrong\n", bad);
    }
+   for (unsigned run = 0; run < 2; run++) { // bg_mip_write: levels chosen at run time (Mercury's blur downsample); 1 and 3 stay zero
+      struct chl_compute_pipeline *c = kernel("bg_mip_write");
+      const unsigned W = 16, H = 8, LEVELS = run ? 5 : 1, written = run ? 1u << 0 | 1u << 2 | 1u << 4 : 1u;
+      struct chl_texture *t = c ? tex(125, 2, W, H, LEVELS, 1, 3) : NULL;
+      struct chl_buffer *k = t ? buf(16) : NULL, *sz = k ? buf(64) : NULL;
+      static float zero[16 * 8 * 4], got[16 * 8 * 4];
+      bool ok = sz != NULL;
+      if (ok) memset(chl_buffer_contents(sz), 0xff, 64);
+      for (unsigned l = 0; ok && l < LEVELS; l++) ok = chl_texture_replace(t, l, 0, NULL, NULL, zero, 0, 0, why, sizeof(why)) == 0;
+      for (unsigned l = 0; ok && l < LEVELS; l++) {
+         if (!(written & 1u << l)) continue;
+         *(uint32_t *)chl_buffer_contents(k) = l;
+         struct binding bd = { .b = { k, sz }, .nb = 2, .t = { t }, .nt = 1 };
+         ok = dispatch(c, &bd, 1, 1, W, H);
+      }
+      unsigned bad = 0;
+      const uint32_t *ps = ok ? chl_buffer_contents(sz) : NULL;
+      for (unsigned l = 0; ok && l < LEVELS; l++) {
+         unsigned w = MAX(W >> l, 1), h = MAX(H >> l, 1);
+         if ((written & 1u << l) && (ps[2 * l] != w || ps[2 * l + 1] != h)) { bad++; printf("    level %u measured %ux%u\n", l, ps[2 * l], ps[2 * l + 1]); }
+         if (chl_texture_get(t, l, 0, NULL, NULL, got, 0, 0, why, sizeof(why)) != 0) { bad++; continue; }
+         float want[4] = { 0, 0, 0, 0 };
+         if (written & 1u << l) { want[0] = w / 255.0f; want[1] = h / 255.0f; want[2] = l / 255.0f; want[3] = 1.0f; }
+         for (unsigned i = 0; i < w * h; i++)
+            if (memcmp(got + 4 * i, want, sizeof(want))) { if (bad++ < 4) printf("    level %u texel %u = %g,%g,%g,%g\n", l, i, got[4*i], got[4*i+1], got[4*i+2], got[4*i+3]); }
+      }
+      CHECK(ok && !bad, "bg_mip_write (%u levels): %u wrong%s%s", LEVELS, bad, ok ? "" : ": ", ok ? "" : why);
+      printf("  bg_mip_write (%u level%s, level chosen at run time): %u wrong\n", LEVELS, LEVELS > 1 ? "s" : "", bad);
+   }
    for (unsigned nt = 2; nt <= 3; nt++) { // bg_tex_choice / bg_tex_choice3: textures chosen at run time
       struct chl_compute_pipeline *c = kernel(nt == 2 ? "bg_tex_choice" : "bg_tex_choice3");
       struct chl_texture *tx[3] = { NULL };

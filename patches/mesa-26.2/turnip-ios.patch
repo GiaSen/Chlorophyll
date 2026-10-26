@@ -15,10 +15,10 @@ index 5f19ef9..bc14e62 100644
  gallium_drivers = get_option('gallium-drivers')
  if gallium_drivers.contains('auto')
 diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
-index b019710..8793448 100644
+index b019710..64e90d8 100644
 --- a/src/freedreno/vulkan/meson.build
 +++ b/src/freedreno/vulkan/meson.build
-@@ -228,9 +228,51 @@ libvulkan_freedreno = shared_library(
+@@ -228,9 +228,64 @@ libvulkan_freedreno = shared_library(
    gnu_symbol_visibility : 'hidden',
    link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
    link_depends : vulkan_icd_link_depends,
@@ -62,6 +62,19 @@ index b019710..8793448 100644
 +                 '-Wl,-install_name,@rpath/libchlorophyll.dylib'],
 +    link_depends : vulkan_icd_link_depends,
 +    override_options : ['b_lundef=false'],
++    build_by_default : false,
++    install : false,
++  )
++endif
++
++# Chlorophyll: the AIR -> NIR -> Vulkan-binding path checked on the host, no GPU needed (src/compiler/air/air_vk_check.c)
++if host_machine.system() == 'darwin' and not meson.is_cross_build()
++  air_vk_check = executable(
++    'air_vk_check',
++    [files('../../compiler/air/air_vk_check.c', '../../compiler/air/air_nir_vk.c')],
++    include_directories : [libtu_includes, include_directories('../../compiler/air')],
++    link_with : [libfreedreno_ir3],
++    dependencies : [idep_libfreedreno_common, idep_nir, idep_air, idep_mesautil, dep_m, dep_thread],
 +    build_by_default : false,
 +    install : false,
 +  )
