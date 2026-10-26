@@ -1582,8 +1582,17 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
 {
    static int on = -1;
    static uint64_t win_start, last_end, n, draws, enc, wait, gap, enc_max, wait_max;
+   // animation frame rate: commits less than 100 ms apart form a burst; the burst time and frame count give fps while something
+   // moves (the per-second count above mixes in idle time), and the intervals are binned at 17/25/34/100 ms (60/40/30/10 fps)
+   static uint64_t last_begin, burst_ns, burst_frames, bin[4];
    if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0;
    if (!on) return;
+   if (last_begin && t_begin > last_begin && t_begin - last_begin < 100000000ull) {
+      uint64_t d = t_begin - last_begin;
+      burst_ns += d; burst_frames++;
+      bin[d <= 17000000ull ? 0 : d <= 25000000ull ? 1 : d <= 34000000ull ? 2 : 3]++;
+   }
+   last_begin = t_begin;
    if (win_start == 0) win_start = t_begin;
    uint64_t e = t_flushed - t_begin, w = t_waited - t_flushed;
    if (last_end && t_begin > last_end) gap += t_begin - last_end;
@@ -1598,6 +1607,13 @@ bg_perf_note(uint64_t t_begin, uint64_t t_flushed, uint64_t t_waited, unsigned n
                "max encode %.1f ms, max wait %.1f ms", n / sec, n ? (double)draws / n : 0, enc / 1e6 / sec, wait / 1e6 / sec, gap / 1e6 / sec,
                enc_max / 1e6, wait_max / 1e6);
       bgmtl_note_line(line);
+      if (burst_frames >= 3) {
+         snprintf(line, sizeof(line), "frames: %.1f fps while animating (%llu intervals, %.0f ms); intervals <=17 ms %llu, <=25 %llu, <=34 %llu, "
+                  "<=100 %llu", burst_frames * 1e9 / burst_ns, (unsigned long long)burst_frames, burst_ns / 1e6,
+                  (unsigned long long)bin[0], (unsigned long long)bin[1], (unsigned long long)bin[2], (unsigned long long)bin[3]);
+         bgmtl_note_line(line);
+      }
+      burst_ns = burst_frames = bin[0] = bin[1] = bin[2] = bin[3] = 0;
       win_start = t_waited; n = draws = enc = wait = gap = enc_max = wait_max = 0;
    }
 }
@@ -1841,7 +1857,8 @@ bg_linear_written(BGWork *w, NSMutableSet *into)
 // InactiveHard) and it went idle right after each icon render holding the texture pool and freedreno's buffer caches;
 // so 1.5 s after a command buffer completes with nothing committed since, the device is trimmed (rwa_device_trim). Not
 // backboardd (never idle that long, a much higher limit, and its caches save it real time); /private/var/tmp/bgmtl.notrim
-// turns it off everywhere.
+// turns it off everywhere. SpringBoard waits 30 s: a 1.5 s pause between two home-screen swipes emptied its caches, and
+// the next animation began by allocating its textures and buffers from the kernel again (2026-10-26 profile).
 static unsigned long g_bg_trimmed_seq = (unsigned long)-1;
 
 static double
@@ -1858,8 +1875,10 @@ bg_idle_trim_schedule(struct rwa_device *rwa)
    static int skip = -1;
    if (skip < 0) skip = !strcmp(getprogname(), "backboardd") || access("/private/var/tmp/bgmtl.notrim", F_OK) == 0;
    if (skip || !rwa) return;
+   static uint64_t delay_ms;
+   if (!delay_ms) delay_ms = !strcmp(getprogname(), "SpringBoard") ? 30000 : 1500;
    unsigned long seq = __atomic_load_n(&g_bg_commit_seq, __ATOMIC_RELAXED);
-   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay_ms * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
       if (__atomic_load_n(&g_bg_commit_seq, __ATOMIC_RELAXED) != seq) return;   // busy again: a later completion re-arms
       if (__atomic_exchange_n(&g_bg_trimmed_seq, seq, __ATOMIC_RELAXED) == seq) return;   // already trimmed at this point
       double before = bg_footprint_mb();
