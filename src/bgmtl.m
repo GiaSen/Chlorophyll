@@ -550,6 +550,21 @@ ensure_protocol(Class cls, const char *proto)
    (void)port;
    self = [super init];
    if (!self) return nil;
+   // Mesa's shader disk cache (ir3 binaries, keyed by the shader and libbgair's LC_UUID): one folder per user, since
+   // backboardd (mobile), iconservicesagent (_iconservices) and the poster extensions cannot share files. This system has
+   // no per-user cache dir (no dirhelper), so it lives in /private/var/tmp; /private/var/tmp/bgmtl.nocache turns it off.
+   if (!getenv("MESA_SHADER_CACHE_DIR")) {
+      if (access("/private/var/tmp/bgmtl.nocache", F_OK) == 0) {
+         setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
+      } else {
+         char dir[96];
+         mkdir("/private/var/tmp/chlorophyll-cache", 01777);
+         chmod("/private/var/tmp/chlorophyll-cache", 01777);   // sticky and world-writable, like /tmp: every user makes its own
+         snprintf(dir, sizeof(dir), "/private/var/tmp/chlorophyll-cache/%u", (unsigned)getuid());
+         mkdir(dir, 0700);
+         setenv("MESA_SHADER_CACHE_DIR", dir, 1);
+      }
+   }
    _rwa = rwa_device_open(_why, sizeof(_why));
    BG_LOG("rwa_device_open: %s\n", _rwa ? rwa_device_name(_rwa) : _why);
    // a command buffer waits once at its end, so a dispatch need not wait for itself (/private/var/tmp/bgmtl.dispatchwait: it does)

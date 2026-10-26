@@ -63,6 +63,11 @@
 #include "util/simple_mtx.h"
 #include "util/os_time.h"
 #include "util/hash_table.h"
+#include "util/blob.h"
+#include "util/disk_cache.h"
+#include "nir_serialize.h"
+#include <dlfcn.h>
+#include <mach-o/loader.h>
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
@@ -156,6 +161,9 @@ struct rwa_device {
    /* Chlorophyll: the linked functions for the next rwa_render_create (rwa_device_set_linked_functions) */
    const struct rwa_linked_function *linked[2];
    unsigned num_linked[2];
+
+   /* Chlorophyll: AIR -> NIR translations kept on disk (air_to_nir_cached), NULL when off */
+   struct disk_cache *air_cache;
 };
 
 /* Unbind every stage's views and samplers if `p` (a sampler view or a sampler state) is among them, before it is freed. */
@@ -574,6 +582,8 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
             type_size_vec4, nir_lower_io_use_interpolated_input_intrinsics);
 }
 
+static void air_cache_open(struct rwa_device *device);
+
 struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
 {
@@ -669,6 +679,8 @@ rwa_device_open(char *why, size_t why_size)
       goto fail;
    }
 
+   air_cache_open(device);
+
    /* The context, one per device: it is what compiles a shader, binds buffers, launches
     * a grid and hands out fences. Flags zero on purpose -- not PIPE_CONTEXT_PREFER_THREADED,
     * so there is no Gallium worker thread between this library and the driver. A map held
@@ -730,12 +742,196 @@ rwa_device_close(struct rwa_device *device)
 {
    if (!device)
       return;
+   if (device->air_cache)
+      disk_cache_destroy(device->air_cache);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    device->pipe->destroy(device->pipe);
    device->screen->destroy(device->screen);
    free(device);
    glsl_type_singleton_decref();
+}
+
+/*
+ * Chlorophyll: AIR -> NIR translations on disk. Every process that uses Metal translates its pipelines' AIR again at every
+ * start (iconservicesagent: ~6 % of its CPU while it renders icons, backboardd at every boot), and the result depends
+ * only on the module, the entry point, the function-constant values, the linked functions and this library's own code.
+ * So the NIR (nir_serialize) and the air_shader_info beside it are kept in a Mesa disk cache of their own
+ * ("chlorophyll-air", in MESA_SHADER_CACHE_DIR beside ir3's binaries), keyed by all of those, under this library's
+ * LC_UUID: a rebuilt libbgair never reads another build's translations. ir3's own disk cache then finds the compiled
+ * binary for the same NIR. RWA_NO_AIR_CACHE=1 turns this one off.
+ */
+#define AIR_CACHE_MAGIC 0x43484c31u   /* "CHL1": bump with any change to what is written below */
+
+static bool
+image_uuid_hex(const void *addr, char out[41])
+{
+   Dl_info di;
+   if (!dladdr(addr, &di) || !di.dli_fbase)
+      return false;
+   const struct mach_header_64 *h = di.dli_fbase;
+   const struct load_command *lc = (const struct load_command *)(h + 1);
+   for (uint32_t i = 0; i < h->ncmds; i++) {
+      if (lc->cmd == LC_UUID) {
+         const struct uuid_command *u = (const struct uuid_command *)lc;
+         for (unsigned k = 0; k < 16; k++)
+            snprintf(out + 2 * k, 3, "%02x", u->uuid[k]);
+         return true;
+      }
+      lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+   }
+   return false;
+}
+
+static void
+air_cache_open(struct rwa_device *device)
+{
+   char id[41] = { 0 };
+   if (getenv("RWA_NO_AIR_CACHE") || !image_uuid_hex((const void *)air_cache_open, id))
+      return;
+   device->air_cache = disk_cache_create("chlorophyll-air", id, 0);
+}
+
+static void
+blob_write_str(struct blob *b, const char *s)
+{
+   blob_write_uint8(b, s != NULL);
+   if (s)
+      blob_write_string(b, s);
+}
+
+static const char *
+blob_read_str(void *mem_ctx, struct blob_reader *r)
+{
+   if (!blob_read_uint8(r))
+      return NULL;
+   const char *s = blob_read_string(r);
+   return s ? ralloc_strdup(mem_ctx, s) : NULL;
+}
+
+static void
+air_cache_key(struct disk_cache *cache, const void *bitcode, size_t size, const char *entry,
+              const struct air_to_nir_options *o, cache_key key)
+{
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, AIR_CACHE_MAGIC);
+   blob_write_str(&b, entry);
+   blob_write_uint64(&b, size);
+   blob_write_bytes(&b, bitcode, size);
+   blob_write_uint32(&b, o->num_constants);
+   for (unsigned i = 0; i < o->num_constants; i++) {
+      blob_write_uint32(&b, o->constants[i].index);
+      blob_write_uint64(&b, o->constants[i].bits);
+   }
+   blob_write_uint32(&b, o->num_linked);
+   for (unsigned i = 0; i < o->num_linked; i++) {
+      blob_write_str(&b, o->linked[i].name);
+      blob_write_uint64(&b, o->linked[i].size);
+      blob_write_bytes(&b, o->linked[i].bitcode, o->linked[i].size);
+   }
+   blob_write_uint8(&b, o->library_wrapper);
+   blob_write_uint32(&b, o->tile_size[0]);
+   blob_write_uint32(&b, o->tile_size[1]);
+   disk_cache_compute_key(cache, b.data, b.size, key);
+   blob_finish(&b);
+}
+
+/* the info as its raw bytes, then what its pointers point at; read back the same way and the pointers re-made */
+static void
+air_info_write(struct blob *b, const struct air_shader_info *info)
+{
+   blob_write_bytes(b, info, sizeof(*info));
+   blob_write_str(b, info->entry_point);
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      blob_write_bytes(b, &info->resources[i], sizeof(info->resources[i]));
+      blob_write_str(b, info->resources[i].name);
+      blob_write_str(b, info->resources[i].type_name);
+   }
+   for (unsigned i = 0; i < info->num_varyings; i++) {
+      blob_write_bytes(b, &info->varyings[i], sizeof(info->varyings[i]));
+      blob_write_str(b, info->varyings[i].name);
+   }
+   for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+      const struct air_vertex_attribute *a = &info->vertex_attributes[i];
+      blob_write_bytes(b, a, sizeof(*a));
+      blob_write_str(b, a->name);
+      blob_write_str(b, a->type_name);
+      blob_write_str(b, a->function_constant);
+   }
+   for (unsigned i = 0; i < info->num_notes; i++)
+      blob_write_str(b, info->notes ? info->notes[i] : NULL);
+}
+
+static bool
+air_info_read(void *mem_ctx, struct blob_reader *r, struct air_shader_info *info)
+{
+   blob_copy_bytes(r, info, sizeof(*info));
+   info->entry_point = blob_read_str(mem_ctx, r);
+   info->resources = info->num_resources ? rzalloc_array(mem_ctx, struct air_resource, info->num_resources) : NULL;
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      blob_copy_bytes(r, &info->resources[i], sizeof(info->resources[i]));
+      info->resources[i].name = blob_read_str(mem_ctx, r);
+      info->resources[i].type_name = blob_read_str(mem_ctx, r);
+   }
+   info->varyings = info->num_varyings ? rzalloc_array(mem_ctx, struct air_varying, info->num_varyings) : NULL;
+   for (unsigned i = 0; i < info->num_varyings; i++) {
+      blob_copy_bytes(r, &info->varyings[i], sizeof(info->varyings[i]));
+      info->varyings[i].name = blob_read_str(mem_ctx, r);
+   }
+   info->vertex_attributes = info->num_vertex_attributes
+      ? rzalloc_array(mem_ctx, struct air_vertex_attribute, info->num_vertex_attributes) : NULL;
+   for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+      struct air_vertex_attribute *a = &info->vertex_attributes[i];
+      blob_copy_bytes(r, a, sizeof(*a));
+      a->name = blob_read_str(mem_ctx, r);
+      a->type_name = blob_read_str(mem_ctx, r);
+      a->function_constant = blob_read_str(mem_ctx, r);
+   }
+   info->notes = info->num_notes ? rzalloc_array(mem_ctx, const char *, info->num_notes) : NULL;
+   for (unsigned i = 0; i < info->num_notes; i++)
+      info->notes[i] = blob_read_str(mem_ctx, r);
+   return !r->overrun;
+}
+
+/* air_to_nir, through the device's translation cache when it has one */
+static nir_shader *
+air_to_nir_cached(struct rwa_device *device, void *mem_ctx, const void *bitcode, size_t size, const char *entry,
+                  const struct air_to_nir_options *o, struct air_shader_info *info, const char **error)
+{
+   if (!device->air_cache)
+      return air_to_nir(mem_ctx, bitcode, size, entry, o, device->nir_options, info, error);
+   cache_key key;
+   air_cache_key(device->air_cache, bitcode, size, entry, o, key);
+   size_t got = 0;
+   void *data = disk_cache_get(device->air_cache, key, &got);
+   if (data) {
+      struct blob_reader r;
+      blob_reader_init(&r, data, got);
+      struct air_shader_info cached;
+      if (blob_read_uint32(&r) == AIR_CACHE_MAGIC && air_info_read(mem_ctx, &r, &cached)) {
+         nir_shader *nir = nir_deserialize(mem_ctx, device->nir_options, &r);
+         if (nir && !r.overrun) {
+            *info = cached;
+            free(data);
+            return nir;
+         }
+         ralloc_free(nir);
+      }
+      free(data);   /* unreadable: translated again below, and the entry replaced */
+   }
+   nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, o, device->nir_options, info, error);
+   if (!nir)
+      return NULL;
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, AIR_CACHE_MAGIC);
+   air_info_write(&b, info);
+   nir_serialize(&b, nir, false);
+   if (!b.out_of_memory)
+      disk_cache_put(device->air_cache, key, b.data, b.size, NULL);
+   blob_finish(&b);
+   return nir;
 }
 
 const char *
@@ -3552,8 +3748,8 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
       .num_constants = num_constants,
    };
    const char *error;
-   compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
-                             device->nir_options, &compute->info, &error);
+   compute->nir = air_to_nir_cached(device, compute->mem_ctx, bitcode, size, entry, &options,
+                                    &compute->info, &error);
    if (!compute->nir) {
       /* The sentence the translator wrote, which is the one that matters: it begins
        * with its own category (reader, stage, interface, instruction, intrinsic) and
@@ -7166,6 +7362,11 @@ rwa_render_create(struct rwa_device *device,
     * error between the stages cannot surface until the draw, because ir3 compiles and
     * links at draw time (ir3_cache_lookup), so the two belong to two different calls.
     */
+   /* RWA_TIMING=1: where a pipeline's creation time goes, on stderr (translation, then the stages' compile) */
+   static int timing = -1;
+   if (timing < 0)
+      timing = getenv("RWA_TIMING") != NULL;
+   int64_t t_start = timing ? os_time_get_nano() : 0;
    nir_shader *fs;
    if (!fragment_bitcode) {
       nir_builder nb = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, device->nir_options, "no_fragment");
@@ -7186,9 +7387,8 @@ rwa_render_create(struct rwa_device *device,
    const struct air_to_nir_options fopts = { .constants = ffc, .num_constants = num_ffc,
                                              .linked = flinked, .num_linked = num_linked[1] };
    const char *error;
-   fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
-                   fragment_entry, &fopts, device->nir_options, &render->finfo,
-                   &error);
+   fs = air_to_nir_cached(device, render->mem_ctx, fragment_bitcode, fragment_size,
+                          fragment_entry, &fopts, &render->finfo, &error);
    if (!fs) {
       say(why, why_size, "%s", error ? error : "the fragment module could not be translated");
       goto fail;
@@ -7253,8 +7453,8 @@ fragment_done:
                                                     linked[0][i].name };
       const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc,
                                                 .linked = vlinked, .num_linked = num_linked[0] };
-      vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
-                      device->nir_options, &render->vinfo, &error);
+      vs = air_to_nir_cached(device, render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
+                             &render->vinfo, &error);
       if (!vs) {
          say(why, why_size, "%s", error ? error : "the vertex module could not be translated");
          goto fail;
@@ -7388,6 +7588,7 @@ fragment_done:
    /* Compile both stages now. A failure here is a creation failure and says so; the
     * stages are linked later, at the draw.
     */
+   int64_t t_translated = timing ? os_time_get_nano() : 0;
    render->fs_cso = make_stage_cso(device, fs, why, why_size);
    if (!render->fs_cso)
       goto fail;
@@ -7399,6 +7600,11 @@ fragment_done:
       ralloc_free(vs);
    if (!render->vs_cso)
       goto fail;
+   if (timing) {
+      int64_t t_compiled = os_time_get_nano();
+      fprintf(stderr, "RWA_TIMING %s: translate %.1f ms, stages %.1f ms\n", fragment_entry ? fragment_entry : "(none)",
+              (t_translated - t_start) / 1e6, (t_compiled - t_translated) / 1e6);
+   }
 
    /*
     * THE BLEND STATE, which until now was the fixed one air_run draws with -- colormask

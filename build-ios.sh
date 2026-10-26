@@ -29,6 +29,6 @@ sed "s#pkg_config_path = .*#pkg_config_path = ['$D/pc-ios']#" "$EAGL_CROSS" > io
 [ -d build-ios ] || meson setup build-ios mesa --cross-file ios.cross --buildtype=release -Dgallium-drivers=softpipe,freedreno -Dfreedreno-kmds=msm \
   -Dgallium-xa=disabled -Dtools= -Dvulkan-drivers= -Dllvm=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= -Dosmesa=false \
   -Dopengl=true -Dgles1=disabled -Dgles2=enabled -Dshared-glapi=enabled -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=disabled \
-  -Dbuild-tests=false -Dglvnd=disabled -Dlmsensors=disabled -Dgallium-opencl=disabled -Dgallium-rusticl=false -Dshader-cache=disabled -Dprefix=/ > setup-ios.log
+  -Dbuild-tests=false -Dglvnd=disabled -Dlmsensors=disabled -Dgallium-opencl=disabled -Dgallium-rusticl=false -Dshader-cache=enabled -Dprefix=/ > setup-ios.log
 ninja -j"${JOBS:-4}" -C build-ios src/gallium/drivers/freedreno/libbgair.dylib
 ls -l build-ios/src/gallium/drivers/freedreno/libbgair.dylib

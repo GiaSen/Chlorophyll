@@ -1,0 +1,63 @@
+diff --git a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
+index 1d35b43..a0a91a1 100644
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -5,6 +5,32 @@
+ 
+ #include "nir_serialize.h"
+ 
++#ifdef __APPLE__
++#include <dlfcn.h>
++#include <mach-o/loader.h>
++
++/* the LC_UUID of the image holding `addr`, as 32 hex digits */
++static bool
++macho_uuid_hex(const void *addr, char out[41])
++{
++   Dl_info di;
++   if (!dladdr(addr, &di) || !di.dli_fbase)
++      return false;
++   const struct mach_header_64 *h = di.dli_fbase;
++   const struct load_command *lc = (const struct load_command *)(h + 1);
++   for (uint32_t i = 0; i < h->ncmds; i++) {
++      if (lc->cmd == LC_UUID) {
++         const struct uuid_command *u = (const struct uuid_command *)lc;
++         for (unsigned k = 0; k < 16; k++)
++            snprintf(out + 2 * k, 3, "%02x", u->uuid[k]);
++         return true;
++      }
++      lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
++   }
++   return false;
++}
++#endif
++
+ #include "ir3_compiler.h"
+ #include "ir3_nir.h"
+ 
+@@ -33,6 +59,17 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+    if (ir3_shader_debug & IR3_DBG_NOCACHE)
+       return;
+ 
++#ifdef __APPLE__
++   /* Bergamota/Chlorophyll: Mach-O has no ELF build-id; the image's LC_UUID is the same thing (new at every link), so a
++    * rebuilt library never reads another build's binaries. The cache folder comes from MESA_SHADER_CACHE_DIR (the
++    * Chlorophyll inject sets one per user). */
++   const char *renderer = fd_dev_name(compiler->dev_id);
++   char timestamp[41] = { 0 };
++   if (!macho_uuid_hex((const void *)ir3_disk_cache_init, timestamp))
++      return;
++   uint64_t driver_flags = ir3_shader_debug_hash_key();
++   compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
++#else
+    const char *renderer = fd_dev_name(compiler->dev_id);
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+@@ -46,6 +83,7 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
++#endif
+ }
+ 
+ void

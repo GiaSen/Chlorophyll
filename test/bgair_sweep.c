@@ -92,7 +92,9 @@ main(int argc, char **argv)
       shape.color_blend_count = 8;
       struct rwa_render_info info;
       memset(&info, 0, sizeof(info));
+      double tc = now_ms();
       struct rwa_render *r = rwa_render_create(dev, NULL, 0, NULL, fn->bc, fn->size, fn->name, &shape, &info, why, sizeof(why));
+      if (getenv("RWA_TIMING")) fprintf(stderr, "RWA_TIMING %s: create %.1f ms\n", fn->name, now_ms() - tc);
       if (!r) {
          for (char *c = why; *c; c++) if (*c == '\n' || *c == '\t') *c = ' ';
          fprintf(out, "%s\trefused\t%s\t0\n", fn->name, why);
