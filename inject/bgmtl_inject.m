@@ -19,7 +19,7 @@
 // (bgl-launch has already checked bgmtl-bb.arm, bgmtl-bb.off and that the previous Metal launch became healthy). Here: the device is
 // registered before QuartzCore creates its render server (which then builds CA::OGL::MetalContext itself), framebuffer and IOSurface
 // compression and deep framebuffers are turned off (Apple GPU layouts this GPU does not write), and a stricter watchdog runs: GPU
-// lost, 3 failed command buffers, or no completed command buffer within 60 s of the first commit write bgmtl-bb.off and _exit(0); launchd
+// lost, 3 failed command buffers, or no completed command buffer within 180 s of the first commit write bgmtl-bb.off and _exit(0); launchd
 // relaunches backboardd and bgl-launch starts it on the ES path. 10 s after the first completed command buffer with no failure the
 // launch is marked healthy in bgmtl-bb.state. "crashtest" in bgmtl-bb.arm crashes on purpose 5 s after registration (guard test).
 #import <Foundation/Foundation.h>
@@ -240,8 +240,10 @@ watchdog_bb(void *arg)
          abort();
       }
       g_watch_t = t;
-      if (!g_completed && g_first_commit_t && t >= g_first_commit_t + 60)
-         trip("no command buffer completed within 60 s of the first commit");
+      // Chlorophyll: 180 s for the FIRST completion -- backboardd's first frame compiles CoreAnimation's shaders and took 40 s
+      // on a quiet boot and over 60 s with another process compiling; a lost GPU still trips at once (above)
+      if (!g_completed && g_first_commit_t && t >= g_first_commit_t + 180)
+         trip("no command buffer completed within 180 s of the first commit");
       if (g_completed && !healthy_at)
          healthy_at = t + 10;
       if (healthy_at && t == healthy_at && g_failures == 0) {

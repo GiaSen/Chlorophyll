@@ -157,6 +157,25 @@ __attribute__((weak)) void bgmtl_note_unimplemented(const char *sel) { (void)sel
 __attribute__((weak)) void bgmtl_note_completed(void) {}   // a command buffer finished without error (the injection's dead-man reset)
 __attribute__((weak)) void bgmtl_note_committed(void) {}   // a command buffer was committed (starts the injection's dead-man clock)
 __attribute__((weak)) void bgmtl_note_line(const char *line) { (void)line; }   // one diagnostic line, logged by the injection dylib
+
+// Chlorophyll: where a slow start goes (/private/var/tmp/bgmtl.perf at process start): pipeline creation (waiting for the context
+// lock, then building), the context lock a commit waits for, and single draws that take long (a shader variant compiled at
+// draw time). Totals are logged every 16 pipelines and any single wait over 100 ms is logged at once.
+static int
+bg_perf_on(void)
+{
+   static int on = -1;
+   if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0;
+   return on;
+}
+static void
+bg_perf_slow(const char *what, const char *name, uint64_t ns)
+{
+   if (!bg_perf_on() || ns < 100000000ull) return;
+   char line[256];
+   snprintf(line, sizeof(line), "slow: %s %s: %.1f ms", what, name ? name : "", ns / 1e6);
+   bgmtl_note_line(line);
+}
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib   // likewise: logged by the injection dylib
 
 @class BGMTLDevice;
@@ -973,10 +992,25 @@ bg_air_slice(NSData *d)
    char why[512] = { 0 };
    struct rwa_render_info info;
    memset(&info, 0, sizeof(info));
+   uint64_t pt0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    bg_lock();
+   uint64_t pt1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    struct rwa_render *r = rwa_render_create(_rwa, vair ? vair.bytes : NULL, vair ? vair.length : 0, vertex ? [[vertex name] UTF8String] : NULL, fair.bytes, fair.length,
                                             [[fragment name] UTF8String], &shape, &info, why, sizeof(why));
    bg_unlock();
+   uint64_t pt2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   if (bg_perf_on()) {
+      static uint64_t n, lockns, buildns;
+      n++; lockns += pt1 - pt0; buildns += pt2 - pt1;
+      bg_perf_slow("pipeline build", [[fragment name] UTF8String], pt2 - pt1);
+      bg_perf_slow("pipeline lock wait", [[fragment name] UTF8String], pt1 - pt0);
+      if (n % 16 == 0) {
+         char line[160];
+         snprintf(line, sizeof(line), "pipelines: %llu built, %.0f ms building, %.0f ms waiting for the lock", (unsigned long long)n,
+                  buildns / 1e6, lockns / 1e6);
+         bgmtl_note_line(line);
+      }
+   }
    if (!r) {
       bg_fail_dump(why, vair, vertex ? [vertex name] : nil, fair, [fragment name], "f");
       return [self bgFail:error with:[NSString stringWithUTF8String:why]];
@@ -1054,47 +1088,108 @@ bg_air_slice(NSData *d)
 // The other ways to ask for a pipeline: with reflection, and asynchronously. They reached _MTLDevice's own implementations,
 // which hand the work to MTLCompilerService for an Apple GPU and come back with nothing usable here (iOS 26's RenderBox, which
 // draws the icons in iconservicesagent: MTLCompilerService at 100 % for minutes, then "precondition failure" and an abort).
-// Built by the methods above; the reflection object is not made (nil), and completion handlers run before returning.
+// Built by the methods above; the reflection object is not made (nil). An asynchronous request is built on a queue of its own
+// and its handler called from there, as Metal does: calling it on the caller's thread deadlocked backboardd's first frame
+// (CoreAnimation asks while holding a lock its handler takes).
+// the first use of each of these creation paths, to the injection's log (which one a client takes)
+static void
+bg_note_path(const char *what)
+{
+   static NSMutableSet *seen;
+   static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
+   os_unfair_lock_lock(&lk);
+   if (!seen) seen = [[NSMutableSet alloc] init];
+   BOOL fresh = ![seen containsObject:@(what)];
+   if (fresh) [seen addObject:@(what)];
+   os_unfair_lock_unlock(&lk);
+   if (fresh) {
+      char line[160];
+      snprintf(line, sizeof(line), "pipeline path: %s", what);
+      bgmtl_note_line(line);
+   }
+}
+
+static dispatch_queue_t
+bg_pipeline_queue(void)
+{
+   static dispatch_queue_t q;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{ q = dispatch_queue_create("chlorophyll.pipelines", DISPATCH_QUEUE_SERIAL); });
+   return q;
+}
+
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor options:(NSUInteger)options
                                 reflection:(id *)reflection error:(NSError **)error
 {
    BG_TRACE("newRenderPipelineState...options:%lu reflection:%s\n", (unsigned long)options, reflection ? "asked" : "-");
-   if (reflection) *reflection = nil;
+   // A caller that wants the reflection (backboardd's CoreAnimation) keeps _MTLDevice's own path, which it has always taken
+   // and which builds the pipeline through the method above; answering it nil hung backboardd's first frame for good.
+   // Without it (RenderBox in iconservicesagent) the pipeline is ours alone.
+   if (reflection) {
+      bg_note_path("newRenderPipelineState...options reflection (asked: _MTLDevice's)");
+      return ((id (*)(struct objc_super *, SEL, id, NSUInteger, id *, NSError **))objc_msgSendSuper)(
+         &(struct objc_super){ self, [_MTLDevice class] }, _cmd, descriptor, options, reflection, error);
+   }
+   bg_note_path("newRenderPipelineState...options reflection (none)");
    return [self newRenderPipelineStateWithDescriptor:descriptor error:error];
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor completionHandler:(void (^)(id, NSError *))handler
 {
+   bg_note_path("newRenderPipelineState...completionHandler");
    BG_TRACE("newRenderPipelineState...completionHandler\n");
-   NSError *err = nil;
-   id p = [self newRenderPipelineStateWithDescriptor:descriptor error:&err];
-   if (handler) handler(p, err);
-   [p release];
+   MTLRenderPipelineDescriptor *d = [descriptor copy];
+   void (^h)(id, NSError *) = [handler copy];
+   [self retain];
+   dispatch_async(bg_pipeline_queue(), ^{
+      NSError *err = nil;
+      id p = [self newRenderPipelineStateWithDescriptor:d error:&err];
+      if (h) h(p, err);
+      [p release]; [d release]; [h release]; [self release];
+   });
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor options:(NSUInteger)options
                            completionHandler:(void (^)(id, id, NSError *))handler
 {
+   bg_note_path("newRenderPipelineState...options completionHandler");
    BG_TRACE("newRenderPipelineState...options:%lu completionHandler\n", (unsigned long)options);
-   NSError *err = nil;
-   id p = [self newRenderPipelineStateWithDescriptor:descriptor error:&err];
-   if (handler) handler(p, nil, err);
-   [p release];
+   MTLRenderPipelineDescriptor *d = [descriptor copy];
+   void (^h)(id, id, NSError *) = [handler copy];
+   [self retain];
+   dispatch_async(bg_pipeline_queue(), ^{
+      NSError *err = nil;
+      id p = [self newRenderPipelineStateWithDescriptor:d error:&err];
+      if (h) h(p, nil, err);
+      [p release]; [d release]; [h release]; [self release];
+   });
 }
 - (void)newComputePipelineStateWithFunction:(id)function completionHandler:(void (^)(id, NSError *))handler
 {
+   bg_note_path("newComputePipelineState...completionHandler");
    BG_TRACE("newComputePipelineState...completionHandler\n");
-   NSError *err = nil;
-   id p = [self newComputePipelineStateWithFunction:function error:&err];
-   if (handler) handler(p, err);
-   [p release];
+   id fn = [function retain];
+   void (^h)(id, NSError *) = [handler copy];
+   [self retain];
+   dispatch_async(bg_pipeline_queue(), ^{
+      NSError *err = nil;
+      id p = [self newComputePipelineStateWithFunction:fn error:&err];
+      if (h) h(p, err);
+      [p release]; [fn release]; [h release]; [self release];
+   });
 }
 - (void)newComputePipelineStateWithFunction:(id)function options:(NSUInteger)options completionHandler:(void (^)(id, id, NSError *))handler
 {
    (void)options;
+   bg_note_path("newComputePipelineState...options completionHandler");
    BG_TRACE("newComputePipelineState...options completionHandler\n");
-   NSError *err = nil;
-   id p = [self newComputePipelineStateWithFunction:function error:&err];
-   if (handler) handler(p, nil, err);
-   [p release];
+   id fn = [function retain];
+   void (^h)(id, id, NSError *) = [handler copy];
+   [self retain];
+   dispatch_async(bg_pipeline_queue(), ^{
+      NSError *err = nil;
+      id p = [self newComputePipelineStateWithFunction:fn error:&err];
+      if (h) h(p, nil, err);
+      [p release]; [fn release]; [h release]; [self release];
+   });
 }
 - (id)newComputePipelineStateWithFunction:(id)function options:(NSUInteger)options reflection:(id *)reflection error:(NSError **)error
 {
@@ -1105,11 +1200,17 @@ bg_air_slice(NSData *d)
 - (void)newComputePipelineStateWithDescriptor:(id)descriptor options:(NSUInteger)options completionHandler:(void (^)(id, id, NSError *))handler
 {
    (void)options;
+   bg_note_path("newComputePipelineState(descriptor)...completionHandler");
    BG_TRACE("newComputePipelineState(descriptor)...completionHandler\n");
-   NSError *err = nil;
-   id p = [self newComputePipelineStateWithDescriptor:descriptor error:&err];
-   if (handler) handler(p, nil, err);
-   [p release];
+   id d = [descriptor copy];
+   void (^h)(id, id, NSError *) = [handler copy];
+   [self retain];
+   dispatch_async(bg_pipeline_queue(), ^{
+      NSError *err = nil;
+      id p = [self newComputePipelineStateWithDescriptor:d error:&err];
+      if (h) h(p, nil, err);
+      [p release]; [d release]; [h release]; [self release];
+   });
 }
 
 @end
@@ -1410,6 +1511,7 @@ bg_linear_written(BGWork *w, NSMutableSet *into)
    _status = 2;   // Committed
    char why[512] = { 0 };
    bg_lock();
+   bg_perf_slow("commit lock wait", getprogname(), clock_gettime_nsec_np(CLOCK_MONOTONIC) - t_begin);
    for (BGWork *w in _work) {
       if (w->kind == BG_WORK_DISPATCH) {
          struct rwa_buffer *bufs[BG_MAX_BINDINGS] = { NULL };
@@ -1484,7 +1586,10 @@ bg_linear_written(BGWork *w, NSMutableSet *into)
          /* A draw the runtime refuses is skipped and logged, and the rest of the command buffer still runs. Failing the
           * whole command buffer left the frame's later passes undrawn (the wallpaper area black or grey, stale wedges in
           * the poster editor) and counted towards the watchdog that switches Metal off. */
-         if (rwa_render_draw(rp->_render, &dr, why, sizeof(why)) != 0)
+         uint64_t dt0 = bg_perf_on() ? clock_gettime_nsec_np(CLOCK_MONOTONIC) : 0;
+         int drc = rwa_render_draw(rp->_render, &dr, why, sizeof(why));
+         if (dt0) bg_perf_slow("draw", rp->_names, clock_gettime_nsec_np(CLOCK_MONOTONIC) - dt0);
+         if (drc != 0)
             BG_LOG("draw skipped: %s\n", why);
          // debugging (/private/var/tmp/bgmtl.dumpatt with the trace): colour 0 right after each blur-chain draw, before any
          // later draw of the pass touches it
