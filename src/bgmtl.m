@@ -132,6 +132,27 @@ bg_trace(void)
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
 
+// /private/var/tmp/bgmtl.xr10log: one line per two-plane XR10 surface wrapped, written back and decoded (surface ID, texture,
+// seed, texels with alpha). Its own switch: the trace's can be hidden by the kernel's sweetdenypath (and traces a lot more).
+static int
+bg_xr10log(void)
+{
+   static int t = -1;
+   static time_t next;
+   time_t now = time(NULL);
+   if (t < 0 || now >= next) { t = access("/private/var/tmp/bgmtl.xr10log", F_OK) == 0; next = now + 1; }
+   return t;
+}
+
+// texels of a BGRA8 image whose alpha is not 0
+static unsigned
+bg_alpha_count(const uint8_t *px, size_t n)
+{
+   unsigned c = 0;
+   for (size_t i = 0; i < n; i++) c += px[4 * i + 3] != 0;
+   return c;
+}
+
 // One Gallium context serves every thread of the process, and QuartzCore commits from several (the render thread and
 // com.apple.coreanimation.asynchronous at once crashed in fd6_draw_vbos). Every call that reaches the context runs under this
 // recursive lock; only the fence wait of the completion queue stays outside (it uses the screen).
@@ -462,6 +483,7 @@ bg_install_fallback(Class c)
    BOOL _surfCopy;       // an IOSurface the GPU could not import (row pitch not 64-aligned): own memory, refreshed from the surface at each use
    BOOL _xr2p;           // ... a two-plane RGB10A8_2P_XR10 one ('b3a8': XR10 RGB + A8 alpha), decoded into BGRA8 at each refresh
    uint32_t _surfSeed;   // the surface's seed at the last refresh (an unchanged surface is not copied again)
+   uint32_t _xrUses;     // rwaTexture calls since the last XR10 decode (bgmtl.xr10log)
    NSUInteger _ncLength;
    void (^_ncDealloc)(void *, NSUInteger);
    BGMTLTexture *_parent;  // a texture view (newTextureViewWith...): the texture whose memory it shows (retained)
@@ -2328,6 +2350,10 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
          _tex = rwa_texture_create([device rwa], &_shape, why2, sizeof(why2));
          if (_tex) { _surfCopy = YES; _xr2p = YES; }
       }
+      if (bg_xr10log() && [d pixelFormat] == 550)
+         bg_log("xr10 wrap surface %u tex %p %ux%u planes %zu usage 0x%lx: %s\n", IOSurfaceGetID((IOSurfaceRef)surface), (void *)self,
+                _shape.width, _shape.height, IOSurfaceGetPlaneCount((IOSurfaceRef)surface), (unsigned long)[d usage],
+                !_tex ? "no texture" : _xr2p ? "own memory, XR10 decode/write-back" : _surfCopy ? "own memory, plain copy" : "imported (plane 0 only)");
       bg_unlock();
       _surface = CFRetain(surface);
       _plane = plane;
@@ -2490,6 +2516,9 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
       IOSurfaceUnlock(sf, 0, NULL);
       _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture: no decode back at the next use
       if (!_surfSeed) _surfSeed = 1;
+      if (bg_xr10log())
+         bg_log("xr10 write-back surface %u tex %p %ux%u seed %u alpha %u\n", IOSurfaceGetID(sf), (void *)self, w, h, _surfSeed,
+                bg_alpha_count(px, (size_t)w * h));
    }
    free(px);
    return YES;
@@ -2501,6 +2530,7 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
    if (_xr2p && _tex && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       uint32_t seed = IOSurfaceGetSeed(sf);
+      _xrUses++;
       if ((seed != _surfSeed || !_surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
          // plane 0: one little-endian word per texel, B bits 0-9, G 10-19, R 20-29 in XR10 (384 = 0.0, 894 = 1.0, the
          // extended range clamped here); plane 1: one alpha byte per texel. Out: BGRA8, the stand-in format of 550.
@@ -2535,6 +2565,10 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
             const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
             if (rwa_texture_write(_tex, 0, 0, o, sz, out, w * 4, why, sizeof(why)) != 0) BG_LOG("XR10 surface refresh: %s\n", why);
             bg_unlock();
+            if (bg_xr10log())
+               bg_log("xr10 decode surface %u tex %p %ux%u seed %u (had %u, used %u times since) alpha %u\n", IOSurfaceGetID(sf),
+                      (void *)self, w, h, seed, _surfSeed, _xrUses - 1, bg_alpha_count(out, (size_t)w * h));
+            _xrUses = 0;
             free(out);
             _surfSeed = seed ? seed : 1;
          }
