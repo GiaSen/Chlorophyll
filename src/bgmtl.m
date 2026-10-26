@@ -115,7 +115,7 @@ bg_fail_dump(const char *reason, NSData *vair, NSString *vname, NSData *air, NSS
    fclose(f);
 }
 
-// BGMTL_TRACE=1 or /private/var/tmp/bgmtl.trace: one line per command buffer, render pass, pipeline build and commit
+// BGMTL_TRACE=1 or /private/var/tmp/bgmtl.trace (or bgmtl.tracing): one line per command buffer, render pass, pipeline build and commit
 // (what a client such as CoreAnimation sends)
 static int
 bg_trace(void)
@@ -127,7 +127,12 @@ bg_trace(void)
    if (env < 0) env = getenv("BGMTL_TRACE") != NULL;
    if (env) return 1;
    time_t now = time(NULL);
-   if (t < 0 || now >= next) { t = access("/private/var/tmp/bgmtl.trace", F_OK) == 0; next = now + 1; }
+   // bgmtl.tracing: the same switch under a name the kernel's sweetdenypath=bgmtl.trace (the guard boot images carry since a
+   // stale trace switch crash-looped backboardd) does not hide. Remove it after use like the other one.
+   if (t < 0 || now >= next) {
+      t = access("/private/var/tmp/bgmtl.trace", F_OK) == 0 || access("/private/var/tmp/bgmtl.tracing", F_OK) == 0;
+      next = now + 1;
+   }
    return t;
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
