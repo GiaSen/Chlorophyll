@@ -15,6 +15,7 @@ Metal API (`MTLDevice`, command buffers, encoders, textures, IOSurfaces) over Me
 | Probes and tests (CoreAnimation renderer harness, kernel tests) | `test/` |
 | Corpus and comparison tools | `tools/`, `results/` |
 | Rendering bugs fixed so far: symptom, cause, fix, how to check | `docs/FIXES.md` |
+| Moving to Turnip (Vulkan), replacing Gallium: build, phone results, port plan | `docs/TURNIP.md`, `turnip/`, `patches/turnip-ios.patch` |
 
 ## Checkout and build
 
