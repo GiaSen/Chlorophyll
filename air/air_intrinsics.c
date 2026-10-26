@@ -496,15 +496,15 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "reverse_bits")) {
       r = nir_bitfield_reverse(&c->b, a[0]);
    } else if (!strcmp(op, "rotate")) {
-      r = nir_urol(&c->b, a[0], nir_u2u32(&c->b, a[1]));
+      r = nir_urol(&c->b, a[0], air_u2u32(&c->b, a[1]));
    } else if (!strcmp(op, "extract_bits")) {
-      r = is_signed ? nir_ibitfield_extract(&c->b, a[0], nir_u2u32(&c->b, a[1]),
-                                            nir_u2u32(&c->b, a[2]))
-                    : nir_ubitfield_extract(&c->b, a[0], nir_u2u32(&c->b, a[1]),
-                                            nir_u2u32(&c->b, a[2]));
+      r = is_signed ? nir_ibitfield_extract(&c->b, a[0], air_u2u32(&c->b, a[1]),
+                                            air_u2u32(&c->b, a[2]))
+                    : nir_ubitfield_extract(&c->b, a[0], air_u2u32(&c->b, a[1]),
+                                            air_u2u32(&c->b, a[2]));
    } else if (!strcmp(op, "insert_bits")) {
-      r = nir_bitfield_insert(&c->b, a[0], a[1], nir_u2u32(&c->b, a[2]),
-                              nir_u2u32(&c->b, a[3]));
+      r = nir_bitfield_insert(&c->b, a[0], a[1], air_u2u32(&c->b, a[2]),
+                              air_u2u32(&c->b, a[3]));
    } else if (!strcmp(op, "dfdx")) {
       r = nir_ddx(&c->b, a[0]);
    } else if (!strcmp(op, "dfdy")) {
@@ -605,7 +605,7 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       else if (src_float)
          r = n->part[1][0] == 's' ? nir_f2iN(&c->b, x, bits) : nir_f2uN(&c->b, x, bits);
       else
-         r = src_signed ? nir_i2iN(&c->b, x, bits) : nir_u2uN(&c->b, x, bits);
+         r = src_signed ? nir_i2iN(&c->b, x, bits) : air_u2uN(&c->b, x, bits);
    } else {
       *handled = false;
    }
@@ -1010,7 +1010,7 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       air_note(c, "air.%s takes its lane number in the SIMD group this "
                   "implementation has, which is not Metal's 32 lanes", n->part[0]);
       air_set(c, &in->base,
-              air_val_ssa(c, nir_shuffle(&c->b, a0, nir_u2u32(&c->b, lane))));
+              air_val_ssa(c, nir_shuffle(&c->b, a0, air_u2u32(&c->b, lane))));
       return true;
    }
 
@@ -1027,8 +1027,8 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       if (!fill || !delta)
          return false;
       nir_def *lane = nir_load_subgroup_invocation(&c->b);
-      nir_def *m = mod ? nir_u2u32(&c->b, mod) : nir_load_subgroup_size(&c->b);
-      nir_def *d = nir_u2u32(&c->b, delta);
+      nir_def *m = mod ? air_u2u32(&c->b, mod) : nir_load_subgroup_size(&c->b);
+      nir_def *d = air_u2u32(&c->b, delta);
       nir_def *pos = nir_umod(&c->b, lane, m);
       nir_def *inside = nir_ult(&c->b, nir_iadd(&c->b, pos, d), m);
       nir_def *from_data = nir_shuffle(&c->b, a0, nir_iadd(&c->b, lane, d));
@@ -1509,7 +1509,7 @@ image_level_index(struct air_ctx *c, const struct air_ptr *tex, nir_def *lod)
       r->level_base = top;
       r->level_slots = AIR_IMAGE_LEVEL_SLOTS;
    }
-   lod = nir_u2u32(&c->b, lod);
+   lod = air_u2u32(&c->b, lod);
    nir_def *slot = nir_iadd_imm(&c->b, nir_umin(&c->b, lod, nir_imm_int(&c->b, r->level_slots)),
                                 (int64_t)r->level_base - 1);
    return nir_bcsel(&c->b, nir_ieq_imm(&c->b, lod, 0), nir_imm_int(&c->b, tex->binding), slot);
@@ -1616,7 +1616,7 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
    (*arg)++;
    bool is_float = air_type_is_float(air_type_scalar(cv->type));
    if (!is_float)
-      coord = nir_u2u32(&c->b, coord);
+      coord = air_u2u32(&c->b, coord);
 
    if (t->is_array) {
       if (in->num_operands <= *arg) {
@@ -1633,7 +1633,7 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
          return NULL;
       }
       layer = is_float ? nir_u2fN(&c->b, layer, coord->bit_size)
-                       : nir_u2u32(&c->b, layer);
+                       : air_u2u32(&c->b, layer);
 
       nir_def *comps[4];
       unsigned nc = MIN2(coord->num_components, 3);
@@ -1736,7 +1736,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
             nir_def *given = air_get_ssa(c, in->operands[arg]);
             if (!given)
                return false;
-            lod = nir_u2u32(&c->b, given);
+            lod = air_u2u32(&c->b, given);
          }
          nir_def *size = query_texture(c, &tex, &t, nir_texop_txs, lod, 0);
          unsigned comp = !strcmp(t.query, "width") ? 0 :
@@ -1750,7 +1750,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
                              n->part[0], comp, size->num_components);
          res = nir_channel(&c->b, size, comp);
       }
-      air_set(c, &in->base, air_val_ssa(c, nir_u2uN(&c->b, res, dest_bits)));
+      air_set(c, &in->base, air_val_ssa(c, air_u2uN(&c->b, res, dest_bits)));
       return true;
    }
 
@@ -1776,7 +1776,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (!index)
          return false;
       nir_image_store(&c->b, index,
-                      nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
+                      nir_pad_vector(&c->b, air_u2u32(&c->b, coord), 4),
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
                       nir_imm_int(&c->b, 0),
                       .image_dim = t.dim, .image_array = t.is_array,
@@ -1794,7 +1794,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *off = air_get_ssa(c, in->operands[arg++]);
       if (!off)
          return false;
-      off = nir_u2u32(&c->b, off);
+      off = air_u2u32(&c->b, off);
       nir_def *comps[4];
       for (unsigned i = 0; i < coord->num_components && i < 4; i++) {
          comps[i] = nir_channel(&c->b, coord, i);
@@ -1809,7 +1809,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       if (!tex_flag(c, in, arg, &extra))
          return false;
       nir_def *res = nir_image_load(&c->b, 4, dest_bits, nir_imm_int(&c->b, tex.binding),
-                                    nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
+                                    nir_pad_vector(&c->b, air_u2u32(&c->b, coord), 4),
                                     nir_imm_int(&c->b, t.is_ms ? extra : 0),
                                     nir_imm_int(&c->b, t.is_ms ? 0 : extra),
                                     .image_dim = t.dim, .image_array = t.is_array,
@@ -1916,7 +1916,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
 
       if (offset && has_offset && !all_zero(offset))
          srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_offset,
-                                       .src = nir_src_for_ssa(nir_u2u32(&c->b, offset)) };
+                                       .src = nir_src_for_ssa(air_u2u32(&c->b, offset)) };
 
       if (t.grad) {
          /* An explicit pair of derivatives of the coordinate, which is what
@@ -1971,7 +1971,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       }
       if (offset && has_offset && !all_zero(offset))
          srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_offset,
-                                       .src = nir_src_for_ssa(nir_u2u32(&c->b, offset)) };
+                                       .src = nir_src_for_ssa(air_u2u32(&c->b, offset)) };
       op = nir_texop_tg4;
    } else {
       /* read: a fetch by integer coordinate, with a level or a sample. Neither
@@ -1981,7 +1981,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *which = air_get_ssa(c, in->operands[arg++]);
       if (!which)
          return false;
-      which = nir_u2u32(&c->b, which);
+      which = air_u2u32(&c->b, which);
       op = t.is_ms ? nir_texop_txf_ms : nir_texop_txf;
       srcs[nsrc++] = (nir_tex_src){
          .src_type = t.is_ms ? nir_tex_src_ms_index : nir_tex_src_lod,
@@ -2074,12 +2074,12 @@ imageblock_op(struct air_ctx *c, const struct air_inst *in, const struct air_nam
    nir_def *pos = air_get_ssa(c, in->operands[first + 1]);
    if (!pos)
       return false;
-   pos = nir_u2u32(&c->b, pos);
+   pos = air_u2u32(&c->b, pos);
    unsigned tx = c->options && c->options->tile_size[0] ? c->options->tile_size[0] : 0;
    unsigned ty = c->options && c->options->tile_size[1] ? c->options->tile_size[1] : 0;
    nir_def *wg = nir_load_workgroup_id(&c->b);
    nir_def *tsz = tx ? nir_imm_ivec2(&c->b, tx, ty) : nir_trim_vector(&c->b, nir_load_workgroup_size(&c->b), 2);
-   nir_def *origin = nir_imul(&c->b, nir_trim_vector(&c->b, nir_u2u32(&c->b, wg), 2), tsz);
+   nir_def *origin = nir_imul(&c->b, nir_trim_vector(&c->b, air_u2u32(&c->b, wg), 2), tsz);
    nir_def *coord = nir_pad_vector(&c->b, nir_iadd(&c->b, nir_trim_vector(&c->b, pos, 2), origin), 4);
    unsigned bits = m->bits;
    nir_alu_type ty_f = nir_type_float | bits;

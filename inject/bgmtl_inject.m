@@ -396,6 +396,13 @@ bgmtl_inject_init(void)
       for (const char *const *a = kAllow; *a; a++)
          if (bid && !strcmp([bid UTF8String], *a)) allowed = 1;
       if (!allowed) return;                                   // gate 1: silent in every other process
+      // /private/var/tmp/bgmtl.mesalog: Mesa's own log (ir3 compile errors, with the failing shader printed) to a file of
+      // its own -- these processes' stderr goes nowhere
+      if (exists("/private/var/tmp/bgmtl.mesalog") && !getenv("MESA_LOG_FILE")) {
+         char lf[96];
+         snprintf(lf, sizeof(lf), "/private/var/tmp/mesa-%d.log", getpid());
+         setenv("MESA_LOG_FILE", lf, 1);
+      }
       snprintf(g_state, sizeof(g_state), "%s.%s", F_STATE, [bid UTF8String]);
       snprintf(g_off, sizeof(g_off), "%s.%s", F_OFF, [bid UTF8String]);
       if (exists(F_OFF) || exists(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }

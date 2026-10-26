@@ -658,6 +658,46 @@ main(int argc, char **argv)
             got[0], got[1], ok ? "" : ": ", ok ? "" : why2);
       printf("  RGB10A2Unorm clear: red 0x%08x blue 0x%08x (want 0xC00003FF 0x3FF00000)%s%s\n", got[0], got[1], ok ? "" : ": ", ok ? "" : why2);
    }
+   { // bg_ptr_walk: a pointer phi carried around a loop (in[i] = i, 4 terms 8 apart: out[g] = 4g + 48)
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_ptr_walk", &info);
+      enum { G = 64, T = 4 };
+      struct rwa_buffer *in = c ? buf((G + 8 * T) * 4) : NULL, *out = in ? buf(G * 4) : NULL, *n = out ? buf(16) : NULL;
+      bool ok = n != NULL;
+      unsigned bad = 0;
+      if (ok) {
+         float *pi = rwa_buffer_map(in);
+         for (unsigned i = 0; i < G + 8 * T; i++) pi[i] = (float)i;
+         memset(rwa_buffer_map(out), 0, G * 4);
+         *(uint32_t *)rwa_buffer_map(n) = T;
+         struct rwa_buffer *bufs[3] = { in, out, n };
+         ok = dispatch(c, bufs, 3, G / 32, 32, "bg_ptr_walk");
+         const float *po = rwa_buffer_map(out);
+         for (unsigned g = 0; ok && g < G; g++) if (po[g] != 4.0f * g + 48.0f) bad++;
+      }
+      CHECK(ok && !bad, "bg_ptr_walk: %u wrong of %u", bad, (unsigned)G);
+      printf("  bg_ptr_walk (loop-carried pointer): %u wrong of %u\n", bad, (unsigned)G);
+   }
+   { // bg_ptr_select_walk: start chosen per thread, then walked (in[i] = i, 4 terms 8 apart): even g 4g + 48, odd g 4(g + 1) + 48
+      struct rwa_compute_info info = { 0 };
+      struct rwa_compute *c = pipeline("bg_ptr_select_walk", &info);
+      enum { G = 64, T = 4 };
+      struct rwa_buffer *in = c ? buf((G + 1 + 8 * T) * 4) : NULL, *out = in ? buf(G * 4) : NULL, *n = out ? buf(16) : NULL;
+      bool ok = n != NULL;
+      unsigned bad = 0;
+      if (ok) {
+         float *pi = rwa_buffer_map(in);
+         for (unsigned i = 0; i < G + 1 + 8 * T; i++) pi[i] = (float)i;
+         memset(rwa_buffer_map(out), 0, G * 4);
+         *(uint32_t *)rwa_buffer_map(n) = T;
+         struct rwa_buffer *bufs[3] = { in, out, n };
+         ok = dispatch(c, bufs, 3, G / 32, 32, "bg_ptr_select_walk");
+         const float *po = rwa_buffer_map(out);
+         for (unsigned g = 0; ok && g < G; g++) if (po[g] != 4.0f * (g + (g & 1)) + 48.0f) bad++;
+      }
+      CHECK(ok && !bad, "bg_ptr_select_walk: %u wrong of %u", bad, (unsigned)G);
+      printf("  bg_ptr_select_walk: %u wrong of %u\n", bad, (unsigned)G);
+   }
    printf("== result: %d checks passed, %d failed\n", pass, fail);
    rwa_device_close(dev);
    return fail ? 1 : 0;

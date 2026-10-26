@@ -14,6 +14,20 @@
 #include "nir.h"
 #include "nir_builder.h"
 
+/* Chlorophyll: an unsigned widening or narrowing of an integer that may be a BOOLEAN. LLVM's i1 is NIR's 1-bit bool, which
+ * u2u cannot take: ir3 rejects the conversion ("invalid src bit size: 1", and before the ir3 patch spun its compile thread
+ * forever). A bool zero-extends as b2i. iOS 26's RenderBox indexes two-element arrays and vectors with an i1. */
+static inline nir_def *
+air_u2uN(nir_builder *b, nir_def *d, unsigned bits)
+{
+   return d->bit_size == 1 ? nir_b2iN(b, d, bits) : nir_u2uN(b, d, bits);
+}
+static inline nir_def *
+air_u2u32(nir_builder *b, nir_def *d)
+{
+   return air_u2uN(b, d, 32);
+}
+
 /* Where a pointer points. AIR's address spaces say which kind of memory;
  * which buffer, and the byte offset into it, the translator tracks itself
  * (docs/air.md section 3): no pointer in the corpus is ever stored to

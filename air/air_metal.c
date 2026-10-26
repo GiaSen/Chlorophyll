@@ -2572,7 +2572,9 @@ sampler_state_from_metal(const struct rwa_sampler_state *st, struct pipe_sampler
          return false;
       }
    }
-   if (st->min_filter > RWA_FILTER_LINEAR || st->mag_filter > RWA_FILTER_LINEAR) {
+   /* Chlorophyll: filter 2, which iOS 26's RenderBox asks for in a sampler descriptor (bicubic), is drawn as linear, as the
+    * translator already does for a shader's own bicubic sampler; refusing it made RenderBox abort ("precondition failure") */
+   if (st->min_filter > RWA_FILTER_LINEAR + 1 || st->mag_filter > RWA_FILTER_LINEAR + 1) {
       say(why, why_size, "filters %u and %u: MTLSamplerMinMagFilter is nearest or linear",
           st->min_filter, st->mag_filter);
       return false;
@@ -2611,9 +2613,9 @@ sampler_state_from_metal(const struct rwa_sampler_state *st, struct pipe_sampler
       .wrap_s = wrap[st->address[0]],
       .wrap_t = wrap[st->address[1]],
       .wrap_r = wrap[st->address[2]],
-      .min_img_filter = st->min_filter == RWA_FILTER_LINEAR ? PIPE_TEX_FILTER_LINEAR
+      .min_img_filter = st->min_filter >= RWA_FILTER_LINEAR ? PIPE_TEX_FILTER_LINEAR
                                                             : PIPE_TEX_FILTER_NEAREST,
-      .mag_img_filter = st->mag_filter == RWA_FILTER_LINEAR ? PIPE_TEX_FILTER_LINEAR
+      .mag_img_filter = st->mag_filter >= RWA_FILTER_LINEAR ? PIPE_TEX_FILTER_LINEAR
                                                             : PIPE_TEX_FILTER_NEAREST,
       .min_mip_filter = mip[st->mip_filter],
       /* Metal decides at the SAMPLE CALL whether a comparison happens

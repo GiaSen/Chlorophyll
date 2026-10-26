@@ -157,6 +157,31 @@ struct air_texture_phi {
    struct air_val *first;
 };
 
+/* Chlorophyll: a phi of pointers into ONE buffer at offsets that differ -- a loop walking a buffer (`p = phi [base], [p +
+ * stride]`, iOS 26's RenderBox and IconRendering) or two paths reaching different elements. The resource is decided
+ * while translating as always; only the byte offset is a value, carried in a 32-bit register stored at the end of each
+ * predecessor (translate_body's phi stores, key in|4) like a number's. */
+struct air_ptr_phi {
+   nir_def *reg;
+   struct air_val *base;   /* which resource: class, binding, is_image, pointee */
+};
+
+/* the same resource, whatever the offset */
+static bool
+same_resource(const struct air_val *a, const struct air_val *b)
+{
+   return a->kind == AIR_VAL_PTR && b->kind == AIR_VAL_PTR && a->ptr.class == b->ptr.class &&
+          a->ptr.binding == b->ptr.binding && a->ptr.is_image == b->ptr.is_image;
+}
+
+/* a pointer class whose offset is a real byte offset into memory the shader loads from, so it can live in a register */
+static bool
+offset_is_a_value(enum air_ptr_class cl)
+{
+   return cl == AIR_PTR_UBO || cl == AIR_PTR_SSBO || cl == AIR_PTR_SHARED || cl == AIR_PTR_SCRATCH ||
+          cl == AIR_PTR_CONSTANT_DATA;
+}
+
 static struct air_val *
 air_val_agg(struct air_ctx *c, unsigned n)
 {
@@ -1020,7 +1045,7 @@ fit(struct air_ctx *c, nir_def *def, const struct air_type *t)
    if (def->bit_size != bits)
       def = air_type_is_float(air_type_scalar(t))
                ? nir_u2fN(&c->b, def, bits)
-               : nir_u2uN(&c->b, def, bits);
+               : air_u2uN(&c->b, def, bits);
    return def;
 }
 
@@ -1373,7 +1398,7 @@ translate_vertex_attribute(struct air_ctx *c, const struct air_md *node, unsigne
        * 8- or 16-bit component to 32 bits is the format's business, and the
        * format is the MTLVertexDescriptor's.
        */
-      v = is_float ? nir_f2f16(&c->b, v) : nir_u2uN(&c->b, v, bits);
+      v = is_float ? nir_f2f16(&c->b, v) : air_u2uN(&c->b, v, bits);
    }
    add_vertex_attribute(c, node, index, comps, bits, is_float, true, driver_location);
 
@@ -2365,7 +2390,7 @@ gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
       nir_def *first = air_get_ssa(c, in->operands[1]);
       if (!first)
          return false;
-      p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, first), stride));
+      p = air_ptr_add(c, p, nir_imul_imm(&c->b, air_u2u32(&c->b, first), stride));
    }
 
    for (unsigned i = 2; i < in->num_operands; i++) {
@@ -2386,7 +2411,7 @@ gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
       } else if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_VECTOR) {
          uint64_t es = t->kind == AIR_TYPE_ARRAY ? air_type_alloc_size(c->m, t->elem)
                                                  : MAX2(air_type_bit_size(t->elem) / 8, 1);
-         p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, idx), es));
+         p = air_ptr_add(c, p, nir_imul_imm(&c->b, air_u2u32(&c->b, idx), es));
          t = t->elem;
       } else {
          return air_error(c, "instruction: getelementptr into a scalar");
@@ -2416,7 +2441,7 @@ translate_gep(struct air_ctx *c, const struct air_inst *in)
          nir_def *d = air_get_ssa(c, ix);
          if (!d)
             return false;
-         ev->def = base->num_elems ? nir_iadd_imm(&c->b, nir_u2u32(&c->b, d), base->num_elems) : d;
+         ev->def = base->num_elems ? nir_iadd_imm(&c->b, air_u2u32(&c->b, d), base->num_elems) : d;
       }
       air_set(c, &in->base, ev);
       return true;
@@ -2471,9 +2496,9 @@ translate_binop(struct air_ctx *c, const struct air_inst *in)
    case AIR_BINOP_SDIV: res = is_float ? nir_fdiv(&c->b, x, y) : nir_idiv(&c->b, x, y); break;
    case AIR_BINOP_UREM: res = is_float ? nir_frem(&c->b, x, y) : nir_umod(&c->b, x, y); break;
    case AIR_BINOP_SREM: res = is_float ? nir_frem(&c->b, x, y) : nir_irem(&c->b, x, y); break;
-   case AIR_BINOP_SHL: res = nir_ishl(&c->b, x, nir_u2u32(&c->b, y)); break;
-   case AIR_BINOP_LSHR: res = nir_ushr(&c->b, x, nir_u2u32(&c->b, y)); break;
-   case AIR_BINOP_ASHR: res = nir_ishr(&c->b, x, nir_u2u32(&c->b, y)); break;
+   case AIR_BINOP_SHL: res = nir_ishl(&c->b, x, air_u2u32(&c->b, y)); break;
+   case AIR_BINOP_LSHR: res = nir_ushr(&c->b, x, air_u2u32(&c->b, y)); break;
+   case AIR_BINOP_ASHR: res = nir_ishr(&c->b, x, air_u2u32(&c->b, y)); break;
    case AIR_BINOP_AND: res = nir_iand(&c->b, x, y); break;
    case AIR_BINOP_OR: res = nir_ior(&c->b, x, y); break;
    case AIR_BINOP_XOR: res = nir_ixor(&c->b, x, y); break;
@@ -2513,10 +2538,10 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
    nir_def *res;
    switch (in->sub) {
    case AIR_CAST_TRUNC:
-      res = bits == 1 ? nir_i2b(&c->b, nir_iand_imm(&c->b, x, 1)) : nir_u2uN(&c->b, x, bits);
+      res = bits == 1 ? nir_i2b(&c->b, nir_iand_imm(&c->b, x, 1)) : air_u2uN(&c->b, x, bits);
       break;
    case AIR_CAST_ZEXT:
-      res = x->bit_size == 1 ? nir_b2iN(&c->b, x, bits) : nir_u2uN(&c->b, x, bits);
+      res = x->bit_size == 1 ? nir_b2iN(&c->b, x, bits) : air_u2uN(&c->b, x, bits);
       break;
    case AIR_CAST_SEXT:
       res = x->bit_size == 1 ? nir_ineg(&c->b, nir_b2iN(&c->b, x, bits))
@@ -2748,7 +2773,7 @@ select_by_index(struct air_ctx *c, nir_def *idx, struct air_val **r, const unsig
    for (int k = (int)n - 2; k >= 0; k--) {
       if (!r[k] || r[k]->kind != AIR_VAL_SSA)
          continue;
-      nir_def *cond = nir_ieq_imm(&c->b, nir_u2u32(&c->b, idx), which[k]);
+      nir_def *cond = nir_ieq_imm(&c->b, air_u2u32(&c->b, idx), which[k]);
       acc = nir_bcsel(&c->b, cond, r[k]->def, acc);
    }
    return air_val_ssa(c, acc);
@@ -2816,6 +2841,20 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             return false;
          if (pc->num_components != 1)
             return air_error(c, "instruction: a vector select between pointers");
+         /* Chlorophyll: two places in ONE buffer are one pointer whose offset is chosen, not a choice of pointers: a plain
+          * pointer then, which a phi can carry (struct air_ptr_phi; iOS 26's RenderBox selects between elements and loops
+          * over the result) and a load reads once */
+         if (pa->kind == AIR_VAL_PTR && same_resource(pa, pb) && offset_is_a_value(pa->ptr.class)) {
+            nir_def *oa = pa->ptr.offset ? pa->ptr.offset : nir_imm_int(&c->b, 0);
+            nir_def *ob = pb->ptr.offset ? pb->ptr.offset : nir_imm_int(&c->b, 0);
+            if (oa->bit_size != 32) oa = air_u2u32(&c->b, oa);
+            if (ob->bit_size != 32) ob = air_u2u32(&c->b, ob);
+            struct air_val *v = rzalloc(c->mem_ctx, struct air_val);
+            *v = *pa;
+            v->ptr.offset = nir_bcsel(&c->b, pc, oa, ob);
+            air_set(c, &in->base, v);
+            return true;
+         }
          air_set(c, &in->base, air_val_ptr_select(c, pc, pa, pb));
          return true;
       }
@@ -2834,7 +2873,7 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[1]);
       if (!v || !i)
          return false;
-      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v, nir_u2u32(&c->b, i))));
+      air_set(c, &in->base, air_val_ssa(c, nir_vector_extract(&c->b, v, air_u2u32(&c->b, i))));
       return true;
    }
    case AIR_OP_INSERTELT: {
@@ -2846,7 +2885,7 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       if (!nir_src_is_const(nir_src_for_ssa(i))) {
          /* Bergamota: a run-time index (CoreAnimation's poster-editor colour-matrix shaders): nir_vector_insert
           * picks each component with a bcsel on index == k (the lock-screen Customize aborted backboardd) */
-         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x, nir_u2u32(&c->b, i))));
+         air_set(c, &in->base, air_val_ssa(c, nir_vector_insert(&c->b, v, x, air_u2u32(&c->b, i))));
          return true;
       }
       air_set(c, &in->base,
@@ -4383,6 +4422,7 @@ static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable, const int *fold, unsigned phi_block)
 {
    struct air_val *first = NULL, *second = NULL;
+   bool loop_edge = false, offsets_differ = false;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
          continue;
@@ -4390,10 +4430,12 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
       if (fold[in->targets[k]->index] >= 0 && (unsigned)fold[in->targets[k]->index] != phi_block)
          continue;
       struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
-      if (!e)
-         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
-                             "a loop edge, so which resource it is depends on the "
-                             "iteration");
+      if (!e) {
+         /* Chlorophyll: over a loop edge, not translated yet; the pointer it brings is checked against the others when
+          * its store is made (translate_body), and only its offset is carried (struct air_ptr_phi) */
+         loop_edge = true;
+         continue;
+      }
       struct air_val *v = e->data;
       /* Chlorophyll: a texture chosen at run time is an operand too (its choice nests) */
       if (!v || (v->kind != AIR_VAL_PTR && !is_texture_val(v, texture_val_is_image(v))))
@@ -4407,12 +4449,30 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
          continue;
       else if (!second && is_texture_choice(first, v))
          second = v;
+      else if (same_resource(first, v) && offset_is_a_value(first->ptr.class))
+         offsets_differ = true;   /* Chlorophyll: one buffer, two offsets: the offset is carried */
       else
          return air_error(c, "instruction: a phi between pointers that name different "
                              "places, which would have to be chosen at run time");
    }
    if (!first)
       return air_error(c, "instruction: a phi of pointers with no reachable operand");
+   if (loop_edge || offsets_differ) {
+      if (second || first->kind != AIR_VAL_PTR || !offset_is_a_value(first->ptr.class))
+         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
+                             "a loop edge, so which resource it is depends on the "
+                             "iteration");
+      nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
+      struct air_ptr_phi *pp = rzalloc(c->mem_ctx, struct air_ptr_phi);
+      pp->reg = nir_decl_reg(&entry, 1, 32, 0);
+      pp->base = first;
+      _mesa_hash_table_insert(c->phi_regs, (void *)((uintptr_t)in | 4), pp);
+      struct air_val *v = rzalloc(c->mem_ctx, struct air_val);
+      *v = *first;
+      v->ptr.offset = nir_load_reg(&c->b, pp->reg);
+      air_set(c, &in->base, v);
+      return true;
+   }
    if (second) {
       /* Chlorophyll: two textures (Mercury's space::rasterizeBackgroundFragment samples
        * goboTexture or secondaryGoboTexture). Which edge came in is a 1-bit register,
@@ -4653,6 +4713,29 @@ translate_body(struct air_ctx *c)
             continue;
          struct hash_entry *rea = _mesa_hash_table_search(c->phi_regs, (void *)((uintptr_t)in | 1));
          struct hash_entry *re = rea ? NULL : _mesa_hash_table_search(c->phi_regs, in);
+         struct hash_entry *rp = _mesa_hash_table_search(c->phi_regs, (void *)((uintptr_t)in | 4));
+         if (rp) {
+            /* Chlorophyll: a phi of pointers into one buffer (resolve_pointer_phi): each edge stores its offset */
+            const struct air_ptr_phi *pp = rp->data;
+            for (unsigned k = 0; k < in->num_operands; k++) {
+               struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
+               if (!ce)
+                  continue;
+               if (fold[in->targets[k]->index] >= 0 && (unsigned)fold[in->targets[k]->index] != bi)
+                  continue;
+               struct air_val *av = air_get(c, in->operands[k]);
+               if (!av || !same_resource(pp->base, av))
+                  return air_error(c, "instruction: a phi of pointers whose operand over a loop edge names "
+                                      "another resource than the others, which would have to be chosen at run time");
+               c->b.cursor = *(nir_cursor *)ce->data;
+               nir_def *off = av->ptr.offset ? av->ptr.offset : nir_imm_int(&c->b, 0);
+               if (off->bit_size != 32)
+                  off = air_u2u32(&c->b, off);
+               nir_store_reg(&c->b, off, pp->reg);
+               *(nir_cursor *)ce->data = c->b.cursor;
+            }
+            continue;
+         }
          struct hash_entry *rt = _mesa_hash_table_search(c->phi_regs, (void *)((uintptr_t)in | 2));
          if (rt) {
             /* Chlorophyll: a phi of two textures (resolve_pointer_phi): which one came in */

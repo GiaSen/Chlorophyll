@@ -132,3 +132,31 @@ kernel void bg_is_null(texture2d<float> a [[texture(0)]], texture2d<float> b [[t
 {
    if (gid == 0) { out[0] = is_null_texture(a) ? 1 : 0; out[1] = is_null_texture(b) ? 1 : 0; }
 }
+
+// a pointer walking a buffer in a loop (a loop-carried pointer phi: iOS 26's RenderBox and IconRendering shaders): out[g] = sum of
+// in[g], in[g+8], in[g+16], ... n terms
+kernel void bg_ptr_walk(device const float *in [[buffer(0)]], device float *out [[buffer(1)]], constant uint &n [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]])
+{
+   device const float *p = in + gid;
+   float s = 0.0f;
+   for (uint i = 0; i < n; i++) {
+      s += *p;
+      p += 8;
+   }
+   out[gid] = s;
+}
+
+// a pointer chosen between two elements of one buffer, then walked in a loop (select feeding a loop-carried pointer phi):
+// out[g] = sum of 4 terms 8 apart, starting at in[g] for even g and at in[g + 1] for odd g
+kernel void bg_ptr_select_walk(device const float *in [[buffer(0)]], device float *out [[buffer(1)]], constant uint &n [[buffer(2)]],
+                               uint gid [[thread_position_in_grid]])
+{
+   device const float *p = (gid & 1) ? in + gid + 1 : in + gid;
+   float s = 0.0f;
+   for (uint i = 0; i < n; i++) {
+      s += *p;
+      p += 8;
+   }
+   out[gid] = s;
+}

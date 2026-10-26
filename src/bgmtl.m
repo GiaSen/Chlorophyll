@@ -2231,7 +2231,10 @@ bg_bytes_slice(BGMTLDevice *dev, const void *bytes, NSUInteger length, NSUIntege
 - (NSUInteger)usage { return _shape.usage; }
 - (BOOL)isFramebufferOnly { return NO; }
 - (id)parentTexture { return _parent; }
-- (id)buffer { return nil; }
+// a texture over a buffer (newTextureWithDescriptor:offset:bytesPerRow: / newLinearTexture...): which buffer, where, how laid out
+- (id)buffer { return _linSrc; }
+- (NSUInteger)bufferOffset { return _linOff; }
+- (NSUInteger)bufferBytesPerRow { return _linBpr; }
 - (NSUInteger)storageMode { return 0; }
 - (NSUInteger)cpuCacheMode { return 0; }
 - (NSUInteger)resourceOptions { return 0; }
