@@ -332,6 +332,10 @@ bb_init(void)
       }
       fclose(fd);
    }
+   // bgmtl.m keys its compositor-only paths on BGMTL_BB, which bgl-launch set; with bgmtl-bb.direct nothing did, so backboardd
+   // cleaned the CPU cache over its 828x1792 framebuffer and lock/unlocked it after every command buffer -- inside the frame, as
+   // commits are synchronous -- for a surface only the GPU and the display touch (half its CPU samples during swipes, 2026-10-26)
+   setenv("BGMTL_BB", "1", 1);
    // Apple GPU layouts this GPU does not write: compressed framebuffers and IOSurfaces, deep (10-bit) framebuffers
    setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
    // A/B switch: "scheduled" only once the GPU finished, as before 0229/0240 (see -commit in src/bgmtl.m)
