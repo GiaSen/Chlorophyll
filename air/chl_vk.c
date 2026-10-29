@@ -74,7 +74,7 @@ say(char *why, size_t why_size, const char *fmt, ...)
    X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
    X(vkCreateComputePipelines) X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
-   X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) \
+   X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkResetCommandPool) X(vkAllocateCommandBuffers) X(vkFreeCommandBuffers) \
    X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
    X(vkCmdPipelineBarrier) X(vkCmdBindPipeline) X(vkCmdPushDescriptorSetKHR) X(vkCmdPushConstants) X(vkCmdDispatch) \
    X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCmdCopyImage) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
@@ -510,6 +510,10 @@ pro_reap(struct chl_device *d, bool wait)
          continue;
       d->vk.vkDestroyFence(d->dev, d->pro_inflight[i].fence, NULL);
       d->pro_inflight[i].fence = VK_NULL_HANDLE;
+      /* the prologue's command buffer too: each one holds Turnip command-stream BOs, and texture uploads open one every frame
+       * (backboardd ran out of the kernel's 4096 BO handles within minutes of UI use, Mi 8 2026-10-29) */
+      d->vk.vkFreeCommandBuffers(d->dev, d->pro_pool, 1, &d->pro_inflight[i].cb);
+      d->pro_inflight[i].cb = VK_NULL_HANDLE;
       for (unsigned k = 0; k < d->pro_inflight[i].n_held; k++)
          obj_release(d->pro_inflight[i].held[k]);
       free(d->pro_inflight[i].held);
