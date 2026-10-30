@@ -2113,16 +2113,20 @@ static int
 flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_layout *l, char *why, size_t why_size)
 {
    struct chl_device *d = cb->dev;
-   VkWriteDescriptorSet w[32];
-   VkDescriptorBufferInfo bi[32];
-   VkDescriptorImageInfo ii[32];
+   VkWriteDescriptorSet w[48];
+   VkDescriptorBufferInfo bi[48];
+   VkDescriptorImageInfo ii[48];
    uint32_t push[64] = { 0 };
    unsigned nw = 0;
    for (unsigned i = 0; i < AIR_VK_MAX_BINDINGS; i++) {
-      if (!l->bindings.type[i] || l->immutable[i])
+      /* An immutable sampler is written too (the handle below is ignored): Turnip reads it from the push set, keeps that set in a
+       * host buffer it never clears and copies the layout's sampler in only when the binding is written. Unwritten, the slot held
+       * stale heap words: a constexpr sampler with a random filter and wrap, whose BCOLOR sent the texture pipe to a wild address
+       * (TPL1 border colour base + BCOLOR * 0x80, the SMMU faults of RenderBox's fi* pipelines). */
+      if (!l->bindings.type[i])
          continue;
-      if (nw == 32) {
-         say(why, why_size, "more than 32 resources in one draw or dispatch");
+      if (nw == 48) {
+         say(why, why_size, "more than 48 resources in one draw or dispatch");
          return -1;
       }
       unsigned stage = i / AIR_VK_STAGE_BINDINGS, local = i % AIR_VK_STAGE_BINDINGS;
