@@ -245,6 +245,12 @@ int chl_copy_texture_to_buffer(struct chl_cmdbuf *cb, struct chl_texture *src, u
                                size_t bytes_per_row, size_t bytes_per_image);
 int chl_generate_mipmaps(struct chl_cmdbuf *cb, struct chl_texture *tex);
 
+/* Encode profile (bgmtl.encprof): where encoding goes, mach_absolute_time ticks and calls, all threads; zeros unless `on`. */
+enum { CHL_P_BEGIN, CHL_P_END, CHL_P_PIPE, CHL_P_STATE, CHL_P_VB, CHL_P_FLUSH, CHL_P_PUSHD, CHL_P_PUSHC, CHL_P_DRAW, CHL_P_BYTES,
+       CHL_P_CMDBUF, CHL_P_N };
+struct chl_prof { bool on; uint64_t t[CHL_P_N], n[CHL_P_N]; };
+extern struct chl_prof chl_prof;
+
 #pragma GCC visibility pop
 
 #ifdef __cplusplus

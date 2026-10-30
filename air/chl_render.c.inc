@@ -309,6 +309,7 @@ attachment_info(struct chl_cmdbuf *cb, const struct chl_attachment *a, VkRenderi
 int
 chl_render_begin(struct chl_cmdbuf *cb, const struct chl_render_pass *pass, char *why, size_t why_size)
 {
+   P_START(pt);
    struct chl_device *d = cb->dev;
    if (cb->enc == ENC_RENDER)
       chl_render_end(cb);
@@ -361,6 +362,7 @@ chl_render_begin(struct chl_cmdbuf *cb, const struct chl_render_pass *pass, char
    apply_depth_stencil(cb);
    d->vk.vkCmdSetDepthBiasEnable(cb->cb, VK_FALSE);
    d->vk.vkCmdSetPrimitiveRestartEnable(cb->cb, VK_FALSE);
+   P_MARK(pt, CHL_P_BEGIN);
    return 0;
 }
 
@@ -369,9 +371,11 @@ chl_set_render_pipeline(struct chl_cmdbuf *cb, struct chl_render_pipeline *p)
 {
    if (cb->rp == p)
       return;
+   P_START(pt);
    cb->rp = p;
    cb_hold(cb, &p->o);
    cb->dev->vk.vkCmdBindPipeline(cb->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->vk);
+   P_MARK(pt, CHL_P_PIPE);
 }
 
 void
@@ -435,6 +439,7 @@ chl_set_blend_color(struct chl_cmdbuf *cb, const float rgba[4])
 static int
 draw_prologue(struct chl_cmdbuf *cb, unsigned mtl_primitive, bool indexed, char *why, size_t why_size)
 {
+   P_START(pt);
    struct chl_device *d = cb->dev;
    struct chl_render_pipeline *p = cb->rp;
    if (cb->enc != ENC_RENDER || !p) {
@@ -466,6 +471,7 @@ draw_prologue(struct chl_cmdbuf *cb, unsigned mtl_primitive, bool indexed, char 
       VkDeviceSize off = cb->bind[0].off[b];
       d->vk.vkCmdBindVertexBuffers(cb->cb, b, 1, &buf->vk, &off);
    }
+   P_MARK(pt, CHL_P_VB);
    return flush_bindings(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, &p->layout, why, why_size);
 }
 
@@ -477,7 +483,9 @@ chl_draw(struct chl_cmdbuf *cb, unsigned mtl_primitive, unsigned vertex_start, u
       return 0;
    if (draw_prologue(cb, mtl_primitive, false, why, why_size) != 0)
       return -1;
+   P_START(pt);
    cb->dev->vk.vkCmdDraw(cb->cb, vertex_count, instances ? instances : 1, vertex_start, base_instance);
+   P_MARK(pt, CHL_P_DRAW);
    return 0;
 }
 
@@ -494,9 +502,11 @@ chl_draw_indexed(struct chl_cmdbuf *cb, unsigned mtl_primitive, unsigned index_c
    }
    if (draw_prologue(cb, mtl_primitive, true, why, why_size) != 0)
       return -1;
+   P_START(pt);
    cb_hold(cb, &index_buffer->o);
    cb->dev->vk.vkCmdBindIndexBuffer(cb->cb, index_buffer->vk, index_offset, mtl_index_type ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
    cb->dev->vk.vkCmdDrawIndexed(cb->cb, index_count, instances ? instances : 1, 0, base_vertex, base_instance);
+   P_MARK(pt, CHL_P_DRAW);
    return 0;
 }
 
@@ -505,8 +515,10 @@ chl_render_end(struct chl_cmdbuf *cb)
 {
    if (cb->enc != ENC_RENDER)
       return;
+   P_START(pt);
    cb->dev->vk.vkCmdEndRendering(cb->cb);
    full_barrier(cb->dev, cb->cb);
    cb->enc = ENC_NONE;
    cb->rp = NULL;
+   P_MARK(pt, CHL_P_END);
 }

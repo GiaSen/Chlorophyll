@@ -30,6 +30,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -533,6 +534,7 @@ bg_install_fallback(Class c)
    NSMutableSet *_noCopy;                                  // no-copy buffers it binds (refreshed at commit)
    unsigned _draws;
    uint64_t _t_first;                                      // the first encoder (encode time for bgmtl.perf)
+   uint64_t _cpu_first;                                    // this thread's CPU time then (bgmtl.encprof)
    uint64_t _t_flushed;                                    // when the commit had submitted (bgmtl.perf)
    pthread_t _sched_thread;                                // the committing thread while it runs the scheduled handlers
 }
@@ -578,6 +580,8 @@ bg_install_fallback(Class c)
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
    unsigned long _linSeq; // the command buffer (g_bg_cb_seq) it was last filled from its buffer for: once per command buffer
+   uint64_t _linHash;     // the buffer's bytes when last filled: unchanged bytes are not uploaded again
+   BOOL _linHashed;
    int _linPending;       // command buffers in flight that write it: no fill from the buffer until they wrote back
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    BOOL _surfCopy;       // an IOSurface the GPU could not import: own memory, refreshed from the surface at each use
@@ -1531,7 +1535,14 @@ bg_return_slot(BGMTLCommandBuffer *cb, BGMTLCommandQueue *queue)
    [super dealloc];
 }
 - (id)device { return [_queue device]; }
-- (struct chl_cmdbuf *)bgChl { if (!_t_first) _t_first = clock_gettime_nsec_np(CLOCK_MONOTONIC); return _ccb; }
+- (struct chl_cmdbuf *)bgChl
+{
+   if (!_t_first) {
+      _t_first = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+      if (chl_prof.on) _cpu_first = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+   }
+   return _ccb;
+}
 - (NSInteger)status { return _status; }
 - (NSError *)error { return _error; }
 - (void)enqueue {}
@@ -1578,6 +1589,97 @@ bg_return_slot(BGMTLCommandBuffer *cb, BGMTLCommandQueue *queue)
    [_noCopy addObject:b];
 }
 
+// Encode profile (/private/var/tmp/bgmtl.encprof, with bgmtl.perf): one line a second splitting encoding between Chlorophyll's calls
+// (chl_prof), the Objective-C layer around them and the rest, which is CoreAnimation itself. `cpu` is the encoding thread's CPU time
+// from the first encoder to the commit, `frame cpu` the same thread's from one commit to the next.
+static uint64_t g_enc_wall, g_enc_cpu, g_frame_cpu, g_enc_n, g_bgdraw_t, g_bgdraw_n, g_newenc_t, g_newenc_n, g_chltex_t, g_chltex_n;
+enum { BG_TEX_SEED, BG_TEX_FLUSH, BG_TEX_XR, BG_TEX_COPY, BG_TEX_NC, BG_TEX_LIN, BG_TEX_N };
+static uint64_t g_tex_t[BG_TEX_N], g_tex_n[BG_TEX_N], g_lin_up, g_lin_up_bytes, g_lin_bytes, g_lin_hash_t;
+#define BG_TEX_START() uint64_t tex_pt = chl_prof.on ? mach_absolute_time() : 0
+#define BG_TEX_MARK(w) do { if (tex_pt) { uint64_t now_ = mach_absolute_time(); g_tex_t[w] += now_ - tex_pt; g_tex_n[w]++; tex_pt = now_; } } while (0)
+
+// A fast 64-bit hash of memory, four lanes of 8-byte words (the mixing of xxHash64): for "did these bytes change", not for security.
+static uint64_t
+bg_hash(const void *p, size_t len)
+{
+   static const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full;
+#define BG_ROTL(x, r) (((x) << (r)) | ((x) >> (64 - (r))))
+#define BG_LANE(a, w) ((a) = BG_ROTL((a) + (w) * P2, 31) * P1)
+   const uint8_t *b = p;
+   uint64_t a0 = P1 + P2, a1 = P2, a2 = 0, a3 = 0 - P1, w[4];
+   size_t n = len;
+   while (n >= 32) {
+      memcpy(w, b, 32);
+      BG_LANE(a0, w[0]); BG_LANE(a1, w[1]); BG_LANE(a2, w[2]); BG_LANE(a3, w[3]);
+      b += 32;
+      n -= 32;
+   }
+   uint64_t h = BG_ROTL(a0, 1) + BG_ROTL(a1, 7) + BG_ROTL(a2, 12) + BG_ROTL(a3, 18) + len;
+   while (n >= 8) {
+      memcpy(w, b, 8);
+      h = BG_ROTL(h ^ (BG_ROTL(w[0] * P2, 31) * P1), 27) * P1;
+      b += 8;
+      n -= 8;
+   }
+   while (n--) h = BG_ROTL(h ^ (*b++ * P1), 11) * P2;
+   h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P1; h ^= h >> 32;
+#undef BG_LANE
+#undef BG_ROTL
+   return h;
+}
+
+__attribute__((constructor)) static void
+bg_enc_init(void)
+{
+   chl_prof.on = access("/private/var/tmp/bgmtl.encprof", F_OK) == 0;
+}
+
+static void
+bg_enc_note(uint64_t t_first, uint64_t t_begin, uint64_t cpu_first)
+{
+   static __thread uint64_t last_cpu;
+   uint64_t cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+   if (!t_first || t_first >= t_begin) return;
+   g_enc_wall += t_begin - t_first;
+   g_enc_cpu += cpu - cpu_first;
+   if (last_cpu) g_frame_cpu += cpu - last_cpu;
+   last_cpu = cpu;
+   g_enc_n++;
+}
+
+static void
+bg_enc_line(void)
+{
+   static mach_timebase_info_data_t tb;
+   if (!tb.denom) mach_timebase_info(&tb);
+   uint64_t n = g_enc_n ? g_enc_n : 1;
+#define PMS(t) ((double)(t) * tb.numer / tb.denom / 1e6 / n)
+   char line[640];
+   snprintf(line, sizeof(line),
+            "enc: %llu cbufs, per cbuf ms: wall %.1f cpu %.1f frame-cpu %.1f | chl begin %.2f (%.1f) end %.2f pipe %.2f (%.1f) vb %.2f flush %.2f "
+            "pushdesc %.2f pushconst %.2f draw %.2f (%.1f) bytes %.2f (%.1f) cmdbuf %.2f | objc bgdraw %.2f newenc %.2f chltex %.2f (%.1f)",
+            (unsigned long long)g_enc_n, g_enc_wall / 1e6 / n, g_enc_cpu / 1e6 / n, g_frame_cpu / 1e6 / n, PMS(chl_prof.t[CHL_P_BEGIN]),
+            (double)chl_prof.n[CHL_P_BEGIN] / n, PMS(chl_prof.t[CHL_P_END]), PMS(chl_prof.t[CHL_P_PIPE]), (double)chl_prof.n[CHL_P_PIPE] / n,
+            PMS(chl_prof.t[CHL_P_VB]), PMS(chl_prof.t[CHL_P_FLUSH]), PMS(chl_prof.t[CHL_P_PUSHD]), PMS(chl_prof.t[CHL_P_PUSHC]),
+            PMS(chl_prof.t[CHL_P_DRAW]), (double)chl_prof.n[CHL_P_DRAW] / n, PMS(chl_prof.t[CHL_P_BYTES]), (double)chl_prof.n[CHL_P_BYTES] / n,
+            PMS(chl_prof.t[CHL_P_CMDBUF]), PMS(g_bgdraw_t), PMS(g_newenc_t), PMS(g_chltex_t), (double)g_chltex_n / n);
+   bgmtl_note_line(line);
+   snprintf(line, sizeof(line), "tex: seed %.2f (%.1f) flush %.2f (%.1f) xr %.2f (%.1f) copy %.2f (%.1f) nocopy %.2f (%.1f) linear %.2f (%.1f): "
+            "hash %.2f, %.0f KB seen, %.1f uploads %.0f KB",
+            PMS(g_tex_t[BG_TEX_SEED]), (double)g_tex_n[BG_TEX_SEED] / n, PMS(g_tex_t[BG_TEX_FLUSH]), (double)g_tex_n[BG_TEX_FLUSH] / n,
+            PMS(g_tex_t[BG_TEX_XR]), (double)g_tex_n[BG_TEX_XR] / n, PMS(g_tex_t[BG_TEX_COPY]), (double)g_tex_n[BG_TEX_COPY] / n,
+            PMS(g_tex_t[BG_TEX_NC]), (double)g_tex_n[BG_TEX_NC] / n, PMS(g_tex_t[BG_TEX_LIN]), (double)g_tex_n[BG_TEX_LIN] / n,
+            PMS(g_lin_hash_t), g_lin_bytes / 1024.0 / n, (double)g_lin_up / n, g_lin_up_bytes / 1024.0 / n);
+   bgmtl_note_line(line);
+   memset(g_tex_t, 0, sizeof(g_tex_t));
+   memset(g_tex_n, 0, sizeof(g_tex_n));
+   g_lin_up = g_lin_up_bytes = g_lin_bytes = g_lin_hash_t = 0;
+#undef PMS
+   memset(chl_prof.t, 0, sizeof(chl_prof.t));
+   memset(chl_prof.n, 0, sizeof(chl_prof.n));
+   g_enc_wall = g_enc_cpu = g_frame_cpu = g_enc_n = g_bgdraw_t = g_bgdraw_n = g_newenc_t = g_newenc_n = g_chltex_t = g_chltex_n = 0;
+}
+
 // Per-second timing of commits (the compositor): how a frame's time splits into CoreAnimation's own work, encoding (from the
 // first encoder to the commit), submission and the wait for the GPU. One line a second in bgmtl.log; off unless
 // /private/var/tmp/bgmtl.perf exists when the process starts.
@@ -1615,6 +1717,7 @@ bg_perf_note(uint64_t t_first, uint64_t t_begin, uint64_t t_flushed, uint64_t t_
                   (unsigned long long)bin[0], (unsigned long long)bin[1], (unsigned long long)bin[2], (unsigned long long)bin[3]);
          bgmtl_note_line(line);
       }
+      if (chl_prof.on) bg_enc_line();
       if (bg_texpool_cap()) {
          snprintf(line, sizeof(line), "texpool: %lu hits, %lu misses, %.1f MB held", g_texpool_hits, g_texpool_misses,
                   g_texpool_bytes / 1048576.0);
@@ -1650,6 +1753,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
    __atomic_add_fetch(&g_bg_commit_seq, 1, __ATOMIC_RELAXED);
    bgmtl_note_committed();
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   if (chl_prof.on) bg_enc_note(_t_first, t_begin, _cpu_first);
    _status = 2;   // Committed
    BG_TRACE("commit: %u draws\n", _draws);
    for (BGMTLBuffer *b in _noCopy) [b bgRefresh];
@@ -1813,7 +1917,10 @@ bg_idle_trim_schedule(void)
              (unsigned long)t.pixelFormat, (unsigned long)d.colorAttachments[0].level, (unsigned long)d.colorAttachments[0].loadAction,
              (unsigned long)d.colorAttachments[0].storeAction, surf0);
    }
-   return [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
+   uint64_t pt = chl_prof.on ? mach_absolute_time() : 0;
+   id enc = [[[BGMTLRenderEncoder alloc] initWithBGCommandBuffer:self descriptor:d] autorelease];
+   if (pt) { g_newenc_t += mach_absolute_time() - pt; g_newenc_n++; }
+   return enc;
 }
 - (id)blitCommandEncoder { return [[[BGMTLBlitEncoder alloc] initWithBGCommandBuffer:self] autorelease]; }
 - (id)blitCommandEncoderWithDescriptor:(id)d { (void)d; return [self blitCommandEncoder]; }
@@ -1831,7 +1938,9 @@ static void
 bg_bind_texture(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id texture)
 {
    if (index >= BG_MAX_TEX || !cb->_ccb) return;
+   uint64_t pt = chl_prof.on ? mach_absolute_time() : 0;
    chl_set_texture(cb->_ccb, stage, (unsigned)index, texture ? [(BGMTLTexture *)texture chlTextureFor:cb] : NULL);
+   if (pt) { g_chltex_t += mach_absolute_time() - pt; g_chltex_n++; }
 }
 static void
 bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sampler)
@@ -2158,6 +2267,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 {
    if (_parent) { [_parent chlTextureFor:cb]; return _tex; }
    char why[256] = { 0 };
+   BG_TEX_START();
    if (_surface && !_surfCopy) {
       static NSMutableDictionary *seeds;
       static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
@@ -2170,7 +2280,11 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       if (changed) seeds[key] = @(seed);
       if ([seeds count] > 4096) [seeds removeAllObjects];
       os_unfair_lock_unlock(&lk);
-      if (changed) chl_texture_flush_surface(_tex);
+      BG_TEX_MARK(BG_TEX_SEED);
+      if (changed) {
+         chl_texture_flush_surface(_tex);
+         BG_TEX_MARK(BG_TEX_FLUSH);
+      }
    } else if (_xr2p && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       uint32_t seed = IOSurfaceGetSeed(sf);
@@ -2214,6 +2328,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
             _surfFresh = YES;
          }
       }
+      BG_TEX_MARK(BG_TEX_XR);
    } else if (_surfCopy && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       uint32_t seed = IOSurfaceGetSeed(sf);
@@ -2225,18 +2340,36 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
          _surfSeed = seed;
          _surfFresh = YES;
       }
+      BG_TEX_MARK(BG_TEX_COPY);
    }
    if (_ncBytes) {
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
       if (chl_texture_replace(_tex, 0, 0, o, sz, _ncBytes, _ncLength / (_desc.height ? _desc.height : 1), 0, why, sizeof(why)) != 0)
          BG_LOG("no-copy texture refresh: %s\n", why);
+      BG_TEX_MARK(BG_TEX_NC);
    }
    if (_linSrc && cb && __atomic_load_n(&_linPending, __ATOMIC_ACQUIRE) == 0 && _linSeq != cb->_seq) {
       _linSeq = cb->_seq;
-      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
-      if (chl_texture_replace(_tex, 0, 0, o, sz, (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff, _linBpr, 0, why,
-                              sizeof(why)) != 0)
-         BG_LOG("linear texture refresh: %s\n", why);
+      // Upload only what changed. Metal shares the buffer's memory with the texture, so CoreAnimation may write it at any time and tells
+      // nobody; here the texture is a copy. Every upload is a new staging buffer and a GPU copy (about 20 textures, 8-13 ms of each
+      // frame on the home screen, nearly all of it unchanged bytes); the hash of a 128x128 RGBA16F icon takes about 25 us.
+      const uint8_t *src = (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff;
+      size_t bytes = (size_t)_linBpr * _desc.height, have = [(BGMTLBuffer *)_linSrc length];
+      bytes = _linOff >= have ? 0 : MIN(bytes, have - _linOff);
+      uint64_t ht = chl_prof.on ? mach_absolute_time() : 0;
+      uint64_t h = bg_hash(src, bytes);
+      if (ht) { g_lin_hash_t += mach_absolute_time() - ht; g_lin_bytes += bytes; }
+      if (!_linHashed || h != _linHash) {
+         const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
+         if (chl_texture_replace(_tex, 0, 0, o, sz, src, _linBpr, 0, why, sizeof(why)) != 0) {
+            BG_LOG("linear texture refresh: %s\n", why);
+         } else {
+            _linHash = h;
+            _linHashed = YES;
+         }
+         if (ht) { g_lin_up++; g_lin_up_bytes += bytes; }
+      }
+      BG_TEX_MARK(BG_TEX_LIN);
    }
    return _tex;
 }
@@ -2283,6 +2416,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 - (void)bgLinearWriteBack
 {
    if (!_linSrc || !_tex) return;
+   _linHashed = NO;   // the GPU wrote the texture: the next fill may not trust the hash of the old bytes
    char why[256] = { 0 };
    const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
    if (chl_texture_get(_tex, 0, 0, o, sz, (uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff, _linBpr, 0, why, sizeof(why)) != 0)
@@ -2579,6 +2713,7 @@ bg_buf_desc(char *s, size_t n, id b, NSUInteger off, NSUInteger bytes)
    if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }
    if (bg_fidraw() && strstr(_pipeline->_names, "primitive_custom_vertex"))
       [self bgDrawLog:prim start:start count:count instances:inst indexBuffer:ib indexType:it indexOffset:io rc:0];
+   uint64_t pt = chl_prof.on ? mach_absolute_time() : 0;
    char why[512] = { 0 };
    int rc;
    if (ib) {
@@ -2590,6 +2725,7 @@ bg_buf_desc(char *s, size_t n, id b, NSUInteger off, NSUInteger bytes)
    }
    if (rc != 0) [_cb bgSkip:_pipeline->_names why:why];
    else _cb->_draws++;
+   if (pt) { g_bgdraw_t += mach_absolute_time() - pt; g_bgdraw_n++; }
 }
 - (void)drawPrimitives:(NSUInteger)p vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c
 { [self bgDraw:p start:s count:c instances:1 indexBuffer:nil indexType:0 indexOffset:0 baseVertex:0 baseInstance:0]; }

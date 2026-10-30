@@ -18,6 +18,7 @@
 #define VK_NO_PROTOTYPES
 #include "vulkan/vulkan_core.h"
 
+#include <mach/mach_time.h>
 #include "chl.h"
 #include "air_nir_vk.h"
 #include "nir_air.h"
@@ -29,6 +30,11 @@
 #include "common/freedreno_dev_info.h"
 #include "util/half_float.h"
 #include "util/ralloc.h"
+
+/* ---- encode profile, see chl.h ---- */
+struct chl_prof chl_prof;
+#define P_START(v) uint64_t v = chl_prof.on ? mach_absolute_time() : 0
+#define P_MARK(v, w) do { if (v) { uint64_t p_now = mach_absolute_time(); chl_prof.t[w] += p_now - v; chl_prof.n[w]++; v = p_now; } } while (0)
 
 /* Mesa-internal: a pipeline stage given as NIR instead of SPIR-V (vk_pipeline.c, VkPipelineShaderStageNirCreateInfoMESA) */
 #ifndef VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA
@@ -1868,6 +1874,7 @@ compute_variant(struct chl_compute_pipeline *p, const unsigned threads[3], unsig
 struct chl_cmdbuf *
 chl_cmdbuf_create(struct chl_device *d, char *why, size_t why_size)
 {
+   P_START(pt);
    pthread_mutex_lock(&d->free_lock);
    struct chl_cmdbuf *cb = d->free_cbs;
    if (cb)
@@ -1903,6 +1910,7 @@ chl_cmdbuf_create(struct chl_device *d, char *why, size_t why_size)
    cb->ds = NULL;
    memset(cb->bind, 0, sizeof(cb->bind));
    memset(cb->tg_len, 0, sizeof(cb->tg_len));
+   P_MARK(pt, CHL_P_CMDBUF);
    return cb;
 }
 
@@ -2078,6 +2086,7 @@ chl_set_bytes(struct chl_cmdbuf *cb, unsigned stage, unsigned index, const void 
 {
    if (stage > 1 || index >= AIR_VK_BUFFER_SLOTS)
       return;
+   P_START(pt);
    struct chl_buffer *b;
    size_t off;
    void *p;
@@ -2086,6 +2095,7 @@ chl_set_bytes(struct chl_cmdbuf *cb, unsigned stage, unsigned index, const void 
    memcpy(p, bytes, length);
    cb->bind[stage].buf[index] = b;
    cb->bind[stage].off[index] = off;
+   P_MARK(pt, CHL_P_BYTES);
 }
 
 void
@@ -2113,6 +2123,7 @@ static int
 flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_layout *l, char *why, size_t why_size)
 {
    struct chl_device *d = cb->dev;
+   P_START(pt);
    VkWriteDescriptorSet w[48];
    VkDescriptorBufferInfo bi[48];
    VkDescriptorImageInfo ii[48];
@@ -2188,13 +2199,16 @@ flush_bindings(struct chl_cmdbuf *cb, VkPipelineBindPoint bp, const struct chl_l
       for (unsigned n = 0; n < AIR_VK_TEXTURE_SLOTS; n++)
          if (!cb->bind[stage].tex[n])
             push[stage * 32 + AIR_PUSH_NULL_MASK_WORD] |= 1u << n;
+   P_MARK(pt, CHL_P_FLUSH);
    if (nw)
       d->vk.vkCmdPushDescriptorSetKHR(cb->cb, bp, l->layout, 0, nw, w);
+   P_MARK(pt, CHL_P_PUSHD);
    if (l->push_bytes)
       d->vk.vkCmdPushConstants(cb->cb, l->layout,
                                bp == VK_PIPELINE_BIND_POINT_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT
                                                                     : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, l->push_bytes, push);
+   P_MARK(pt, CHL_P_PUSHC);
    return 0;
 }
 
