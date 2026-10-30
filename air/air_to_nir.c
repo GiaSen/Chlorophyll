@@ -3086,9 +3086,16 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *sv = air_get(c, in->operands[0]);
       if (!sv)
          return false;
-      if (val_is_pointerish(sv))
+      if (val_is_pointerish(sv)) {
+         /* Into a local it can be dropped: LLVM leaves such stores behind (RenderBox's
+          * custom_fn copies its texture into a struct and never reads that member), and
+          * the one way to need the value back, loading the pointer, air_load_ptr refuses.
+          */
+         if (p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_SCRATCH)
+            return true;
          return air_error(c, "instruction: a store of a pointer into memory, which this "
                              "frontend has no address to write");
+      }
       if (p->kind == AIR_VAL_PTR_SELECT)
          return air_error(c, "instruction: a store through a chosen pointer, which would "
                              "have to write both of them");
