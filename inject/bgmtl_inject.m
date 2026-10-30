@@ -24,6 +24,9 @@
 // launch is marked healthy in bgmtl-bb.state. "crashtest" in bgmtl-bb.arm crashes on purpose 5 s after registration (guard test).
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#include <dispatch/dispatch.h>
+#include <time.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
@@ -33,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -426,6 +430,86 @@ restart_stale_posterboard(void)
    free(all);
 }
 
+// /private/var/tmp/bgmtl.touchlog, SpringBoard: touch events per second reaching -[UIApplication sendEvent:], their spacing and their age
+// (now minus the event's timestamp). Tells a slow delivery of touches from slow handling of them.
+static void (*g_sendevent_orig)(id, SEL, id);
+static void
+touchlog_sendevent(id app, SEL sel, id ev)
+{
+   static uint64_t n, win, last, age, age_max, gap_max, bin[4];
+   long type = ((long (*)(id, SEL))objc_msgSend)(ev, sel_registerName("type"));
+   if (type == 0) {
+      uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+      double ts = ((double (*)(id, SEL))objc_msgSend)(ev, sel_registerName("timestamp"));
+      uint64_t a = (uint64_t)(ts * 1e9) < now ? now - (uint64_t)(ts * 1e9) : 0;
+      if (last) {
+         uint64_t d = now - last;
+         if (d < 300000000ull) {
+            n++;
+            age += a;
+            if (a > age_max) age_max = a;
+            if (d > gap_max) gap_max = d;
+            bin[d <= 10000000ull ? 0 : d <= 20000000ull ? 1 : d <= 50000000ull ? 2 : 3]++;
+         }
+      }
+      last = now;
+      if (!win) win = now;
+      if (now - win >= 1000000000ull && n) {
+         char line[220];
+         snprintf(line, sizeof(line), "touchlog: %llu touch events in %.0f ms; spacing <=10 ms %llu, <=20 %llu, <=50 %llu, more %llu, max %.0f ms; age mean %.1f ms, max %.1f ms",
+                  (unsigned long long)n, (now - win) / 1e6, (unsigned long long)bin[0], (unsigned long long)bin[1], (unsigned long long)bin[2],
+                  (unsigned long long)bin[3], gap_max / 1e6, age / 1e6 / n, age_max / 1e6);
+         bgmtl_note_line(line);
+         win = now;
+         n = age = age_max = gap_max = bin[0] = bin[1] = bin[2] = bin[3] = 0;
+      }
+   }
+   g_sendevent_orig(app, sel, ev);
+}
+
+// How late do timers fire in this process? 8 ms periods on a thread of the given QoS, then a CFRunLoopTimer on the main thread.
+static void *
+touchlog_timers(void *arg)
+{
+   qos_class_t q = (qos_class_t)(uintptr_t)arg;
+   pthread_set_qos_class_self_np(q, 0);
+   for (;;) {
+      sleep(20);
+      uint64_t sum = 0, maxl = 0, n = 0, over5 = 0, over20 = 0;
+      for (int i = 0; i < 300; i++) {
+         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+         usleep(8000);
+         uint64_t l = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+         l = l > 8000000ull ? l - 8000000ull : 0;
+         sum += l; n++;
+         if (l > maxl) maxl = l;
+         if (l > 5000000ull) over5++;
+         if (l > 20000000ull) over20++;
+      }
+      char line[200];
+      snprintf(line, sizeof(line), "touchlog: usleep(8 ms) at qos %#x pri %d darwinbg %d: late mean %.1f ms, max %.1f ms, >5 ms %llu, >20 ms %llu of %llu", (unsigned)q,
+               getpriority(PRIO_PROCESS, 0), getpriority(PRIO_DARWIN_THREAD, 0), sum / 1e6 / n, maxl / 1e6, (unsigned long long)over5, (unsigned long long)over20, (unsigned long long)n);
+      bgmtl_note_line(line);
+   }
+   return NULL;
+}
+
+static void
+touchlog_install(void)
+{
+   pthread_t th;
+   if (access("/private/var/tmp/bgmtl.touchlog", F_OK) != 0) return;
+   pthread_create(&th, NULL, touchlog_timers, (void *)(uintptr_t)QOS_CLASS_USER_INTERACTIVE);
+   pthread_detach(th);
+   if (strcmp(getprogname(), "SpringBoard") != 0) return;
+   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+      Class c = objc_getClass("UIApplication");
+      Method m = c ? class_getInstanceMethod(c, sel_registerName("sendEvent:")) : NULL;
+      if (m) g_sendevent_orig = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)touchlog_sendevent);
+      ilog("touchlog: sendEvent: %s", m ? "hooked" : "not found");
+   });
+}
+
 __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
@@ -495,6 +579,7 @@ bgmtl_inject_init(void)
       add(dev);
       g_registered = 1;
       ilog("%s: BGMTLDevice registered in this process (kernel ABI minor %u)", [bid UTF8String], minor);
+      touchlog_install();
       atexit(clean_exit);
       pthread_t th;
       pthread_create(&th, NULL, watchdog, NULL);

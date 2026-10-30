@@ -2354,12 +2354,14 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       // nobody; here the texture is a copy. Every upload is a new staging buffer and a GPU copy (about 20 textures, 8-13 ms of each
       // frame on the home screen, nearly all of it unchanged bytes); the hash of a 128x128 RGBA16F icon takes about 25 us.
       const uint8_t *src = (const uint8_t *)[(BGMTLBuffer *)_linSrc contents] + _linOff;
-      size_t bytes = (size_t)_linBpr * _desc.height, have = [(BGMTLBuffer *)_linSrc length];
-      bytes = _linOff >= have ? 0 : MIN(bytes, have - _linOff);
+      size_t have = [(BGMTLBuffer *)_linSrc length], rest = _linOff >= have ? 0 : have - _linOff;
+      size_t bytes = _linBpr ? MIN((size_t)_linBpr * _desc.height, rest) : rest;   // no row pitch given: all that can be in it
       uint64_t ht = chl_prof.on ? mach_absolute_time() : 0;
       uint64_t h = bg_hash(src, bytes);
       if (ht) { g_lin_hash_t += mach_absolute_time() - ht; g_lin_bytes += bytes; }
-      if (!_linHashed || h != _linHash) {
+      static int always = -1;   // /private/var/tmp/bgmtl.linalways: upload every time, as before
+      if (always < 0) always = access("/private/var/tmp/bgmtl.linalways", F_OK) == 0;
+      if (always || !_linHashed || h != _linHash) {
          const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
          if (chl_texture_replace(_tex, 0, 0, o, sz, src, _linBpr, 0, why, sizeof(why)) != 0) {
             BG_LOG("linear texture refresh: %s\n", why);
