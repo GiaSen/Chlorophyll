@@ -212,6 +212,21 @@ bg_xr10_note(const char *fmt, ...)
    bgmtl_note_line(line);
 }
 
+// /private/var/tmp/bgmtl.surfdumpall (a directory, world-writable): the bytes of every surface a command buffer of this process drew
+// into, as the CPU reads them once that command buffer has completed: DIR/<surface id>-<W>x<H>-<IOSurface pixel format>-<pitch>-<pid>-<seq>.raw
+static void
+bg_surface_dump(IOSurfaceRef sf, uint64_t seq)
+{
+   static const char *dir = "/private/var/tmp/bgmtl.surfdumpall";
+   if (!bg_xr10log() || access(dir, W_OK) != 0 || IOSurfaceGetWidth(sf) > 512 || IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) != 0) return;
+   char path[256];
+   snprintf(path, sizeof(path), "%s/%u-%zux%zu-%08x-%zu-%d-%llu.raw", dir, IOSurfaceGetID(sf), IOSurfaceGetWidth(sf), IOSurfaceGetHeight(sf),
+            IOSurfaceGetPixelFormat(sf), IOSurfaceGetBytesPerRow(sf), getpid(), (unsigned long long)seq);
+   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+   if (fd >= 0) { (void)!write(fd, IOSurfaceGetBaseAddress(sf), IOSurfaceGetAllocSize(sf)); close(fd); }
+   IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+}
+
 // texels of a BGRA8 image whose alpha is not 0
 static unsigned
 bg_alpha_count(const uint8_t *px, size_t n)
@@ -1738,6 +1753,10 @@ bg_idle_trim_schedule(void)
       NSMutableSet *surfaces = nil, *xr = nil;
       for (BGMTLTexture *t in _written) {
          BGMTLTexture *root = [t bgRoot];
+         if (bg_xr10log() && [t iosurface])
+            bg_xr10_note("drew into surface %u %zux%zu fmt %lu: %s", IOSurfaceGetID((IOSurfaceRef)[t iosurface]),
+                         IOSurfaceGetWidth((IOSurfaceRef)[t iosurface]), IOSurfaceGetHeight((IOSurfaceRef)[t iosurface]), (unsigned long)[root pixelFormat],
+                         root->_xr2p ? "two-plane" : root->_surfCopy ? "copied" : "imported");
          if (root->_xr2p) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }
          chl_texture_flush_surface([t chlTexture]);
          if ([t iosurface]) { if (!surfaces) surfaces = [NSMutableSet set]; [surfaces addObject:(id)[t iosurface]]; }
@@ -1745,6 +1764,7 @@ bg_idle_trim_schedule(void)
       for (id surf in surfaces) {
          IOSurfaceLock((IOSurfaceRef)surf, 0, NULL);
          IOSurfaceUnlock((IOSurfaceRef)surf, 0, NULL);
+         bg_surface_dump((IOSurfaceRef)surf, _seq);
       }
       for (BGMTLTexture *t in xr) [t bgXR10WriteBack];   // the write unlock moves these surfaces' seeds
    }
