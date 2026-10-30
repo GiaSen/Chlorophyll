@@ -20,6 +20,7 @@
 #include <libkern/OSByteOrder.h>
 #include <os/lock.h>
 #include <pthread.h>
+#include <sched.h>
 #include <Block.h>
 #include <sys/stat.h>
 #import <Metal/Metal.h>
@@ -517,6 +518,8 @@ bg_install_fallback(Class c)
    NSMutableSet *_noCopy;                                  // no-copy buffers it binds (refreshed at commit)
    unsigned _draws;
    uint64_t _t_first;                                      // the first encoder (encode time for bgmtl.perf)
+   uint64_t _t_flushed;                                    // when the commit had submitted (bgmtl.perf)
+   pthread_t _sched_thread;                                // the committing thread while it runs the scheduled handlers
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (struct chl_cmdbuf *)bgChl;                         // the Vulkan command buffer, noting when encoding began
@@ -1608,7 +1611,7 @@ bg_perf_note(uint64_t t_first, uint64_t t_begin, uint64_t t_flushed, uint64_t t_
    }
 }
 
-struct bg_done_ctx { BGMTLCommandBuffer *cb; uint64_t t_begin, t_flushed; };
+struct bg_done_ctx { BGMTLCommandBuffer *cb; uint64_t t_begin; };
 
 static void
 bg_cmdbuf_done(void *ctx, int status, const char *why)
@@ -1618,7 +1621,8 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
    @autoreleasepool {
       if (status != 0) [cb bgFailWith:[NSString stringWithUTF8String:why ? why : "the GPU did not finish"] code:3];
       else cb->_status = 4;   // Completed
-      bg_perf_note(cb->_t_first, d->t_begin, d->t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), cb->_draws);
+      uint64_t t_done = clock_gettime_nsec_np(CLOCK_MONOTONIC), t_flushed = __atomic_load_n(&cb->_t_flushed, __ATOMIC_RELAXED);
+      bg_perf_note(cb->_t_first, d->t_begin, t_flushed ? t_flushed : t_done, t_done, cb->_draws);
       [cb bgCompleteFrom:d->t_begin];
       dispatch_group_leave(cb->_done);
    }
@@ -1658,15 +1662,26 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       dispatch_group_leave(_done);
       return;
    } else {
+      // From the submit on, the completion thread may run at any moment and may drop its reference and free ctx. So the scheduled
+      // handlers leave _scheduled first (it enumerated and emptied the same array: backboardd's "mutated while being enumerated"),
+      // self stays retained, and bgCompleteFrom waits for them, so each runs once and all before any completed handler.
+      NSArray *sched = nil;
+      if (!defer_scheduled) {
+         _status = 3;
+         sched = [_scheduled copy];
+         [_scheduled removeAllObjects];
+         __atomic_store_n(&_sched_thread, pthread_self(), __ATOMIC_RELEASE);
+      }
       struct bg_done_ctx *ctx = malloc(sizeof(*ctx));
       ctx->cb = [self retain];
       ctx->t_begin = t_begin;
-      ctx->t_flushed = 0;
-      if (!defer_scheduled) _status = 3;
-      if (chl_cmdbuf_commit(_ccb, bg_cmdbuf_done, ctx, why, sizeof(why)) != 0)
-         return;   // bg_cmdbuf_done ran with the failure
-      ctx->t_flushed = clock_gettime_nsec_np(CLOCK_MONOTONIC);
-      if (!defer_scheduled) { for (void (^h)(id) in _scheduled) h(self); [_scheduled removeAllObjects]; }
+      [self retain];
+      (void)chl_cmdbuf_commit(_ccb, bg_cmdbuf_done, ctx, why, sizeof(why));   // on a failure bg_cmdbuf_done has already run, here
+      __atomic_store_n(&_t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), __ATOMIC_RELAXED);
+      for (void (^h)(id) in sched) h(self);
+      [sched release];
+      __atomic_store_n(&_sched_thread, (pthread_t)NULL, __ATOMIC_RELEASE);
+      [self release];
       return;
    }
    [self bgCompleteFrom:t_begin];
@@ -1703,6 +1718,8 @@ bg_idle_trim_schedule(void)
 // What follows a completed (or failed) command buffer; run on chl's completion thread, or inline when tracing.
 - (void)bgCompleteFrom:(uint64_t)t_begin
 {
+   for (pthread_t t; (t = __atomic_load_n(&_sched_thread, __ATOMIC_ACQUIRE)) && t != pthread_self(); )
+      sched_yield();   // commit is still running the scheduled handlers
    bg_return_slot(self, _queue);
    for (void (^h)(id) in _scheduled) h(self);    // left here by the compositor's deferral (see commit)
    [_scheduled removeAllObjects];

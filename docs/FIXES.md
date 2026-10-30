@@ -51,6 +51,18 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
   sample call uses the argument). The frontend refused any pointer stored into memory.
 - **Fix.** A pointer stored into a local is dropped. Reading one back is still refused, by `air_load_ptr`.
 
+### backboardd aborted with asynchronous commits: "Collection was mutated while being enumerated" (2026-10-30)
+
+- **Symptom.** A soft reboot, once in about 12 minutes of UI use with `bgmtl-bb.sync` removed: `NSGenericException` from
+  `commit`, under CoreAnimation's `MetalContext::flush` and `commitAndWaitUntilSubmitted`.
+- **Why.** After submitting, `commit` walked and emptied `_scheduled`, while the completion thread, which can run as soon as
+  the GPU is done, walked and emptied the same array in `bgCompleteFrom`. A handler could also run twice, or after the
+  completed handlers, and `commit` wrote a field of a context the completion side may already have freed. Every process but
+  backboardd, which ran synchronous commits, had the same race.
+- **Fix.** The scheduled handlers leave `_scheduled` before the submit and run from that copy, the command buffer stays
+  retained until they finish, and `bgCompleteFrom` waits for them. A scheduled handler must not wait for its own command
+  buffer to complete.
+
 ### Frame time: what helped and what did not (2026-10-24)
 
 - **Framebuffer kept bound per pass (31e727e).** Every draw used to make new `pipe_surface`s, set the framebuffer, and
