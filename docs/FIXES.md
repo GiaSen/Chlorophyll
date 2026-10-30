@@ -140,6 +140,20 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
 - **Fix.** Lookup matches flags first and skips busy entries (73aa9d4, `patches/fd-bo-cache-skip-busy.patch`). The cache
   keeps freed buffers 15 s instead of 1 (7e62ace): full-screen targets cost ~18 ms each to allocate.
 
+### Every app a black screen (iOS 26, 2026-10-30)
+
+- **What it looks like.** Tapping an icon dims the home screen, then the panel is black: no status bar, no frames, touches
+  land on SpringBoard's home screen window while the app runs behind them. The same with backboardd and SpringBoard stock, so
+  not a rendering bug.
+- **Why.** The poster's snapshots (`RuntimeSnapshot-*.atx`) load as CGImages `(IP) <ATX >`. SpringBoard puts one in the fake
+  wallpaper of `SBMainSwitcherWindow`, the window that hosts the app. The render server cannot decode it (backboardd:
+  `CompressedImage port is MACH_PORT_NULL!`) and drops the whole commit (`serialization error from context`), so that context
+  never shows. That image alone in a new context reproduces it; a bitmap copy of it does not. Why the port is empty in the
+  sender was not found.
+- **Fix.** `inject/bgmtl_inject.m`, `atx_contents_install`: in SpringBoard, before the GPU gates so it holds on stock too,
+  `-[CALayer setContents:]` gets a bitmap copy of such an image (2-20 ms). `bgmtl.noatxfix` turns it off.
+- **How to check.** `sweetlog 60 serialization` stays empty after opening an app; `ATX image` lines in `bgmtl.log`.
+
 ### Black or grey wallpaper on the lock and home screens
 
 - **Why.** One refused draw or clear failed the whole command buffer, so the rest of the frame was never drawn. A

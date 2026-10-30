@@ -25,6 +25,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <CoreGraphics/CoreGraphics.h>
 #include <dispatch/dispatch.h>
 #include <time.h>
 #include <dlfcn.h>
@@ -510,6 +511,62 @@ touchlog_install(void)
    });
 }
 
+// Every app was a black screen (iOS 26, Mi 8, the same with backboardd and SpringBoard stock): the poster's snapshots
+// (RuntimeSnapshot-*.atx) load as CGImages "(IP) <ATX >" and SpringBoard puts one in the fake wallpaper of SBMainSwitcherWindow,
+// next to the layer that hosts the app. The render server cannot decode that image ("CompressedImage port is MACH_PORT_NULL!",
+// from a sender that made the port: why it is empty is not known) and drops the whole commit ("serialization error from context"),
+// so that window never shows and touches fall through to the home screen. Layers get a plain bitmap copy instead.
+// /private/var/tmp/bgmtl.noatxfix turns this off.
+static void (*g_setcontents_orig)(id, SEL, id);
+static const void *(*g_image_provider)(CGImageRef);
+
+static CGImageRef
+atx_plain_copy(CGImageRef im)
+{
+   size_t w = CGImageGetWidth(im), h = CGImageGetHeight(im);
+   CGColorSpaceRef cs = CGImageGetColorSpace(im), rgb = CGColorSpaceCreateDeviceRGB();
+   CGContextRef g = cs ? CGBitmapContextCreate(NULL, w, h, 8, 0, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast) : NULL;
+   if (!g) g = CGBitmapContextCreate(NULL, w, h, 8, 0, rgb, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+   CGColorSpaceRelease(rgb);
+   if (!g) return NULL;
+   CGContextDrawImage(g, CGRectMake(0, 0, w, h), im);
+   CGImageRef o = CGBitmapContextCreateImage(g);
+   CGContextRelease(g);
+   return o;
+}
+
+static void
+atx_setcontents(id self, SEL sel, id contents)
+{
+   // CGImageGetImageProvider first: most contents are plain bitmaps, and -description formats the whole image header
+   if (contents && CFGetTypeID((CFTypeRef)contents) == CGImageGetTypeID() && (!g_image_provider || g_image_provider((CGImageRef)contents)) &&
+       [[contents description] rangeOfString:@"<ATX"].location != NSNotFound) {
+      struct timespec a, b;
+      clock_gettime(CLOCK_MONOTONIC, &a);
+      CGImageRef o = atx_plain_copy((CGImageRef)contents);
+      clock_gettime(CLOCK_MONOTONIC, &b);
+      ilog("ATX image %zux%zu %p: plain copy %p in %ld ms", CGImageGetWidth((CGImageRef)contents), CGImageGetHeight((CGImageRef)contents), contents, o,
+           (long)((b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000));
+      if (o) {
+         g_setcontents_orig(self, sel, (id)o);
+         CGImageRelease(o);
+         return;
+      }
+   }
+   g_setcontents_orig(self, sel, contents);
+}
+
+static void
+atx_contents_install(void)
+{
+   if (exists("/private/var/tmp/bgmtl.noatxfix")) return;
+   Class c = objc_getClass("CALayer");
+   Method m = c ? class_getInstanceMethod(c, sel_registerName("setContents:")) : NULL;
+   if (!m) { ilog("ATX contents: -[CALayer setContents:] not found"); return; }
+   g_image_provider = (const void *(*)(CGImageRef))dlsym(RTLD_DEFAULT, "CGImageGetImageProvider");
+   g_setcontents_orig = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)atx_setcontents);
+}
+
 __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
@@ -527,7 +584,10 @@ bgmtl_inject_init(void)
       for (const char *const *a = kAllow; *a; a++)
          if (bid && !strcmp([bid UTF8String], *a)) allowed = 1;
       if (!allowed) return;                                   // gate 1: silent in every other process
-      if (!strcmp([bid UTF8String], "com.apple.springboard")) restart_stale_posterboard();   // not a GPU matter: before the gates
+      if (!strcmp([bid UTF8String], "com.apple.springboard")) {   // not a GPU matter: before the gates
+         restart_stale_posterboard();
+         atx_contents_install();
+      }
       // /private/var/tmp/bgmtl.mesalog: Mesa's own log (ir3 compile errors, with the failing shader printed) to a file of
       // its own -- these processes' stderr goes nowhere
       if (exists("/private/var/tmp/bgmtl.mesalog") && !getenv("MESA_LOG_FILE")) {

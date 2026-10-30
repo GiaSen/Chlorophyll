@@ -39,7 +39,7 @@ probe bgmtl_texpool_test
 # the injection dylib (inert unless armed; see inject/bgmtl_inject.m)
 $CC $OBJC -c "$HERE/inject/bgmtl_inject.m" -o "$OUT/bgmtl_inject.o"
 $CC -dynamiclib -o "$OUT/bgmtl-inject.dylib" "$OUT/bgmtl.o" "$OUT/bgmtl_inject.o" "${LIBS[@]}" -framework Foundation -framework Metal \
-    -framework IOSurface -install_name /usr/local/lib/bgmtl/bgmtl-inject.dylib -Wl,-rpath,@loader_path
+    -framework IOSurface -framework CoreGraphics -install_name /usr/local/lib/bgmtl/bgmtl-inject.dylib -Wl,-rpath,@loader_path
 for f in "$OUT"/*; do
   case "$(file -b "$f")" in *Mach-O*) python3 "$BG_GPU/../tools/renegade/pacstrip.py" --sign "$f" >/dev/null ;; esac
 done
