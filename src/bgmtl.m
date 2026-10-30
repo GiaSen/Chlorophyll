@@ -2609,10 +2609,72 @@ bgmtl_gpu_state(unsigned *abi_minor)
    return (f & 2) ? 2 : (f & 1) ? 1 : 0;
 }
 
+// /private/var/tmp/bgmtl.compilelog (read once per process): one bgmtl.log line per call that reaches Apple's MTLCompilerService
+// through what this device does not override: function specialisation and libraries from source. Which function, how long, who asked.
+static IMP o_fn_cv, o_fn_cv_async, o_fn_desc, o_lib_src;
+static void
+bg_clog(const char *what, NSString *name, uint64_t t0, void *caller)
+{
+   Dl_info di = { 0 };
+   dladdr(caller, &di);
+   const char *who = di.dli_fname ? strrchr(di.dli_fname, '/') : NULL;
+   char line[300];
+   snprintf(line, sizeof(line), "compile: %s %s: %.1f ms, asked by %s", what, name ? name.UTF8String : "-",
+            (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6, who ? who + 1 : "?");
+   bgmtl_note_line(line);
+}
+static id
+h_fn_cv(id s, SEL c, NSString *n, id cv, NSError **e)
+{
+   uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   id r = ((id (*)(id, SEL, NSString *, id, NSError **))o_fn_cv)(s, c, n, cv, e);
+   bg_clog("specialise", n, t, __builtin_return_address(0));
+   return r;
+}
+static void
+h_fn_cv_async(id s, SEL c, NSString *n, id cv, id handler)
+{
+   uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   ((void (*)(id, SEL, NSString *, id, id))o_fn_cv_async)(s, c, n, cv, handler);
+   bg_clog("specialise async", n, t, __builtin_return_address(0));
+}
+static id
+h_fn_desc(id s, SEL c, id d, NSError **e)
+{
+   uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   id r = ((id (*)(id, SEL, id, NSError **))o_fn_desc)(s, c, d, e);
+   bg_clog("function descriptor", [d name], t, __builtin_return_address(0));
+   return r;
+}
+static id
+h_lib_src(id s, SEL c, NSString *src, id o, NSError **e)
+{
+   uint64_t t = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   id r = ((id (*)(id, SEL, NSString *, id, NSError **))o_lib_src)(s, c, src, o, e);
+   bg_clog("library from source", [NSString stringWithFormat:@"%lu chars", (unsigned long)src.length], t, __builtin_return_address(0));
+   return r;
+}
+static void
+bg_compile_log_install(void)
+{
+   if (access("/private/var/tmp/bgmtl.compilelog", F_OK) != 0) return;
+   Class lib = objc_getClass("_MTLLibrary"), dev = objc_getClass("_MTLDevice");
+   Method m;
+   if ((m = class_getInstanceMethod(lib, @selector(newFunctionWithName:constantValues:error:)))) o_fn_cv = method_setImplementation(m, (IMP)h_fn_cv);
+   if ((m = class_getInstanceMethod(lib, @selector(newFunctionWithName:constantValues:completionHandler:)))) o_fn_cv_async = method_setImplementation(m, (IMP)h_fn_cv_async);
+   if ((m = class_getInstanceMethod(lib, @selector(newFunctionWithDescriptor:error:)))) o_fn_desc = method_setImplementation(m, (IMP)h_fn_desc);
+   if ((m = class_getInstanceMethod(dev, @selector(newLibraryWithSource:options:error:)))) o_lib_src = method_setImplementation(m, (IMP)h_lib_src);
+   char line[120];
+   snprintf(line, sizeof(line), "compile log on: specialise %d/%d, descriptor %d, source %d", !!o_fn_cv, !!o_fn_cv_async, !!o_fn_desc, !!o_lib_src);
+   bgmtl_note_line(line);
+}
+
 // ---- entry point for test processes ----------------------------------------------------------------------------------
 id
 bgmtl_create_device(void)
 {
+   static dispatch_once_t clog_once;
+   dispatch_once(&clog_once, ^{ bg_compile_log_install(); });
    unsigned minor = 0;
    int st = bgmtl_gpu_state(&minor);
    if (st == 2) { BG_LOG("the kernel reports the GPU LOST: no device is made\n"); return nil; }

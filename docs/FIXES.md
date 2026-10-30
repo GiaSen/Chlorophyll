@@ -17,6 +17,7 @@ Debugging switches referred to below (files on the phone, read when the process 
 | `/private/var/tmp/bgmtl-bb.sync` / `.full` / `.off` | synchronous commits / dirty regions off / Metal off in backboardd |
 | `/private/var/tmp/bgmtl.env.<bundle id>` | `KEY=VALUE` lines set for that process alone before its device exists (`bgmtl-bb.env` is backboardd's), e.g. `FD_RD_DUMP=enable,combine` |
 | `/private/var/tmp/bgmtl.fidraw` | one `bgmtl.log` line per draw of RenderBox's `primitive_custom_vertex` pipelines |
+| `/private/var/tmp/bgmtl.compilelog` | one `bgmtl.log` line per call that reaches Apple's MTLCompilerService (specialised functions, libraries from source), with who asked and how long it took |
 
 Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `bgmtl-bb.state` says `alive=0`, delete it too.
 
