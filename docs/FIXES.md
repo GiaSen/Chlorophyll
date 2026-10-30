@@ -15,12 +15,41 @@ Debugging switches referred to below (files on the phone, read when the process 
 | `/private/var/tmp/bgmtl-bb.inorder` | backboardd: freedreno without batch reordering (`FD_MESA_DEBUG=inorder`) |
 | `/private/var/tmp/bgmtl-bb.fddebug` | backboardd: any `FD_MESA_DEBUG` flags (`flush`, `ddraw`, `sysmem`, ...) |
 | `/private/var/tmp/bgmtl-bb.sync` / `.full` / `.off` | synchronous commits / dirty regions off / Metal off in backboardd |
+| `/private/var/tmp/bgmtl.env.<bundle id>` | `KEY=VALUE` lines set for that process alone before its device exists (`bgmtl-bb.env` is backboardd's), e.g. `FD_RD_DUMP=enable,combine` |
+| `/private/var/tmp/bgmtl.fidraw` | one `bgmtl.log` line per draw of RenderBox's `primitive_custom_vertex` pipelines |
 
 Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `bgmtl-bb.state` says `alive=0`, delete it too.
 
 ---
 
 ## Fixes
+
+### SpringBoard's SMMU faults: the texture pipe following an unwritten sampler (2026-10-30)
+
+- **Symptom.** With SpringBoard and iconservicesagent on the GPU, an SMMU fault within minutes, often seconds:
+  `TP|VFD` at an address far from any buffer (`FAR 0xe00b2880`, `0x17af27a00`, ...), always SpringBoard's work. The kernel's
+  recovery then failed every client's command buffers, so all the dead-men fired and the phone fell back to the CPU renderer.
+  It looked like a race: logging per draw, tracing, `TU_DEBUG=noubwc` and the kernel's UBWC registers each made it rarer.
+- **Why.** Metal's constexpr samplers are immutable samplers in the set layout, and `flush_bindings` skipped them because a
+  set's immutable samplers need no write. Turnip reads them from the descriptors, though, and for a push set it copies the
+  layout's sampler in only when the binding is written. The set itself lives in a host buffer from `vk_realloc`, never
+  cleared, which is copied whole into the command stream at each push. So the slot held whatever the heap held: zeros
+  (nearest filtering, repeat) or stale pointers. A sampler's `BCOLOR` is the byte offset of its border colour, so the texture
+  pipe read `TPL1_GFX_BORDER_COLOR_BASE + BCOLOR * 0x80`. In the faulting command stream of one capture the slot held
+  `0afdde78 00000002 23160002 00000001`: `BCOLOR` 0x462c00, base 0x8003f200, sum 0xa319f200, exactly that fault's FAR. Every
+  FAR seen was a multiple of 0x80. Each "cure" only changed what the heap held. RenderBox's `fi*` pipelines were the ones
+  that hit it.
+- **Fix.** `flush_bindings` writes immutable samplers too (the handle in the write is ignored, Turnip copies the layout's).
+- **Check.** On the kernel and test that faulted within 2 rounds (`uitest`): 20 minutes with 59 app launches, 32673
+  submissions, 0 faults, 0 recoveries, all six clients on the GPU.
+
+### A RenderBox custom effect refused: "a store of a pointer into memory" (2026-10-30)
+
+- **Symptom.** SpringBoard logged the refusal in pairs, dozens of times per boot, for `custom_effect_vertex +
+  ffgea5cmba5gemhba3`. Whatever that effect draws was skipped.
+- **Why.** Its linked `custom_fn` copies its texture argument into a local `RB::Layer` and never reads that member back (the
+  sample call uses the argument). The frontend refused any pointer stored into memory.
+- **Fix.** A pointer stored into a local is dropped. Reading one back is still refused, by `air_load_ptr`.
 
 ### Frame time: what helped and what did not (2026-10-24)
 

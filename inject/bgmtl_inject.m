@@ -377,9 +377,9 @@ bb_init(void)
 // /private/var/tmp/bgmtl-bb.env, one KEY=VALUE per line ('#' starts a comment), set here before main starts the render server.
 // launchd's plist cannot be edited on the sealed root and dyld ignores the environment of a platform binary, so this is the way in.
 static void
-bb_env(void)
+env_file(const char *path, const char *who)
 {
-   FILE *f = fopen("/private/var/tmp/bgmtl-bb.env", "r");
+   FILE *f = fopen(path, "r");
    if (!f) return;
    char line[512];
    while (fgets(line, sizeof(line), f)) {
@@ -388,9 +388,15 @@ bb_env(void)
       if (line[0] == '#' || !eq || eq == line) continue;
       *eq = 0;
       setenv(line, eq + 1, 1);
-      ilog("backboardd: %s=%s (bgmtl-bb.env)", line, eq + 1);
+      ilog("%s: %s=%s (%s)", who, line, eq + 1, path);
    }
    fclose(f);
+}
+
+static void
+bb_env(void)
+{
+   env_file("/private/var/tmp/bgmtl-bb.env", "backboardd");
 }
 
 // SpringBoard: a PosterBoard left over from the previous SpringBoard (it outlives a SpringBoard restart) never hosts its wallpaper
@@ -444,6 +450,13 @@ bgmtl_inject_init(void)
          char lf[96];
          snprintf(lf, sizeof(lf), "/private/var/tmp/mesa-%d.log", getpid());
          setenv("MESA_LOG_FILE", lf, 1);
+      }
+      // /private/var/tmp/bgmtl.env.<bundle id>: KEY=VALUE lines set before the device exists, for one process only (bgmtl-bb.env
+      // is backboardd's), e.g. FD_RD_DUMP=enable,combine for Turnip's command-stream dump of SpringBoard alone
+      {
+         char ef[160];
+         snprintf(ef, sizeof(ef), "/private/var/tmp/bgmtl.env.%s", [bid UTF8String]);
+         env_file(ef, [bid UTF8String]);
       }
       snprintf(g_state, sizeof(g_state), "%s.%s", F_STATE, [bid UTF8String]);
       snprintf(g_off, sizeof(g_off), "%s.%s", F_OFF, [bid UTF8String]);

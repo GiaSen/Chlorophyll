@@ -614,6 +614,8 @@ bg_install_fallback(Class c)
    BGMTLCommandBuffer *_cb;
    BGMTLRenderPipeline *_pipeline;
    id _vbuf[BG_MAX_BINDINGS], _fbuf[BG_MAX_BINDINGS];   // what each slot holds (setVertexBufferOffset: moves only the offset)
+   NSUInteger _voff[BG_MAX_BINDINGS], _foff[BG_MAX_BINDINGS], _vbytes[BG_MAX_BINDINGS], _fbytes[BG_MAX_BINDINGS];   // for bgDrawLog
+   id _ftex0;            // fragment texture slot 0 as last set (nil included), for bgDrawLog
    NSUInteger _cull, _winding;
    BOOL _open;
 }
@@ -2430,22 +2432,22 @@ bg_attachment(BGMTLCommandBuffer *cb, MTLRenderPassAttachmentDescriptor *a, stru
    if (_open && s) chl_set_render_pipeline(_cb->_ccb, ((BGMTLRenderPipeline *)s)->_p);
    BG_TRACE("setPipeline %s\n", s ? ((BGMTLRenderPipeline *)s)->_names : "-");
 }
-- (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _vbuf[i] = b; bg_bind_buffer(_cb, CHL_STAGE_VERTEX, i, b, o); }
-- (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) _fbuf[i] = b; bg_bind_buffer(_cb, CHL_STAGE_FRAGMENT, i, b, o); }
+- (void)setVertexBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) { _vbuf[i] = b; _voff[i] = o; _vbytes[i] = 0; } bg_bind_buffer(_cb, CHL_STAGE_VERTEX, i, b, o); }
+- (void)setFragmentBuffer:(id)b offset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) { _fbuf[i] = b; _foff[i] = o; _fbytes[i] = 0; } bg_bind_buffer(_cb, CHL_STAGE_FRAGMENT, i, b, o); }
 // CoreAnimation binds a buffer once per pass and then only moves the offset between draws
-- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) bg_bind_buffer(_cb, CHL_STAGE_VERTEX, i, _vbuf[i], o); }
-- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) bg_bind_buffer(_cb, CHL_STAGE_FRAGMENT, i, _fbuf[i], o); }
+- (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) { _voff[i] = o; bg_bind_buffer(_cb, CHL_STAGE_VERTEX, i, _vbuf[i], o); } }
+- (void)setFragmentBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i { if (i < BG_MAX_BINDINGS) { _foff[i] = o; bg_bind_buffer(_cb, CHL_STAGE_FRAGMENT, i, _fbuf[i], o); } }
 - (void)setVertexBuffers:(const id *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
 { for (NSUInteger k = 0; k < r.length; k++) [self setVertexBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
 - (void)setFragmentBuffers:(const id *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
 { for (NSUInteger k = 0; k < r.length; k++) [self setFragmentBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
-   if (_cb->_ccb && i < BG_MAX_BINDINGS) { _vbuf[i] = nil; chl_set_bytes(_cb->_ccb, CHL_STAGE_VERTEX, (unsigned)i, bytes, l); }
+   if (_cb->_ccb && i < BG_MAX_BINDINGS) { _vbuf[i] = nil; _voff[i] = 0; _vbytes[i] = l; chl_set_bytes(_cb->_ccb, CHL_STAGE_VERTEX, (unsigned)i, bytes, l); }
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)l atIndex:(NSUInteger)i
 {
-   if (_cb->_ccb && i < BG_MAX_BINDINGS) { _fbuf[i] = nil; chl_set_bytes(_cb->_ccb, CHL_STAGE_FRAGMENT, (unsigned)i, bytes, l); }
+   if (_cb->_ccb && i < BG_MAX_BINDINGS) { _fbuf[i] = nil; _foff[i] = 0; _fbytes[i] = l; chl_set_bytes(_cb->_ccb, CHL_STAGE_FRAGMENT, (unsigned)i, bytes, l); }
 }
 - (void)setVertexTexture:(id)t atIndex:(NSUInteger)i { bg_bind_texture(_cb, CHL_STAGE_VERTEX, i, t); }
 - (void)setFragmentTexture:(id)t atIndex:(NSUInteger)i
@@ -2455,6 +2457,7 @@ bg_attachment(BGMTLCommandBuffer *cb, MTLRenderPassAttachmentDescriptor *a, stru
              (unsigned long)[(id<MTLTexture>)t height], (unsigned long)[(id<MTLTexture>)t pixelFormat],
              [(BGMTLTexture *)t iosurface] ? (unsigned)IOSurfaceGetID((IOSurfaceRef)[(BGMTLTexture *)t iosurface]) : 0u,
              [(id<MTLTexture>)t parentTexture] ? " (view)" : "");
+   if (i == 0) _ftex0 = t;
    bg_bind_texture(_cb, CHL_STAGE_FRAGMENT, i, t);
 }
 - (void)setVertexTextures:(const id *)t withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setVertexTexture:t[k] atIndex:r.location + k]; }
@@ -2488,11 +2491,57 @@ bg_attachment(BGMTLCommandBuffer *cb, MTLRenderPassAttachmentDescriptor *a, stru
 - (void)useHeap:(id)h { (void)h; }
 - (void)useHeap:(id)h stages:(NSUInteger)s { (void)h; (void)s; }
 
+// /private/var/tmp/bgmtl.fidraw (read once per process): one bgmtl.log line per draw of RenderBox's primitive_custom_vertex
+// pipelines, whose GPU work read through a garbage texture/vertex-fetch address on the Mi 8 (2026-10-30, kernel 3004: TP|VFD):
+// the draw, fragment texture 0 as last set (nil included) and the buffers both stages read. The first 400, then every 64th.
+static int
+bg_fidraw(void)
+{
+   static int on = -1;
+   if (on < 0) on = access("/private/var/tmp/bgmtl.fidraw", F_OK) == 0;
+   return on;
+}
+
+static void
+bg_buf_desc(char *s, size_t n, id b, NSUInteger off, NSUInteger bytes)
+{
+   if (b) snprintf(s, n, "buf %lu+%lu", (unsigned long)[(id<MTLBuffer>)b length], (unsigned long)off);
+   else if (bytes) snprintf(s, n, "bytes %lu", (unsigned long)bytes);
+   else snprintf(s, n, "-");
+}
+
+- (void)bgDrawLog:(NSUInteger)prim start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)inst
+   indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io rc:(int)rc
+{
+   static unsigned n;
+   unsigned k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+   if (k > 400 && (k & 63)) return;
+   char tex[200], vb0[48], fb0[48], fb3[48], line[640];
+   id<MTLTexture> t = _ftex0;
+   if (t) {
+      IOSurfaceRef sf = (IOSurfaceRef)[(BGMTLTexture *)t iosurface];
+      snprintf(tex, sizeof(tex), "%p %lux%lu fmt %lu type %lu storage %lu usage %lu surface %u%s%s", t, (unsigned long)[t width],
+               (unsigned long)[t height], (unsigned long)[t pixelFormat], (unsigned long)[t textureType], (unsigned long)[t storageMode],
+               (unsigned long)[t usage], sf ? (unsigned)IOSurfaceGetID(sf) : 0u, [t parentTexture] ? " view" : "", [t buffer] ? " buffer-backed" : "");
+   } else {
+      snprintf(tex, sizeof(tex), "nil");
+   }
+   bg_buf_desc(vb0, sizeof(vb0), _vbuf[0], _voff[0], _vbytes[0]);
+   bg_buf_desc(fb0, sizeof(fb0), _fbuf[0], _foff[0], _fbytes[0]);
+   bg_buf_desc(fb3, sizeof(fb3), _fbuf[3], _foff[3], _fbytes[3]);
+   snprintf(line, sizeof(line), "[%d] fidraw #%u %s prim %lu start %lu count %lu inst %lu index %s%lu+%lu type %lu rc %d | tex0 %s | vb0 %s fb0 %s fb3 %s",
+            getpid(), k, _pipeline->_names, (unsigned long)prim, (unsigned long)start, (unsigned long)count, (unsigned long)inst,
+            ib ? "buf " : "none ", ib ? (unsigned long)[(id<MTLBuffer>)ib length] : 0ul, (unsigned long)io, (unsigned long)it, rc, tex, vb0, fb0, fb3);
+   bgmtl_note_line(line);
+}
+
 - (void)bgDraw:(NSUInteger)prim start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)inst
    indexBuffer:(id)ib indexType:(NSUInteger)it indexOffset:(NSUInteger)io baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi
 {
    if (!_open) return;
    if (!_pipeline) { BG_LOG("draw with no pipeline\n"); return; }
+   if (bg_fidraw() && strstr(_pipeline->_names, "primitive_custom_vertex"))
+      [self bgDrawLog:prim start:start count:count instances:inst indexBuffer:ib indexType:it indexOffset:io rc:0];
    char why[512] = { 0 };
    int rc;
    if (ib) {
