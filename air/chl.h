@@ -250,6 +250,8 @@ enum { CHL_P_BEGIN, CHL_P_END, CHL_P_PIPE, CHL_P_STATE, CHL_P_VB, CHL_P_FLUSH, C
        CHL_P_CMDBUF, CHL_P_N };
 struct chl_prof { bool on; uint64_t t[CHL_P_N], n[CHL_P_N]; };
 extern struct chl_prof chl_prof;
+/* the memory cache of released textures, since the last call */
+void chl_memcache_stats(struct chl_device *d, unsigned long *hits, unsigned long *misses, double *mb);
 
 #pragma GCC visibility pop
 

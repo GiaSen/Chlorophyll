@@ -29,6 +29,7 @@
 #include "ir3/ir3_compiler.h"
 #include "common/freedreno_dev_info.h"
 #include "util/half_float.h"
+#include "util/os_time.h"
 #include "util/ralloc.h"
 
 /* ---- encode profile, see chl.h ---- */
@@ -49,6 +50,7 @@ typedef struct VkPipelineShaderStageNirCreateInfoMESA {
 extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 
 #define CHL_FENCE_TIMEOUT_NS 5000000000ull
+#define CHL_MEMC_SLOTS 64
 #define CHL_RING_SLAB (256u << 10)
 
 static int chl_trace = -1;
@@ -235,6 +237,7 @@ struct chl_texture {
    struct chl_texture *parent;    /* a view: the image and memory are the parent's */
    VkImage image;
    VkDeviceMemory mem;
+   VkDeviceSize mem_size;         /* what memc_take gave, 0 = its own memory to free */
    const struct chl_format *fmt;
    VkFormat vkfmt;                /* the view format */
    unsigned type, width, height, depth, levels, layers, samples;  /* layers: Vulkan array layers (6 per cube) */
@@ -376,6 +379,11 @@ struct chl_device {
    VkPhysicalDeviceProperties props;
    VkPhysicalDeviceMemoryProperties memprops;
    uint32_t mt_host;                 /* host-visible, coherent */
+   /* memory of released textures, see memc_take */
+   struct { VkDeviceMemory mem; VkDeviceSize size; uint64_t t; } memc[CHL_MEMC_SLOTS];
+   VkDeviceSize memc_bytes, memc_cap;
+   pthread_mutex_t memc_lock;
+   unsigned long memc_hits, memc_misses;
    char name[256];
    struct ir3_compiler *ir3;
    const nir_shader_compiler_options *nir_options;
@@ -658,6 +666,9 @@ chl_device_open(char *why, size_t why_size)
    pthread_mutex_init(&d->free_lock, NULL);
    pthread_mutex_init(&d->share_lock, NULL);
    pthread_mutex_init(&d->done_lock, NULL);
+   pthread_mutex_init(&d->memc_lock, NULL);
+   if (getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.nomemcache", F_OK) != 0)
+      d->memc_cap = 96ull << 20;
    pthread_cond_init(&d->done_cv, NULL);
    glsl_type_singleton_init_or_ref();
 
@@ -671,6 +682,21 @@ chl_device_open(char *why, size_t why_size)
             flags[strcspn(flags, "\r\n")] = 0;
             if (flags[0])
                setenv("TU_DEBUG", flags, 1);
+         }
+         fclose(f);
+      }
+   }
+
+   /* /private/var/tmp/chl.autotune: Turnip's TU_AUTOTUNE_ALGO, how each render pass chooses between GMEM tiles and direct
+    * memory. prefer_sysmem keeps the passes with framebuffer fetch on GMEM, which TU_DEBUG=sysmem does not (black wedges). */
+   if (!getenv("TU_AUTOTUNE_ALGO")) {
+      FILE *f = fopen("/private/var/tmp/chl.autotune", "r");
+      if (f) {
+         char algo[64] = "";
+         if (fgets(algo, sizeof(algo), f)) {
+            algo[strcspn(algo, "\r\n")] = 0;
+            if (algo[0])
+               setenv("TU_AUTOTUNE_ALGO", algo, 1);
          }
          fclose(f);
       }
@@ -810,6 +836,9 @@ chl_device_close(struct chl_device *d)
    pthread_mutex_unlock(&d->done_lock);
    pthread_join(d->thread, NULL);
    d->vk.vkDeviceWaitIdle(d->dev);
+   for (unsigned i = 0; i < CHL_MEMC_SLOTS; i++)
+      if (d->memc[i].mem)
+         d->vk.vkFreeMemory(d->dev, d->memc[i].mem, NULL);
    pthread_mutex_lock(&d->pro_lock);
    pro_reap(d, true);
    pthread_mutex_unlock(&d->pro_lock);
@@ -982,6 +1011,114 @@ storage_view(struct chl_texture *t, unsigned level)
    return t->storage[level];
 }
 
+/*
+ * The compositor makes hundreds of offscreen textures a second while a glass animation runs, many of a shape it never had
+ * before, so the shape-keyed pool in bgmtl.m misses. What a miss costs is the memory: a kernel allocation with its pages and
+ * mappings, and a kernel free later, on the render thread. A VkImage over memory that already exists costs almost nothing, so
+ * released memory is kept here for a few seconds and rounded up to reuse across sizes. Its contents are undefined, as a new
+ * image's are, and a texture is only released once no command buffer holds it. On with BGMTL_TEXPOOL_MB (backboardd);
+ * /private/var/tmp/chl.nomemcache turns it off.
+ */
+static VkDeviceSize
+memc_round(VkDeviceSize size)
+{
+   unsigned top = 63 - __builtin_clzll(size | 1);
+   VkDeviceSize step = top > 14 ? 1ull << (top - 2) : 16384;
+   return (size + step - 1) & ~(step - 1);
+}
+
+static void
+memc_expire(struct chl_device *d, uint64_t now)
+{
+   for (unsigned i = 0; i < CHL_MEMC_SLOTS; i++)
+      if (d->memc[i].mem && now - d->memc[i].t > 3000000000ull) {
+         d->vk.vkFreeMemory(d->dev, d->memc[i].mem, NULL);
+         d->memc_bytes -= d->memc[i].size;
+         d->memc[i].mem = VK_NULL_HANDLE;
+      }
+}
+
+static VkResult
+memc_take(struct chl_device *d, VkDeviceSize size, VkDeviceMemory *mem, VkDeviceSize *got)
+{
+   VkDeviceSize want = memc_round(size);
+   *got = 0;
+   if (d->memc_cap) {
+      int best = -1;
+      pthread_mutex_lock(&d->memc_lock);
+      memc_expire(d, os_time_get_nano());
+      for (unsigned i = 0; i < CHL_MEMC_SLOTS; i++)
+         if (d->memc[i].mem && d->memc[i].size >= size && d->memc[i].size <= want + want / 2 &&
+             (best < 0 || d->memc[i].size < d->memc[best].size))
+            best = (int)i;
+      if (best >= 0) {
+         *mem = d->memc[best].mem;
+         *got = d->memc[best].size;
+         d->memc_bytes -= *got;
+         d->memc[best].mem = VK_NULL_HANDLE;
+         d->memc_hits++;
+      } else {
+         d->memc_misses++;
+      }
+      pthread_mutex_unlock(&d->memc_lock);
+      if (*got)
+         return VK_SUCCESS;
+   }
+   VkDeviceSize alloc = d->memc_cap ? want : size;
+   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, alloc, d->mt_host };
+   VkResult r = d->vk.vkAllocateMemory(d->dev, &ai, NULL, mem);
+   if (r == VK_SUCCESS)
+      *got = alloc;
+   return r;
+}
+
+static void
+memc_give(struct chl_device *d, VkDeviceMemory mem, VkDeviceSize size)
+{
+   if (d->memc_cap && size && size <= d->memc_cap / 4) {
+      pthread_mutex_lock(&d->memc_lock);
+      uint64_t now = os_time_get_nano();
+      memc_expire(d, now);
+      int slot = -1, oldest = -1;
+      for (unsigned i = 0; i < CHL_MEMC_SLOTS; i++) {
+         if (!d->memc[i].mem) {
+            if (slot < 0)
+               slot = (int)i;
+         } else if (oldest < 0 || d->memc[i].t < d->memc[oldest].t) {
+            oldest = (int)i;
+         }
+      }
+      while (oldest >= 0 && (slot < 0 || d->memc_bytes + size > d->memc_cap)) {
+         d->vk.vkFreeMemory(d->dev, d->memc[oldest].mem, NULL);
+         d->memc_bytes -= d->memc[oldest].size;
+         d->memc[oldest].mem = VK_NULL_HANDLE;
+         slot = oldest;
+         oldest = -1;
+         for (unsigned i = 0; i < CHL_MEMC_SLOTS; i++)
+            if (d->memc[i].mem && (oldest < 0 || d->memc[i].t < d->memc[oldest].t))
+               oldest = (int)i;
+      }
+      d->memc[slot].mem = mem;
+      d->memc[slot].size = size;
+      d->memc[slot].t = now;
+      d->memc_bytes += size;
+      pthread_mutex_unlock(&d->memc_lock);
+      return;
+   }
+   d->vk.vkFreeMemory(d->dev, mem, NULL);
+}
+
+void
+chl_memcache_stats(struct chl_device *d, unsigned long *hits, unsigned long *misses, double *mb)
+{
+   pthread_mutex_lock(&d->memc_lock);
+   *hits = d->memc_hits;
+   *misses = d->memc_misses;
+   *mb = d->memc_bytes / 1048576.0;
+   d->memc_hits = d->memc_misses = 0;
+   pthread_mutex_unlock(&d->memc_lock);
+}
+
 static void
 transition_new_image(struct chl_device *d, struct chl_texture *t)
 {
@@ -1094,8 +1231,7 @@ chl_texture_create(struct chl_device *d, const struct chl_texture_desc *desc, ch
    }
    VkMemoryRequirements req;
    d->vk.vkGetImageMemoryRequirements(d->dev, t->image, &req);
-   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, d->mt_host };
-   if (d->vk.vkAllocateMemory(d->dev, &ai, NULL, &t->mem) != VK_SUCCESS ||
+   if (memc_take(d, req.size, &t->mem, &t->mem_size) != VK_SUCCESS ||
        d->vk.vkBindImageMemory(d->dev, t->image, t->mem, 0) != VK_SUCCESS) {
       say(why, why_size, "%s would not allocate %llu bytes for a %ux%u %s", d->name, (unsigned long long)req.size, w, h, f->name);
       if (t->mem)
@@ -2439,8 +2575,12 @@ destroy_obj(struct chl_obj *o)
          obj_release(&t->parent->o);
       } else {
          d->vk.vkDestroyImage(d->dev, t->image, NULL);
-         if (t->mem)
-            d->vk.vkFreeMemory(d->dev, t->mem, NULL);
+         if (t->mem) {
+            if (t->mem_size)
+               memc_give(d, t->mem, t->mem_size);
+            else
+               d->vk.vkFreeMemory(d->dev, t->mem, NULL);
+         }
       }
       break;
    }

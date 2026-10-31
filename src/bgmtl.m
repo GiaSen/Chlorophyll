@@ -1722,6 +1722,15 @@ bg_perf_note(uint64_t t_first, uint64_t t_begin, uint64_t t_flushed, uint64_t t_
          snprintf(line, sizeof(line), "texpool: %lu hits, %lu misses, %.1f MB held", g_texpool_hits, g_texpool_misses,
                   g_texpool_bytes / 1048576.0);
          bgmtl_note_line(line);
+         struct chl_device *mcd = NULL;
+         for (unsigned k = 0; k < BG_TEXPOOL_SLOTS && !mcd; k++) mcd = g_texpool[k].dev;
+         if (mcd) {
+            unsigned long mh, mm;
+            double mb;
+            chl_memcache_stats(mcd, &mh, &mm, &mb);
+            snprintf(line, sizeof(line), "memcache: %lu hits, %lu misses, %.1f MB held", mh, mm, mb);
+            bgmtl_note_line(line);
+         }
          g_texpool_hits = g_texpool_misses = 0;
       }
       burst_ns = burst_frames = bin[0] = bin[1] = bin[2] = bin[3] = 0;

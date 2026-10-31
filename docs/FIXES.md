@@ -212,3 +212,18 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
   template, after the check, and fall back to tiled if the allocation refuses. `-replaceRegion:` then writes through
   the mapping for most uploads. Probe 18/18; texture uploads 6.4 % -> 4 % of backboardd, our share 37 % -> 30 %;
   `RWA_LINEAR_SAMPLED=0` turns it off.
+
+## Texture memory stays around for a few seconds (2026-10-31, Mi 8)
+
+A glass animation makes hundreds of offscreen textures a second, many of a shape never seen before, so the shape-keyed pool in
+bgmtl.m misses (400-800 misses per scene). A miss cost a kernel allocation, and later a kernel free, on the render thread.
+`memc_take` / `memc_give` (air/chl_vk.c) keep released texture memory for 3 s, rounded up to a quarter of its power of two, up to
+96 MB, and only in backboardd (with BGMTL_TEXPOOL_MB). A VkImage over existing memory costs almost nothing. `/private/var/tmp/chl.nomemcache`
+turns it off; `memcache:` lines in bgmtl.log count it (bgmtl.perf). Reused memory holds old pixels, as Metal allows; screenshots and a
+5 minute soak showed no damage.
+
+`TU_DEBUG=sysmem` is NOT usable here: GPU time drops by 15-25% but the picture breaks, black wedges and staircases in Control Center
+and on icons. It forces passes with framebuffer fetch off GMEM. Turnip's autotuner keeps those on GMEM by itself, and
+`/private/var/tmp/chl.autotune` = `prefer_sysmem` (TU_AUTOTUNE_ALGO) is clean, but gains nothing because the glass passes are the ones that
+stay on GMEM. Left at the default. Look at screenshots before believing a frame-rate gain.
+
