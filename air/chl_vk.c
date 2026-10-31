@@ -5,7 +5,9 @@
  * driver's own, reached through vk_icdGetInstanceProcAddr with no loader in between.
  */
 
+#include <dlfcn.h>
 #include <errno.h>
+#include <mach-o/loader.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -25,7 +27,10 @@
 
 #include "nir.h"
 #include "nir_builder.h"
+#include "nir_serialize.h"
 #include "compiler/glsl_types.h"
+#include "util/blob.h"
+#include "util/disk_cache.h"
 #include "ir3/ir3_compiler.h"
 #include "common/freedreno_dev_info.h"
 #include "util/half_float.h"
@@ -92,7 +97,8 @@ say(char *why, size_t why_size, const char *fmt, ...)
    X(vkCmdSetDepthBias) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) \
    X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) \
    X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBiasEnable) \
-   X(vkCmdSetPrimitiveRestartEnable)
+   X(vkCmdSetPrimitiveRestartEnable) \
+   X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 struct chl_vk {
 #define X(n) PFN_##n n;
@@ -353,6 +359,10 @@ struct chl_cmdbuf {
    uint32_t pushed_pc[2][64];
    bool vp_set, sc_set;
    struct chl_cmdbuf *next_free, *next_inflight;
+   /* /private/var/tmp/chl.passprof: the GPU time of each render pass, chl_cmdbuf_pass_line */
+   VkQueryPool qp;
+   struct chl_pass_note { unsigned w, h, colors, draws, nfs; char fs[4][28]; } *pass_notes;
+   unsigned n_pass;
 };
 
 struct chl_shared_layout {
@@ -387,6 +397,7 @@ struct chl_device {
    char name[256];
    struct ir3_compiler *ir3;
    const nir_shader_compiler_options *nir_options;
+   struct disk_cache *air_cache;     /* AIR -> NIR translations, see translate_cached */
    unsigned align;                   /* descriptor offset alignment (64 on Turnip) */
    VkSampler default_sampler;
 
@@ -415,6 +426,8 @@ struct chl_device {
    pthread_mutex_t done_lock;
    pthread_cond_t done_cv;
    struct chl_cmdbuf *inflight_head, *inflight_tail;
+   unsigned n_inflight, inflight_limit;   /* see chl_cmdbuf_commit */
+   bool passprof;
    bool quit;
 };
 
@@ -631,6 +644,7 @@ completion_thread(void *arg)
       d->inflight_head = cb->next_inflight;
       if (!d->inflight_head)
          d->inflight_tail = NULL;
+      d->n_inflight--;
       pthread_mutex_unlock(&d->done_lock);
       /* what it held goes first: once it is reported done, its owner may recycle it (chl_cmdbuf_release) */
       cb_retire(cb);
@@ -653,6 +667,8 @@ completion_thread(void *arg)
 /* ---------------------------------------------------------------------------------------------------------------------
  * Device
  */
+static void air_cache_open(struct chl_device *d);
+
 struct chl_device *
 chl_device_open(char *why, size_t why_size)
 {
@@ -669,6 +685,16 @@ chl_device_open(char *why, size_t why_size)
    pthread_mutex_init(&d->memc_lock, NULL);
    if (getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.nomemcache", F_OK) != 0)
       d->memc_cap = 96ull << 20;
+   d->passprof = getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.passprof", F_OK) == 0;
+   if (getenv("BGMTL_TEXPOOL_MB")) {
+      FILE *f = fopen("/private/var/tmp/chl.inflight", "r");
+      d->inflight_limit = 2;
+      if (f) {
+         if (fscanf(f, "%u", &d->inflight_limit) != 1)
+            d->inflight_limit = 2;
+         fclose(f);
+      }
+   }
    pthread_cond_init(&d->done_cv, NULL);
    glsl_type_singleton_init_or_ref();
 
@@ -813,6 +839,7 @@ chl_device_open(char *why, size_t why_size)
       say(why, why_size, "no completion thread");
       goto fail;
    }
+   air_cache_open(d);
    return d;
 
 fail:
@@ -836,6 +863,8 @@ chl_device_close(struct chl_device *d)
    pthread_mutex_unlock(&d->done_lock);
    pthread_join(d->thread, NULL);
    d->vk.vkDeviceWaitIdle(d->dev);
+   if (d->air_cache)
+      disk_cache_destroy(d->air_cache);
    for (unsigned i = 0; i < CHL_MEMC_SLOTS; i++)
       if (d->memc[i].mem)
          d->vk.vkFreeMemory(d->dev, d->memc[i].mem, NULL);
@@ -1714,10 +1743,176 @@ inline_sampler(struct chl_device *d, const struct air_resource *r, bool compare,
 /* ---------------------------------------------------------------------------------------------------------------------
  * Shaders and layouts
  */
-static bool
-translate(struct chl_device *d, void *mem_ctx, const struct chl_function *fn, mesa_shader_stage want, unsigned stage,
-          struct chl_stage_info *out, struct air_vk_layout *layout, char *why, size_t why_size)
+/*
+ * AIR -> NIR translations on disk. Every process parsed and translated its pipelines' AIR again at every start, on the thread
+ * that wanted the pipeline, which is the render server's in the middle of a frame; the result depends only on the module, the
+ * entry point, the constants, the linked functions and this library's own code. So the NIR and the air_shader_info beside it
+ * are kept in a Mesa disk cache of their own ("chlorophyll-air", in MESA_SHADER_CACHE_DIR beside ir3's binaries), under this
+ * library's LC_UUID: a rebuilt library never reads another build's translations. Turnip's own disk cache then finds the
+ * compiled binary, since the same bytes of NIR hash the same. /private/var/tmp/chl.noaircache turns this one off.
+ */
+#define AIR_CACHE_MAGIC 0x43484c32u   /* "CHL2": bump with any change to what is written below */
+
+static void
+air_cache_open(struct chl_device *d)
 {
+   Dl_info di;
+   if (access("/private/var/tmp/chl.noaircache", F_OK) == 0 || !dladdr((const void *)air_cache_open, &di) || !di.dli_fbase)
+      return;
+   const struct mach_header_64 *h = di.dli_fbase;
+   const struct load_command *lc = (const struct load_command *)(h + 1);
+   for (uint32_t i = 0; i < h->ncmds; i++) {
+      if (lc->cmd == LC_UUID) {
+         char id[33];
+         for (unsigned k = 0; k < 16; k++)
+            snprintf(id + 2 * k, 3, "%02x", ((const struct uuid_command *)lc)->uuid[k]);
+         d->air_cache = disk_cache_create("chlorophyll-air", id, 0);
+         return;
+      }
+      lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+   }
+}
+
+static void
+blob_write_str(struct blob *b, const char *s)
+{
+   blob_write_uint8(b, s != NULL);
+   if (s)
+      blob_write_string(b, s);
+}
+
+static const char *
+blob_read_str(void *mem_ctx, struct blob_reader *r)
+{
+   if (!blob_read_uint8(r))
+      return NULL;
+   const char *s = blob_read_string(r);
+   return s ? ralloc_strdup(mem_ctx, s) : NULL;
+}
+
+/* constants a caller did not give come out of the module itself, so the module's bytes cover them */
+static void
+air_cache_key(struct disk_cache *cache, const struct chl_function *fn, cache_key key)
+{
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, AIR_CACHE_MAGIC);
+   blob_write_str(&b, fn->entry);
+   blob_write_uint64(&b, fn->size);
+   blob_write_bytes(&b, fn->bitcode, fn->size);
+   blob_write_uint32(&b, fn->constants ? fn->num_constants : 0);
+   if (fn->constants)
+      blob_write_bytes(&b, fn->constants, fn->num_constants * sizeof(struct air_constant_value));
+   blob_write_uint32(&b, fn->num_linked);
+   for (unsigned i = 0; i < fn->num_linked; i++) {
+      blob_write_str(&b, fn->linked[i].name);
+      blob_write_uint64(&b, fn->linked[i].size);
+      blob_write_bytes(&b, fn->linked[i].bitcode, fn->linked[i].size);
+   }
+   disk_cache_compute_key(cache, b.data, b.size, key);
+   blob_finish(&b);
+}
+
+/* the info as its raw bytes, then what its pointers point at; read back the same way and the pointers re-made */
+static void
+air_info_write(struct blob *b, const struct air_shader_info *info)
+{
+   blob_write_bytes(b, info, sizeof(*info));
+   blob_write_str(b, info->entry_point);
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      blob_write_bytes(b, &info->resources[i], sizeof(info->resources[i]));
+      blob_write_str(b, info->resources[i].name);
+      blob_write_str(b, info->resources[i].type_name);
+   }
+   for (unsigned i = 0; i < info->num_varyings; i++) {
+      blob_write_bytes(b, &info->varyings[i], sizeof(info->varyings[i]));
+      blob_write_str(b, info->varyings[i].name);
+   }
+   for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+      const struct air_vertex_attribute *a = &info->vertex_attributes[i];
+      blob_write_bytes(b, a, sizeof(*a));
+      blob_write_str(b, a->name);
+      blob_write_str(b, a->type_name);
+      blob_write_str(b, a->function_constant);
+   }
+   for (unsigned i = 0; i < info->num_notes; i++)
+      blob_write_str(b, info->notes ? info->notes[i] : NULL);
+}
+
+static bool
+air_info_read(void *mem_ctx, struct blob_reader *r, struct air_shader_info *info)
+{
+   blob_copy_bytes(r, info, sizeof(*info));
+   info->entry_point = blob_read_str(mem_ctx, r);
+   info->resources = info->num_resources ? rzalloc_array(mem_ctx, struct air_resource, info->num_resources) : NULL;
+   for (unsigned i = 0; i < info->num_resources && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->resources[i], sizeof(info->resources[i]));
+      info->resources[i].name = blob_read_str(mem_ctx, r);
+      info->resources[i].type_name = blob_read_str(mem_ctx, r);
+   }
+   info->varyings = info->num_varyings ? rzalloc_array(mem_ctx, struct air_varying, info->num_varyings) : NULL;
+   for (unsigned i = 0; i < info->num_varyings && !r->overrun; i++) {
+      blob_copy_bytes(r, &info->varyings[i], sizeof(info->varyings[i]));
+      info->varyings[i].name = blob_read_str(mem_ctx, r);
+   }
+   info->vertex_attributes = info->num_vertex_attributes
+      ? rzalloc_array(mem_ctx, struct air_vertex_attribute, info->num_vertex_attributes) : NULL;
+   for (unsigned i = 0; i < info->num_vertex_attributes && !r->overrun; i++) {
+      struct air_vertex_attribute *a = &info->vertex_attributes[i];
+      blob_copy_bytes(r, a, sizeof(*a));
+      a->name = blob_read_str(mem_ctx, r);
+      a->type_name = blob_read_str(mem_ctx, r);
+      a->function_constant = blob_read_str(mem_ctx, r);
+   }
+   info->notes = info->num_notes ? rzalloc_array(mem_ctx, const char *, info->num_notes) : NULL;
+   for (unsigned i = 0; i < info->num_notes && !r->overrun; i++)
+      info->notes[i] = blob_read_str(mem_ctx, r);
+   return !r->overrun;
+}
+
+/* where the last pipeline build on this thread went: translating, lowering for Vulkan, Turnip; translations not in the cache */
+static _Thread_local uint64_t build_ns[3];
+static _Thread_local unsigned build_misses;
+
+void
+chl_pipeline_build_stats(double ms[3], unsigned *not_cached)
+{
+   for (unsigned i = 0; i < 3; i++)
+      ms[i] = build_ns[i] / 1e6;
+   *not_cached = build_misses;
+}
+
+static uint64_t
+build_now(void)
+{
+   return clock_gettime_nsec_np(CLOCK_MONOTONIC);
+}
+
+static nir_shader *
+translate_cached(struct chl_device *d, void *mem_ctx, const struct chl_function *fn, struct air_shader_info *info, const char **error)
+{
+   cache_key key;
+   if (d->air_cache) {
+      air_cache_key(d->air_cache, fn, key);
+      size_t got = 0;
+      void *data = disk_cache_get(d->air_cache, key, &got);
+      if (data) {
+         struct blob_reader r;
+         blob_reader_init(&r, data, got);
+         struct air_shader_info cached;
+         if (blob_read_uint32(&r) == AIR_CACHE_MAGIC && air_info_read(mem_ctx, &r, &cached)) {
+            nir_shader *nir = nir_deserialize(mem_ctx, d->nir_options, &r);
+            if (nir && !r.overrun) {
+               *info = cached;
+               free(data);
+               return nir;
+            }
+            ralloc_free(nir);
+         }
+         free(data);   /* unreadable: translated again below, and the entry replaced */
+      }
+   }
+   build_misses++;
    struct air_constant_value *constants = (struct air_constant_value *)fn->constants;
    unsigned num_constants = fn->num_constants;
    if (!constants)
@@ -1725,8 +1920,28 @@ translate(struct chl_device *d, void *mem_ctx, const struct chl_function *fn, me
    _Static_assert(sizeof(struct chl_linked_function) == sizeof(struct air_linked_function), "linked function layouts");
    const struct air_to_nir_options opts = { .constants = constants, .num_constants = num_constants,
                                             .linked = (const struct air_linked_function *)fn->linked, .num_linked = fn->num_linked };
+   nir_shader *nir = air_to_nir(mem_ctx, fn->bitcode, fn->size, fn->entry, &opts, d->nir_options, info, error);
+   if (!nir || !d->air_cache)
+      return nir;
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, AIR_CACHE_MAGIC);
+   air_info_write(&b, info);
+   nir_serialize(&b, nir, false);
+   if (!b.out_of_memory)
+      disk_cache_put(d->air_cache, key, b.data, b.size, NULL);
+   blob_finish(&b);
+   return nir;
+}
+
+static bool
+translate(struct chl_device *d, void *mem_ctx, const struct chl_function *fn, mesa_shader_stage want, unsigned stage,
+          struct chl_stage_info *out, struct air_vk_layout *layout, char *why, size_t why_size)
+{
    const char *error = NULL;
-   out->nir = air_to_nir(mem_ctx, fn->bitcode, fn->size, fn->entry, &opts, d->nir_options, &out->info, &error);
+   uint64_t t0 = build_now();
+   out->nir = translate_cached(d, mem_ctx, fn, &out->info, &error);
+   build_ns[0] += build_now() - t0;
    if (!out->nir) {
       say(why, why_size, "%s", error ? error : "the function could not be translated");
       return false;
@@ -1760,7 +1975,10 @@ translate(struct chl_device *d, void *mem_ctx, const struct chl_function *fn, me
          break;
       }
    }
-   if (!air_nir_to_vulkan(out->nir, &out->info, stage, layout, why, why_size))
+   t0 = build_now();
+   bool lowered = air_nir_to_vulkan(out->nir, &out->info, stage, layout, why, why_size);
+   build_ns[1] += build_now() - t0;
+   if (!lowered)
       return false;
    out->nir->options = NULL;   /* Turnip sets its own when it takes the shader */
    return true;
@@ -2007,6 +2225,29 @@ compute_variant(struct chl_compute_pipeline *p, const unsigned threads[3], unsig
 /* ---------------------------------------------------------------------------------------------------------------------
  * Command buffers
  */
+#define CHL_PASS_MAX 48
+#define CHL_PASS_STAMPS (1 + 2 * CHL_PASS_MAX)
+
+/* pass i of a finished command buffer as a line, empty when it and the gap before it are under min_ms; 0: no such pass */
+int
+chl_cmdbuf_pass_line(struct chl_cmdbuf *cb, unsigned i, double min_ms, char *out, size_t size)
+{
+   struct chl_device *d = cb->dev;
+   uint64_t t[CHL_PASS_STAMPS];
+   if (!cb->qp || i >= cb->n_pass)
+      return 0;
+   out[0] = 0;
+   if (d->vk.vkGetQueryPoolResults(d->dev, cb->qp, 0, 1 + 2 * cb->n_pass, sizeof(t), t, sizeof(t[0]), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+      return 0;
+   const double ms = d->props.limits.timestampPeriod / 1e6;
+   const double gap = (t[1 + 2 * i] - t[2 * i]) * ms, pass = (t[2 + 2 * i] - t[1 + 2 * i]) * ms;
+   const struct chl_pass_note *n = &cb->pass_notes[i];
+   if (gap >= min_ms || pass >= min_ms)
+      snprintf(out, size, "pass %u/%u: gap %.1f, %.1f ms, %ux%u c%u, %u draws: %s %s %s %s", i, cb->n_pass, gap, pass, n->w, n->h, n->colors, n->draws,
+               n->nfs > 0 ? n->fs[0] : "", n->nfs > 1 ? n->fs[1] : "", n->nfs > 2 ? n->fs[2] : "", n->nfs > 3 ? n->fs[3] : "");
+   return 1;
+}
+
 struct chl_cmdbuf *
 chl_cmdbuf_create(struct chl_device *d, char *why, size_t why_size)
 {
@@ -2038,6 +2279,19 @@ chl_cmdbuf_create(struct chl_device *d, char *why, size_t why_size)
    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
                                    NULL };
    d->vk.vkBeginCommandBuffer(cb->cb, &bi);
+   cb->n_pass = 0;
+   if (d->passprof) {
+      if (!cb->qp) {
+         VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, CHL_PASS_STAMPS, 0 };
+         cb->pass_notes = calloc(CHL_PASS_MAX, sizeof(*cb->pass_notes));
+         if (!cb->pass_notes || d->vk.vkCreateQueryPool(d->dev, &qi, NULL, &cb->qp) != VK_SUCCESS)
+            cb->qp = VK_NULL_HANDLE;
+      }
+      if (cb->qp) {
+         d->vk.vkCmdResetQueryPool(cb->cb, cb->qp, 0, CHL_PASS_STAMPS);
+         d->vk.vkCmdWriteTimestamp(cb->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, cb->qp, 0);
+      }
+   }
    cb->committed = cb->done = cb->failed = false;
    cb->done_fn = NULL;
    cb->enc = ENC_NONE;
@@ -2080,6 +2334,16 @@ cb_recycle(struct chl_cmdbuf *cb)
    pthread_mutex_unlock(&d->free_lock);
 }
 
+/* the last commit on this thread: held back by the frame limit, waiting for the locks, the prologue work, vkQueueSubmit */
+static _Thread_local uint64_t commit_ns[4];
+
+void
+chl_commit_stats(double ms[4])
+{
+   for (unsigned i = 0; i < 4; i++)
+      ms[i] = commit_ns[i] / 1e6;
+}
+
 int
 chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why, size_t why_size)
 {
@@ -2095,16 +2359,49 @@ chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why,
    cb->done_ctx = ctx;
    cb->committed = true;
 
+   /*
+    * The render server's frames, at most inflight_limit on the ring (the inject's BGMTL_TEXPOOL_MB marks that process;
+    * /private/var/tmp/chl.inflight overrides the 2, 0 is no limit). Nothing else holds it back: a compositor that outruns
+    * the GPU queues frames that are stale by the time they are drawn, and the display, which shows the newest finished
+    * one, drops most of them. Waiting here means the next frame is encoded from fresher state. The time limit is there so
+    * that a very long frame costs no more than it did.
+    */
+   uint64_t tw = build_now();
+   if (d->inflight_limit) {
+      pthread_mutex_lock(&d->done_lock);
+      if (d->n_inflight >= d->inflight_limit) {
+         struct timespec deadline;
+         clock_gettime(CLOCK_REALTIME, &deadline);
+         deadline.tv_nsec += 100000000;
+         if (deadline.tv_nsec >= 1000000000) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000;
+         }
+         while (d->n_inflight >= d->inflight_limit && !d->quit &&
+                pthread_cond_timedwait(&d->done_cv, &d->done_lock, &deadline) == 0) {
+         }
+      }
+      pthread_mutex_unlock(&d->done_lock);
+   }
+   uint64_t t0 = build_now();
    pthread_mutex_lock(&d->queue_lock);
    pthread_mutex_lock(&d->pro_lock);
+   uint64_t t1 = build_now();
    VkResult r = pro_submit_locked(d);
    pthread_mutex_unlock(&d->pro_lock);
+   uint64_t t2 = build_now();
    if (r == VK_SUCCESS) {
       VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb->cb, 0, NULL };
       r = d->vk.vkQueueSubmit(d->queue, 1, &si, cb->fence);
    }
+   uint64_t t3 = build_now();
+   commit_ns[0] = t0 - tw;
+   commit_ns[1] = t1 - t0;
+   commit_ns[2] = t2 - t1;
+   commit_ns[3] = t3 - t2;
    if (r == VK_SUCCESS) {
       pthread_mutex_lock(&d->done_lock);
+      d->n_inflight++;
       cb->next_inflight = NULL;
       if (d->inflight_tail)
          d->inflight_tail->next_inflight = cb;

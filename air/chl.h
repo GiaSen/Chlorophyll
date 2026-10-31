@@ -252,6 +252,14 @@ struct chl_prof { bool on; uint64_t t[CHL_P_N], n[CHL_P_N]; };
 extern struct chl_prof chl_prof;
 /* the memory cache of released textures, since the last call */
 void chl_memcache_stats(struct chl_device *d, unsigned long *hits, unsigned long *misses, double *mb);
+/* where the last render pipeline built on this thread went: ms[0] translating AIR, ms[1] lowering for Vulkan, ms[2] Turnip;
+ * how many of its functions were not in the translation cache */
+void chl_pipeline_build_stats(double ms[3], unsigned *not_cached);
+/* the last commit on this thread: ms[0] held back by the frame limit, ms[1] waiting for the locks, ms[2] the prologue work, ms[3] vkQueueSubmit */
+void chl_commit_stats(double ms[4]);
+/* /private/var/tmp/chl.passprof, render server only: pass i of a finished command buffer as a line (gap before it, its GPU time, size,
+ * draws, fragment functions), empty when both are under min_ms; returns 0 when there is no such pass */
+int chl_cmdbuf_pass_line(struct chl_cmdbuf *cb, unsigned i, double min_ms, char *out, size_t size);
 
 #pragma GCC visibility pop
 

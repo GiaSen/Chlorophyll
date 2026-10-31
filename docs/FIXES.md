@@ -227,3 +227,23 @@ and on icons. It forces passes with framebuffer fetch off GMEM. Turnip's autotun
 `/private/var/tmp/chl.autotune` = `prefer_sysmem` (TU_AUTOTUNE_ALGO) is clean, but gains nothing because the glass passes are the ones that
 stay on GMEM. Left at the default. Look at screenshots before believing a frame-rate gain.
 
+## The first gestures after a boot, and what held encoding back (2026-10-31, Mi 8)
+
+**Translations on disk.** `air_metal.c`'s translation cache was never ported to Chlorophyll: `translate` (air/chl_vk.c) parsed and translated
+AIR at every pipeline build, in every process, after every boot, on whichever thread wanted the pipeline. `translate_cached` keeps the NIR and
+the air_shader_info in a Mesa disk cache of their own ("chlorophyll-air", beside Turnip's), under this library's LC_UUID. A rebuilt library starts
+cold, so its first boot costs about a minute of compiling. `/private/var/tmp/chl.noaircache` turns it off. backboardd, same gestures on three boots each:
+224 pipelines in 6.2-7.2 s before, 240 in 2.6-2.9 s after.
+
+**At most two frames on the ring.** Kernel patch 3021 removed two waits that made the render thread wait for the GPU (see NOTES.md). They were also
+the only thing holding the compositor back: without them it queued frames faster than the GPU drew them, the display, which shows the newest finished
+frame, dropped most, and shown fps fell (Control Center open 38-43 to 33-35) while rendered fps rose. `chl_cmdbuf_commit` now holds the render server
+at two command buffers in flight, 100 ms at most per commit. `/private/var/tmp/chl.inflight` overrides the 2; 0 is no limit.
+
+**Where a slow frame's GPU time goes.** `/private/var/tmp/chl.passprof`, read at process start in backboardd only: GPU timestamps around each render pass.
+The file holds the GPU time in ms above which a command buffer's passes are listed (default 80); `pass` lines in bgmtl.log give the gap before the pass,
+its time, size, draws and the first four fragment functions. `slowcb:` (over 50 ms from flush to done, any process) and `slowcommit:` (over 30 ms) have
+timestamps, as do `hitch:` and `slow:` lines.
+
+Tried and rejected, each measured: bigger VSC (binning) buffers, no overflow was ever logged, also at upstream's sizes; `prefer_gmem`, first-unlock GPU time unchanged.
+

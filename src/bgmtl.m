@@ -348,22 +348,14 @@ __attribute__((weak)) void bgmtl_note_committed(void) {}   // a command buffer w
 __attribute__((weak)) void bgmtl_note_line(const char *line) { (void)line; }   // one diagnostic line, logged by the injection dylib
 __attribute__((weak)) void bgmtl_note_present(const char *line) { (void)line; }   // per-present diagnostics, logged (rate-limited) by the injection dylib
 
-// Chlorophyll: where a slow start goes (/private/var/tmp/bgmtl.perf at process start): pipeline builds and single commits that
-// take long. Totals are logged every 16 pipelines and any single wait over 100 ms is logged at once.
+// Chlorophyll: where a slow start goes (/private/var/tmp/bgmtl.perf at process start): pipeline builds. Totals are logged every
+// 16 pipelines and any single build over 30 ms is logged at once.
 static int
 bg_perf_on(void)
 {
    static int on = -1;
    if (on < 0) on = access("/private/var/tmp/bgmtl.perf", F_OK) == 0;
    return on;
-}
-static void
-bg_perf_slow(const char *what, const char *name, uint64_t ns)
-{
-   if (!bg_perf_on() || ns < 100000000ull) return;
-   char line[256];
-   snprintf(line, sizeof(line), "slow: %s %s: %.1f ms", what, name ? name : "", ns / 1e6);
-   bgmtl_note_line(line);
 }
 
 @class BGMTLDevice;
@@ -1151,11 +1143,23 @@ bg_air_slice(NSData *d)
    uint64_t pt1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    if (bg_perf_on()) {
       static uint64_t n, buildns;
-      n++; buildns += pt1 - pt0;
-      bg_perf_slow("pipeline build", fragment ? [[fragment name] UTF8String] : [[vertex name] UTF8String], pt1 - pt0);
+      static double total[3];
+      static unsigned long uncached;
+      double ms[3];
+      unsigned nc;
+      chl_pipeline_build_stats(ms, &nc);
+      n++; buildns += pt1 - pt0; uncached += nc;
+      for (unsigned i = 0; i < 3; i++) total[i] += ms[i];
+      if (pt1 - pt0 >= 30000000ull) {
+         char line[256];
+         snprintf(line, sizeof(line), "slow: %.3f: pipeline build %s: %.1f ms (translate %.1f, %u not cached; lower %.1f; turnip %.1f)", pt1 / 1e9,
+                  fragment ? [[fragment name] UTF8String] : [[vertex name] UTF8String], (pt1 - pt0) / 1e6, ms[0], nc, ms[1], ms[2]);
+         bgmtl_note_line(line);
+      }
       if (n % 16 == 0) {
-         char line[160];
-         snprintf(line, sizeof(line), "pipelines: %llu built, %.0f ms building", (unsigned long long)n, buildns / 1e6);
+         char line[200];
+         snprintf(line, sizeof(line), "pipelines: %llu built, %.0f ms building (translate %.0f, %lu not cached; lower %.0f; turnip %.0f), %.1f s after boot",
+                  (unsigned long long)n, buildns / 1e6, total[0], uncached, total[1], total[2], clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1e9);
          bgmtl_note_line(line);
       }
    }
@@ -1704,9 +1708,15 @@ bg_perf_note(uint64_t t_first, uint64_t t_begin, uint64_t t_flushed, uint64_t t_
    static uint64_t prev_first, prev_done, prev_flushed;
    if (prev_first && t_first - prev_first > 40000000ull && t_first - prev_first < 400000000ull) {
       char hl[200];
-      snprintf(hl, sizeof(hl), "hitch: %.0f ms; prev encode..flush %.1f, prev gpu %.1f, then idle %.1f; this encode %.1f, submit %.1f, gpu %.1f, %llu draws",
-               (t_first - prev_first) / 1e6, (prev_flushed - prev_first) / 1e6, prev_done > prev_flushed ? (prev_done - prev_flushed) / 1e6 : 0,
+      snprintf(hl, sizeof(hl), "hitch: %.3f: %.0f ms; prev encode..flush %.1f, prev gpu %.1f, then idle %.1f; this encode %.1f, submit %.1f, gpu %.1f, %llu draws",
+               t_first / 1e9, (t_first - prev_first) / 1e6, (prev_flushed - prev_first) / 1e6, prev_done > prev_flushed ? (prev_done - prev_flushed) / 1e6 : 0,
                t_first > prev_done ? (t_first - prev_done) / 1e6 : 0, e / 1e6, s / 1e6, w / 1e6, (unsigned long long)ndraw);
+      bgmtl_note_line(hl);
+   }
+   // a command buffer the GPU took long over, or stood behind another process's in the one ring
+   if (w > 50000000ull) {
+      char hl[160];
+      snprintf(hl, sizeof(hl), "slowcb: %.3f..%.3f: gpu %.1f ms, %llu draws", t_flushed / 1e9, t_done / 1e9, w / 1e6, (unsigned long long)ndraw);
       bgmtl_note_line(hl);
    }
    prev_first = t_first; prev_done = t_done; prev_flushed = t_flushed;
@@ -1760,6 +1770,21 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       else cb->_status = 4;   // Completed
       uint64_t t_done = clock_gettime_nsec_np(CLOCK_MONOTONIC), t_flushed = __atomic_load_n(&cb->_t_flushed, __ATOMIC_RELAXED);
       bg_perf_note(cb->_t_first, d->t_begin, t_flushed ? t_flushed : t_done, t_done, cb->_draws);
+      // /private/var/tmp/chl.passprof holds the GPU time in ms above which a frame's passes are listed (default 80)
+      static long passprof_ms = -1;
+      if (passprof_ms < 0) {
+         FILE *f = fopen("/private/var/tmp/chl.passprof", "r");
+         passprof_ms = 80;
+         if (f) {
+            if (fscanf(f, "%ld", &passprof_ms) != 1) passprof_ms = 80;
+            fclose(f);
+         }
+      }
+      if (t_flushed && t_done - t_flushed > (uint64_t)passprof_ms * 1000000ull) {
+         char line[220];
+         for (unsigned i = 0; chl_cmdbuf_pass_line(cb->_ccb, i, 5.0, line, sizeof(line)); i++)
+            if (line[0]) bgmtl_note_line(line);
+      }
       [cb bgCompleteFrom:d->t_begin];
       dispatch_group_leave(cb->_done);
    }
@@ -1815,7 +1840,15 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       ctx->t_begin = t_begin;
       [self retain];
       (void)chl_cmdbuf_commit(_ccb, bg_cmdbuf_done, ctx, why, sizeof(why));   // on a failure bg_cmdbuf_done has already run, here
-      __atomic_store_n(&_t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), __ATOMIC_RELAXED);
+      uint64_t t_fl = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+      if (bg_perf_on() && t_fl - t_begin > 30000000ull) {
+         double ms[4];
+         char line[160];
+         chl_commit_stats(ms);
+         snprintf(line, sizeof(line), "slowcommit: %.3f: %.1f ms; frame limit %.1f, locks %.1f, prologue %.1f, vkQueueSubmit %.1f", t_fl / 1e9, (t_fl - t_begin) / 1e6, ms[0], ms[1], ms[2], ms[3]);
+         bgmtl_note_line(line);
+      }
+      __atomic_store_n(&_t_flushed, t_fl, __ATOMIC_RELAXED);
       for (void (^h)(id) in sched) h(self);
       [sched release];
       __atomic_store_n(&_sched_thread, (pthread_t)NULL, __ATOMIC_RELEASE);

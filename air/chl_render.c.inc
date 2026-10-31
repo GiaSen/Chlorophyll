@@ -111,6 +111,8 @@ chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipelin
       say(why, why_size, "out of memory making a render pipeline");
       return NULL;
    }
+   memset(build_ns, 0, sizeof(build_ns));
+   build_misses = 0;
    obj_init(&p->o, d, K_RENDER);
    p->mem_ctx = ralloc_context(NULL);
    if (!translate(d, p->mem_ctx, &desc->vertex, MESA_SHADER_VERTEX, 0, &p->vs, &p->layout.bindings, why, why_size))
@@ -226,7 +228,9 @@ chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipelin
    VkGraphicsPipelineCreateInfo gci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, p->fs.nir ? 2u : 1u, stages, &vi, &ia,
                                         NULL, &vp, &rs, &ms, &dss, &cbs, &ds, p->layout.layout, VK_NULL_HANDLE, 0,
                                         VK_NULL_HANDLE, -1 };
+   uint64_t t0 = build_now();
    VkResult r = d->vk.vkCreateGraphicsPipelines(d->dev, VK_NULL_HANDLE, 1, &gci, NULL, &p->vk);
+   build_ns[2] = build_now() - t0;
    if (r != VK_SUCCESS) {
       say(why, why_size, "Turnip would not compile the render pipeline %s + %s (VkResult %d)",
           p->vs.info.entry_point ? p->vs.info.entry_point : "vertex",
@@ -342,6 +346,14 @@ chl_render_begin(struct chl_cmdbuf *cb, const struct chl_render_pass *pass, char
    attachment_info(cb, &pass->stencil, &sten, false, true);
    /* a combined depth/stencil texture bound to both is one attachment in two roles */
    full_barrier(d, cb->cb);
+   if (cb->qp && cb->n_pass < CHL_PASS_MAX) {
+      struct chl_pass_note *n = &cb->pass_notes[cb->n_pass];
+      memset(n, 0, sizeof(*n));
+      n->w = w;
+      n->h = h;
+      n->colors = ncolor;
+      d->vk.vkCmdWriteTimestamp(cb->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->qp, 1 + 2 * cb->n_pass);
+   }
    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { w, h } }, 1, 0, ncolor, col,
                           pass->depth.texture ? &dep : NULL, pass->stencil.texture ? &sten : NULL };
    d->vk.vkCmdBeginRendering(cb->cb, &ri);
@@ -374,6 +386,14 @@ chl_set_render_pipeline(struct chl_cmdbuf *cb, struct chl_render_pipeline *p)
    P_START(pt);
    cb->rp = p;
    cb_hold(cb, &p->o);
+   if (cb->qp && cb->n_pass < CHL_PASS_MAX && cb->enc == ENC_RENDER && p->fs.info.entry_point) {
+      struct chl_pass_note *n = &cb->pass_notes[cb->n_pass];
+      bool seen = false;
+      for (unsigned i = 0; i < n->nfs && !seen; i++)
+         seen = !strncmp(n->fs[i], p->fs.info.entry_point, sizeof(n->fs[i]) - 1);
+      if (!seen && n->nfs < 4)
+         snprintf(n->fs[n->nfs++], sizeof(n->fs[0]), "%s", p->fs.info.entry_point);
+   }
    cb->dev->vk.vkCmdBindPipeline(cb->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->vk);
    P_MARK(pt, CHL_P_PIPE);
 }
@@ -481,6 +501,8 @@ chl_draw(struct chl_cmdbuf *cb, unsigned mtl_primitive, unsigned vertex_start, u
 {
    if (!vertex_count)
       return 0;
+   if (cb->qp && cb->n_pass < CHL_PASS_MAX)
+      cb->pass_notes[cb->n_pass].draws++;
    if (draw_prologue(cb, mtl_primitive, false, why, why_size) != 0)
       return -1;
    P_START(pt);
@@ -496,6 +518,8 @@ chl_draw_indexed(struct chl_cmdbuf *cb, unsigned mtl_primitive, unsigned index_c
 {
    if (!index_count)
       return 0;
+   if (cb->qp && cb->n_pass < CHL_PASS_MAX)
+      cb->pass_notes[cb->n_pass].draws++;
    if (!index_buffer || mtl_index_type > 1) {
       say(why, why_size, "an indexed draw with %s", index_buffer ? "an index type that is not MTLIndexType's" : "no index buffer");
       return -1;
@@ -518,6 +542,10 @@ chl_render_end(struct chl_cmdbuf *cb)
    P_START(pt);
    cb->dev->vk.vkCmdEndRendering(cb->cb);
    full_barrier(cb->dev, cb->cb);
+   if (cb->qp && cb->n_pass < CHL_PASS_MAX) {
+      cb->dev->vk.vkCmdWriteTimestamp(cb->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->qp, 2 + 2 * cb->n_pass);
+      cb->n_pass++;
+   }
    cb->enc = ENC_NONE;
    cb->rp = NULL;
    P_MARK(pt, CHL_P_END);
