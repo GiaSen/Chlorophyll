@@ -247,3 +247,11 @@ timestamps, as do `hitch:` and `slow:` lines.
 
 Tried and rejected, each measured: bigger VSC (binning) buffers, no overflow was ever logged, also at upstream's sizes; `prefer_gmem`, first-unlock GPU time unchanged.
 
+## The first unlock: CoreAnimation's generic shader (2026-10-31, Mi 8)
+
+What CoreAnimation has no specialised shader for yet, it draws with a generic one, `A2Xghfc` in QuartzCore's default.metallib (the binary also has `uber_fragment`). On this GPU that is ruinous: Turnip's statistics give its fragment stage 53905 instructions (15219 of them nops), 168 loops, 549 texture fetches, 844 memory instructions, 439 spills and 638 reloads, 48 registers, 4 waves per core; `A2Xhf` has 9 instructions and `TimgA2Xhf_Isrc` 11. One full-screen draw costs 40-58 ms and scales with area, about 35 ns a pixel. One pass of 830x1794 with 63 draws took 1214 ms at the first unlock and 17 ms a minute later, without `A2Xghfc`.
+
+QuartzCore reads `CA_DISABLE_GENERIC_SHADERS`, and the inject now sets it for backboardd (`/private/var/tmp/bgmtl-bb.generic` keeps Apple's behaviour): it builds the specialised shader at first use instead, which costs a few ms from the disk caches. I did not read QuartzCore's code to see the policy, only the effect: `A2Xghfc` no longer appears in the log, in any pipeline or pass. The first boot after a driver rebuild compiles more on the render thread.
+
+`/private/var/tmp/chl.shaderdump` (see `shader_dump`, air/chl_render.c.inc) writes statistics, NIR and ir3's disassembly of named fragment functions to /private/var/tmp/chl-shaders.
+

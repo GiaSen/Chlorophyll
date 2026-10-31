@@ -98,7 +98,8 @@ say(char *why, size_t why_size, const char *fmt, ...)
    X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) \
    X(vkCmdSetStencilOp) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBiasEnable) \
    X(vkCmdSetPrimitiveRestartEnable) \
-   X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+   X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
+   X(vkGetPipelineExecutablePropertiesKHR) X(vkGetPipelineExecutableStatisticsKHR) X(vkGetPipelineExecutableInternalRepresentationsKHR)
 
 struct chl_vk {
 #define X(n) PFN_##n n;
@@ -428,6 +429,7 @@ struct chl_device {
    struct chl_cmdbuf *inflight_head, *inflight_tail;
    unsigned n_inflight, inflight_limit;   /* see chl_cmdbuf_commit */
    bool passprof;
+   char shaderdump[256];              /* /private/var/tmp/chl.shaderdump: fragment functions to dump, see shader_dump */
    bool quit;
 };
 
@@ -765,8 +767,19 @@ chl_device_open(char *why, size_t why_size)
 
    /* Metal's framebuffer fetch ([[color(n)]] read in a fragment function): input attachments of the dynamic render pass,
     * read in rasterization order with no barrier between draws (air_nir_vk.c, bridge_fb_fetch) */
+   VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+   {
+      FILE *f = fopen("/private/var/tmp/chl.shaderdump", "r");
+      if (f) {
+         size_t got = fread(d->shaderdump, 1, sizeof(d->shaderdump) - 1, f);
+         d->shaderdump[got] = 0;
+         fclose(f);
+         pex.pipelineExecutableInfo = VK_TRUE;
+      }
+   }
    VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT rao = {
-      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT };
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT, d->shaderdump[0] ? &pex : NULL };
    rao.rasterizationOrderColorAttachmentAccess = VK_TRUE;
    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lread = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, &rao };
@@ -795,11 +808,12 @@ chl_device_open(char *why, size_t why_size)
    static const char *const exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
                                        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
                                        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME,
-                                       VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME };
+                                       VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME,
+                                       VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME };
    float prio = 1.0f;
    VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, 0, 1, &prio };
-   VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feats, 0, 1, &qci, 0, NULL, sizeof(exts) / sizeof(exts[0]), exts,
-                             NULL };
+   VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &feats, 0, 1, &qci, 0, NULL,
+                              (uint32_t)(sizeof(exts) / sizeof(exts[0])) - (d->shaderdump[0] ? 0 : 1), exts, NULL };
    VkResult r = d->vk.vkCreateDevice(d->pd, &dci, NULL, &d->dev);
    if (r != VK_SUCCESS) {
       say(why, why_size, "%s would not make a Vulkan device with push descriptors, null descriptors, dynamic rendering and local reads "

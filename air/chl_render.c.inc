@@ -98,6 +98,75 @@ link_varyings(struct chl_render_pipeline *p, char *why, size_t why_size)
    return true;
 }
 
+/*
+ * /private/var/tmp/chl.shaderdump holds fragment function names, space separated, for a process that starts while it exists: the first
+ * three pipelines of each get a second, throwaway build that keeps Turnip's statistics and internal representations (the NIR and ir3's
+ * disassembly of the real thing, with the real state), written to /private/var/tmp/chl-shaders/NAME.N.PID.txt (make the directory first,
+ * mode 1777). It compiles without the caches, on the thread that wanted the pipeline, so leave it off.
+ */
+static void
+shader_dump(struct chl_device *d, const VkGraphicsPipelineCreateInfo *gci, const char *name)
+{
+   static unsigned seen[32];
+   char want[256], path[160];
+   unsigned idx = 0;
+   bool hit = false;
+   snprintf(want, sizeof(want), "%s", d->shaderdump);
+   for (char *save, *w = strtok_r(want, " \n", &save); w && !hit; w = strtok_r(NULL, " \n", &save), idx++)
+      hit = !strcmp(w, name);
+   if (!hit || idx > 32 || seen[idx - 1] >= 3)
+      return;
+   unsigned n = seen[idx - 1]++;
+   VkGraphicsPipelineCreateInfo g = *gci;
+   g.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+   VkPipeline pl;
+   if (d->vk.vkCreateGraphicsPipelines(d->dev, VK_NULL_HANDLE, 1, &g, NULL, &pl) != VK_SUCCESS)
+      return;
+   snprintf(path, sizeof(path), "/private/var/tmp/chl-shaders/%s.%u.%d.txt", name, n, getpid());
+   FILE *f = fopen(path, "w");
+   if (f) {
+      VkPipelineInfoKHR pi = { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, NULL, pl };
+      uint32_t ne = 0;
+      d->vk.vkGetPipelineExecutablePropertiesKHR(d->dev, &pi, &ne, NULL);
+      VkPipelineExecutablePropertiesKHR *ep = calloc(ne, sizeof(*ep));
+      for (uint32_t i = 0; i < ne; i++)
+         ep[i].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
+      d->vk.vkGetPipelineExecutablePropertiesKHR(d->dev, &pi, &ne, ep);
+      fprintf(f, "blend0 %d rao %u colors %u\n", gci->pColorBlendState->pAttachments[0].blendEnable, gci->pColorBlendState->flags,
+              gci->pColorBlendState->attachmentCount);
+      for (uint32_t e = 0; e < ne; e++) {
+         VkPipelineExecutableInfoKHR ei = { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, NULL, pl, e };
+         fprintf(f, "=== executable %u: %s (%s), subgroup %u\n", e, ep[e].name, ep[e].description, ep[e].subgroupSize);
+         uint32_t ns = 0;
+         d->vk.vkGetPipelineExecutableStatisticsKHR(d->dev, &ei, &ns, NULL);
+         VkPipelineExecutableStatisticKHR *st = calloc(ns, sizeof(*st));
+         for (uint32_t i = 0; i < ns; i++)
+            st[i].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+         d->vk.vkGetPipelineExecutableStatisticsKHR(d->dev, &ei, &ns, st);
+         for (uint32_t i = 0; i < ns; i++)
+            fprintf(f, "stat %s = %llu\n", st[i].name, (unsigned long long)st[i].value.u64);
+         free(st);
+         uint32_t nr = 0;
+         d->vk.vkGetPipelineExecutableInternalRepresentationsKHR(d->dev, &ei, &nr, NULL);
+         VkPipelineExecutableInternalRepresentationKHR *ir = calloc(nr, sizeof(*ir));
+         for (uint32_t i = 0; i < nr; i++)
+            ir[i].sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR;
+         d->vk.vkGetPipelineExecutableInternalRepresentationsKHR(d->dev, &ei, &nr, ir);
+         for (uint32_t i = 0; i < nr; i++)
+            ir[i].pData = calloc(1, ir[i].dataSize + 1);
+         d->vk.vkGetPipelineExecutableInternalRepresentationsKHR(d->dev, &ei, &nr, ir);
+         for (uint32_t i = 0; i < nr; i++) {
+            fprintf(f, "--- %s\n%s\n", ir[i].name, (const char *)ir[i].pData);
+            free(ir[i].pData);
+         }
+         free(ir);
+      }
+      free(ep);
+      fclose(f);
+   }
+   d->vk.vkDestroyPipeline(d->dev, pl, NULL);
+}
+
 struct chl_render_pipeline *
 chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipeline_desc *desc, struct chl_pipeline_info *info,
                            char *why, size_t why_size)
@@ -237,6 +306,8 @@ chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipelin
           p->fs.nir && p->fs.info.entry_point ? p->fs.info.entry_point : "no fragment", r);
       goto fail;
    }
+   if (d->shaderdump[0] && p->fs.nir && p->fs.info.entry_point)
+      shader_dump(d, &gci, p->fs.info.entry_point);
    fill_info(d, info, &p->vs, p->fs.nir ? &p->fs : NULL);
    return p;
 fail:
