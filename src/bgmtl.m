@@ -1700,6 +1700,16 @@ bg_perf_note(uint64_t t_first, uint64_t t_begin, uint64_t t_flushed, uint64_t t_
    if (win_start == 0) win_start = t_begin;
    uint64_t e = t_first && t_first < t_begin ? t_begin - t_first : 0, s = t_flushed - t_begin, w = t_done > t_flushed ? t_done - t_flushed : 0;
    if (last_end && t_first > last_end) gap += t_first - last_end;
+   // a hitch: more than 40 ms from one command buffer's start to the next one's, while frames were coming (idle gaps do not count)
+   static uint64_t prev_first, prev_done, prev_flushed;
+   if (prev_first && t_first - prev_first > 40000000ull && t_first - prev_first < 400000000ull) {
+      char hl[200];
+      snprintf(hl, sizeof(hl), "hitch: %.0f ms; prev encode..flush %.1f, prev gpu %.1f, then idle %.1f; this encode %.1f, submit %.1f, gpu %.1f, %llu draws",
+               (t_first - prev_first) / 1e6, (prev_flushed - prev_first) / 1e6, prev_done > prev_flushed ? (prev_done - prev_flushed) / 1e6 : 0,
+               t_first > prev_done ? (t_first - prev_done) / 1e6 : 0, e / 1e6, s / 1e6, w / 1e6, (unsigned long long)ndraw);
+      bgmtl_note_line(hl);
+   }
+   prev_first = t_first; prev_done = t_done; prev_flushed = t_flushed;
    last_end = t_done;
    n++; draws += ndraw; enc += e; sub += s; wait += w;
    if (e > enc_max) enc_max = e;
