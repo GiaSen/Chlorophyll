@@ -606,6 +606,10 @@ bgmtl_inject_init(void)
          snprintf(ef, sizeof(ef), "/private/var/tmp/bgmtl.env.%s", [bid UTF8String]);
          env_file(ef, [bid UTF8String]);
       }
+      // The icon agent's RenderBox reads its attachments back in the shader. Tiled with several tiles (an icon over about 220 px) that
+      // faults (TP|VFD, a low FAR, in docs/FIXES.md), and direct with ordinary flushes it reads stale cache lines. It draws
+      // little and only when an icon changes, so it can afford direct rendering with everything flushed.
+      if ([bid isEqualToString:@"com.apple.iconservicesagent"]) setenv("TU_DEBUG", "sysmem,flushall", 0);
       snprintf(g_state, sizeof(g_state), "%s.%s", F_STATE, [bid UTF8String]);
       snprintf(g_off, sizeof(g_off), "%s.%s", F_OFF, [bid UTF8String]);
       if (exists(F_OFF) || exists(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }

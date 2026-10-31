@@ -17,6 +17,7 @@ Debugging switches referred to below (files on the phone, read when the process 
 | `/private/var/tmp/bgmtl-bb.sync` / `.full` / `.off` | synchronous commits / dirty regions off / Metal off in backboardd |
 | `/private/var/tmp/bgmtl.env.<bundle id>` | `KEY=VALUE` lines set for that process alone before its device exists (`bgmtl-bb.env` is backboardd's), e.g. `FD_RD_DUMP=enable,combine` |
 | `/private/var/tmp/bgmtl.fidraw` | one `bgmtl.log` line per draw of RenderBox's `primitive_custom_vertex` pipelines |
+| `/private/var/tmp/chl.passdump` | a directory, world-writable, there at process start: every colour attachment of every render pass, memoryless ones too, as it stood when the pass ended, raw in `/private/var/tmp/chlpd-<pid>-<command buffer>-<pass>-c<n>-<w>x<h>-<Metal format>.raw`; with `bgmtl.tracing` a trace line names each |
 | `/private/var/tmp/bgmtl.compilelog` | one `bgmtl.log` line per call that reaches Apple's MTLCompilerService (specialised functions, libraries from source), with who asked and how long it took |
 
 Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `bgmtl-bb.state` says `alive=0`, delete it too.
@@ -255,3 +256,22 @@ QuartzCore reads `CA_DISABLE_GENERIC_SHADERS`, and the inject now sets it for ba
 
 `/private/var/tmp/chl.shaderdump` (see `shader_dump`, air/chl_render.c.inc) writes statistics, NIR and ir3's disassembly of named fragment functions to /private/var/tmp/chl-shaders.
 
+## Glass icons: what RenderBox drew into a surface never reached it (2026-10-31, Mi 8)
+
+With iconservicesagent on the GPU, home screen icons lost layers, always the same ones: Photos' petals, Notes' yellow band, Safari's compass, the glyphs of Phone and Music. So the agent had been kept off the GPU, and without a GPU it cannot draw an SF Symbol, which left Settings' rows empty.
+
+**Cause.** A surface the GPU cannot import is "copied": the texture gets its own memory, filled from the surface at each use. The comment said "good for sampling, which is all CA does with those". RenderBox also draws into them. It renders each layer of an icon into its own RGBA16F IOSurface, then wraps that surface in a second MTLTexture to sample it. What the GPU drew stayed in the first texture's memory, so the second read an empty surface. The first one was no better off: the seed bump at completion made its next use refresh it from the empty surface. `chl.passdump` showed it directly: Notes' band is correct in surface 1205 (608x153), and every later pass that samples that surface gets nothing.
+
+Which layers are lost depends only on the layer's size, which is why the same icons were hit each time, and why flushes, tiling and timing changed nothing. A surface is refused when:
+- its pitch is not 128-byte aligned (`fd6_layout.c`, RGBA16F: 3392 for 424 wide, 960 for 120 wide, while IOSurface aligns to 64);
+- its pitch is fine but it holds fewer bytes than the image Turnip lays over it, whose height is aligned to 4 rows (608x153: 753664 bytes, Turnip asks 758784; `real_size < size` in `tu_knl_drm_msm.cc`).
+
+The blank 40x40 a root tool got from `prepareImageForDescriptor:` was this too.
+
+**Fix.** `bgCopyWriteBack`: at completion, what the GPU wrote goes back into the surface, and the writer takes the new seed. A reader of a surface drawn into by a command buffer in flight waits for that write-back, at most 500 ms (`bg_surfwb_wait`). backboardd is left out, as for the other surface syncs here.
+
+**The tiled-mode fault, avoided and not understood.** With layers now present, an icon larger than about 220 px, so more than one tile, soon gives an SMMU fault: `TP|VFD`, always in iconservicesagent, at a low address: FAR 0x2504c00, 0x2504000, 0x24d7080, 0x247cd80. Home screen sizes never did, in any run. `TU_DEBUG=sysmem` has none. But direct rendering alone reads stale cache lines in framebuffer fetches: black squares on Mail, blocks on Photos and Music, with or without UBWC, gone with `flushall`. So the inject sets `TU_DEBUG=sysmem,flushall` for this process (`bgmtl.env.com.apple.iconservicesagent` overrides it). It draws little, so the cost does not show.
+
+Observed in a capture of the fault (`FD_RD_DUMP=enable,combine`; **`FD_RD_DUMP_PATH` must exist: otherwise `fd_rd_output_write_section` spins forever on a failed gzwrite**): the only low addresses a fetch can start from are the tile-memory descriptors of the input attachments (0x100000 to 0x200000), and all four FARs are multiples of 0x80. A guess that fits all four: FAR = 0x160000 + 16 * (y * 4608 + x * 8), y about 500, x under 530, as if an RGBA16F attachment were read with coordinates still in sixteenths of a pixel. Not confirmed: the 1/16 constant is right in every fetching shader of the capture. Beware cffdump in binning phases: it shows the previous fragment shader's register state, so a set can look as if it held a texture descriptor made of scissor words. It does not; that was a false lead here. SpringBoard's RenderBox stays tiled and may meet this if it ever draws that large with fetches; not seen in any soak.
+
+**Checks.** Ten icons at 528x528 against the CPU renderer: mean difference 0.90 to 2.92 of 255, about 0.06 % of pixels (0.14 % for Maps) off by more than 48. Empty cache, reboot: 276 files in under 2 minutes, 35 s of the agent's CPU where the CPU path took about 2 minutes, home screen and every row of Settings correct, 0 faults, no kill switch tripped.

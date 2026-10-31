@@ -17,6 +17,7 @@
 // buffers or caller memory), samplers, depth/stencil states, libraries and functions through Metal's own _MTLLibrary, render and
 // compute pipelines. No events, indirect draws, tile shaders or Metal 4.
 #import <Foundation/Foundation.h>
+#include <fcntl.h>
 #include <libkern/OSByteOrder.h>
 #include <os/lock.h>
 #include <pthread.h>
@@ -511,6 +512,7 @@ bg_install_fallback(Class c)
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(id)descriptor;
 @end
 
+struct bg_passdump;
 @interface BGMTLCommandBuffer : _MTLCommandBuffer {
  @public
    BGMTLCommandQueue *_queue;
@@ -529,6 +531,8 @@ bg_install_fallback(Class c)
    uint64_t _cpu_first;                                    // this thread's CPU time then (bgmtl.encprof)
    uint64_t _t_flushed;                                    // when the commit had submitted (bgmtl.perf)
    pthread_t _sched_thread;                                // the committing thread while it runs the scheduled handlers
+   struct bg_passdump *_passdumps;                         // chl.passdump
+   unsigned _passdump_n;
 }
 - (instancetype)initWithBGQueue:(BGMTLCommandQueue *)queue;
 - (struct chl_cmdbuf *)bgChl;                         // the Vulkan command buffer, noting when encoding began
@@ -596,6 +600,8 @@ bg_install_fallback(Class c)
 - (void)bgLinearPending:(int)delta;
 - (void)bgLinearWriteBack;
 - (BOOL)bgXR10WriteBack;
+- (void)bgCopyWriteBack;
+- (void)bgCopyPending:(int)delta;
 @end
 
 @interface BGMTLSampler : _MTLSamplerState {
@@ -624,6 +630,68 @@ bg_install_fallback(Class c)
 }
 @end
 
+// Copied surfaces (_surfCopy: the GPU could not import them) drawn into by a command buffer in flight. On Apple's GPU the texture IS the
+// surface and GPU order would be enough; here the pixels reach the surface when that command buffer completes, so a reader waits for it.
+static struct { uint32_t id; int n; } g_surfwb[32];
+static os_unfair_lock g_surfwb_lock = OS_UNFAIR_LOCK_INIT;
+static void
+bg_surfwb_note(uint32_t id, int delta)
+{
+   os_unfair_lock_lock(&g_surfwb_lock);
+   int slot = -1;
+   for (int i = 0; i < 32; i++) {
+      if (g_surfwb[i].n && g_surfwb[i].id == id) { slot = i; break; }
+      if (!g_surfwb[i].n && slot < 0) slot = i;
+   }
+   if (slot >= 0 && (g_surfwb[slot].n || delta > 0)) {
+      g_surfwb[slot].id = id;
+      g_surfwb[slot].n += delta;
+   }
+   os_unfair_lock_unlock(&g_surfwb_lock);
+}
+static void
+bg_surfwb_wait(uint32_t id)
+{
+   for (int ms = 0; ms < 500; ms++) {   // bounded: a completion handler encoding here must not wait for itself
+      BOOL busy = NO;
+      os_unfair_lock_lock(&g_surfwb_lock);
+      for (int i = 0; i < 32 && !busy; i++) busy = g_surfwb[i].n && g_surfwb[i].id == id;
+      os_unfair_lock_unlock(&g_surfwb_lock);
+      if (!busy) return;
+      usleep(1000);
+   }
+}
+static BOOL
+bg_in_compositor(void)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("BGMTL_BB") != NULL;
+   return on;
+}
+
+// /private/var/tmp/chl.passdump (world-writable, read once): each colour attachment of every render pass, as it stood when the pass ended,
+// goes raw to /private/var/tmp/chlpd-* once its command buffer has completed; memoryless attachments are stored for it. A trace line names each.
+struct bg_passdump { struct bg_passdump *next; struct chl_buffer *buf; size_t size; char name[120]; };
+static BOOL
+bg_passdump_on(void)
+{
+   static int on = -1;
+   if (on < 0) on = access("/private/var/tmp/chl.passdump", W_OK) == 0;
+   return on;
+}
+static unsigned
+bg_passdump_bpp(NSUInteger fmt)
+{
+   switch (fmt) {
+   case 1: case 10: return 1;
+   case 25: case 30: return 2;
+   case 65: case 70: case 71: case 80: case 81: case 90: case 92: case 94: case 550: return 4;
+   case 115: return 8;
+   case 125: return 16;
+   default: return 0;
+   }
+}
+
 @interface BGMTLRenderEncoder : _MTLCommandEncoder {
    BGMTLCommandBuffer *_cb;
    BGMTLRenderPipeline *_pipeline;
@@ -632,6 +700,8 @@ bg_install_fallback(Class c)
    id _ftex0;            // fragment texture slot 0 as last set (nil included), for bgDrawLog
    NSUInteger _cull, _winding;
    BOOL _open;
+   id _dumpTex[3];       // chl.passdump
+   unsigned _dumpPass;
 }
 - (instancetype)initWithBGCommandBuffer:(BGMTLCommandBuffer *)cb descriptor:(MTLRenderPassDescriptor *)d;
 @end
@@ -1761,6 +1831,22 @@ bg_perf_note(uint64_t t_first, uint64_t t_begin, uint64_t t_flushed, uint64_t t_
 struct bg_done_ctx { BGMTLCommandBuffer *cb; uint64_t t_begin; };
 
 static void
+bg_passdump_flush(BGMTLCommandBuffer *cb)
+{
+   for (struct bg_passdump *pd = cb->_passdumps, *nx; pd; pd = nx) {
+      nx = pd->next;
+      char path[200];
+      snprintf(path, sizeof(path), "/private/var/tmp/chlpd-%s", pd->name);
+      int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd >= 0) { (void)!write(fd, chl_buffer_contents(pd->buf), pd->size); close(fd); }
+      else BG_TRACE("passdump %s: %s\n", path, strerror(errno));
+      chl_buffer_release(pd->buf);
+      free(pd);
+   }
+   cb->_passdumps = NULL;
+}
+
+static void
 bg_cmdbuf_done(void *ctx, int status, const char *why)
 {
    struct bg_done_ctx *d = ctx;
@@ -1785,6 +1871,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
          for (unsigned i = 0; chl_cmdbuf_pass_line(cb->_ccb, i, 5.0, line, sizeof(line)); i++)
             if (line[0]) bgmtl_note_line(line);
       }
+      bg_passdump_flush(cb);
       [cb bgCompleteFrom:d->t_begin];
       dispatch_group_leave(cb->_done);
    }
@@ -1800,6 +1887,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
    if (chl_prof.on) bg_enc_note(_t_first, t_begin, _cpu_first);
    _status = 2;   // Committed
    BG_TRACE("commit: %u draws\n", _draws);
+   if (!bg_in_compositor()) for (BGMTLTexture *t in _written) [[t bgRoot] bgCopyPending:1];
    for (BGMTLBuffer *b in _noCopy) [b bgRefresh];
    for (BGMTLTexture *t in _linWritten) [t bgLinearPending:1];
    dispatch_group_enter(_done);
@@ -1821,6 +1909,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       if (_status != 5 && chl_cmdbuf_wait(_ccb, why, sizeof(why)) != 0) [self bgFailWith:[NSString stringWithUTF8String:why] code:3];
       else if (_status != 5) _status = 4;
       bg_perf_note(_t_first, t_begin, t_flushed, clock_gettime_nsec_np(CLOCK_MONOTONIC), _draws);
+      bg_passdump_flush(self);
       [self bgCompleteFrom:t_begin];
       dispatch_group_leave(_done);
       return;
@@ -1903,10 +1992,9 @@ bg_idle_trim_schedule(void)
    // What the GPU wrote into an IOSurface becomes visible to the processor (and to a compositor reading it) before the drawable
    // is presented. In the compositor (BGMTL_BB) the surfaces drawn into are its own framebuffers, which the CPU never reads: no
    // cache clean there. A GPU write does not move an IOSurface's seed but consumers cache by it, so a write lock/unlock bumps it.
-   static int in_compositor = -1;
-   if (in_compositor < 0) in_compositor = getenv("BGMTL_BB") != NULL;
+   BOOL in_compositor = bg_in_compositor();
    if (_status == 4 && !in_compositor) {
-      NSMutableSet *surfaces = nil, *xr = nil;
+      NSMutableSet *surfaces = nil, *xr = nil, *copied = nil;
       for (BGMTLTexture *t in _written) {
          BGMTLTexture *root = [t bgRoot];
          if (bg_xr10log() && [t iosurface])
@@ -1914,6 +2002,7 @@ bg_idle_trim_schedule(void)
                          IOSurfaceGetWidth((IOSurfaceRef)[t iosurface]), IOSurfaceGetHeight((IOSurfaceRef)[t iosurface]), (unsigned long)[root pixelFormat],
                          root->_xr2p ? "two-plane" : root->_surfCopy ? "copied" : "imported");
          if (root->_xr2p) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }
+         if (root->_surfCopy) { if (!copied) copied = [NSMutableSet set]; [copied addObject:root]; continue; }
          chl_texture_flush_surface([t chlTexture]);
          if ([t iosurface]) { if (!surfaces) surfaces = [NSMutableSet set]; [surfaces addObject:(id)[t iosurface]]; }
       }
@@ -1923,7 +2012,9 @@ bg_idle_trim_schedule(void)
          bg_surface_dump((IOSurfaceRef)surf, _seq);
       }
       for (BGMTLTexture *t in xr) [t bgXR10WriteBack];   // the write unlock moves these surfaces' seeds
+      for (BGMTLTexture *t in copied) [t bgCopyWriteBack];
    }
+   if (!in_compositor) for (BGMTLTexture *t in _written) [[t bgRoot] bgCopyPending:-1];
    if (_status == 4 && [_presents count]) {
       uint64_t t_end = clock_gettime_nsec_np(CLOCK_MONOTONIC);
       char line[200];
@@ -2383,6 +2474,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       BG_TEX_MARK(BG_TEX_XR);
    } else if (_surfCopy && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
+      bg_surfwb_wait(IOSurfaceGetID(sf));
       uint32_t seed = IOSurfaceGetSeed(sf);
       if ((!_surfFresh || seed != _surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
          const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
@@ -2462,6 +2554,27 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    }
    free(px);
    return YES;
+}
+
+// A copied surface drawn into (RenderBox draws an icon's layers into IOSurfaces whose pitch or size the GPU cannot import, then wraps
+// each surface again to sample it): what the GPU wrote, back into the surface, or every later reader sees it empty.
+- (void)bgCopyWriteBack
+{
+   if (!_surfCopy || _xr2p || !_tex || !_surface) return;
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   if (IOSurfaceGetPlaneCount(sf) > 1 || _plane || IOSurfaceGetWidth(sf) < _desc.width || IOSurfaceGetHeight(sf) < _desc.height) return;
+   if (IOSurfaceLock(sf, 0, NULL) != 0) return;
+   char why[256] = { 0 };
+   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
+   if (chl_texture_get(_tex, 0, 0, o, sz, IOSurfaceGetBaseAddress(sf), IOSurfaceGetBytesPerRow(sf), 0, why, sizeof(why)) != 0)
+      BG_LOG("copied surface write-back: %s\n", why);
+   IOSurfaceUnlock(sf, 0, NULL);
+   _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture
+   _surfFresh = YES;
+}
+- (void)bgCopyPending:(int)delta
+{
+   if (_surfCopy && !_xr2p && _surface) bg_surfwb_note(IOSurfaceGetID((IOSurfaceRef)_surface), delta);
 }
 
 - (void)bgLinearPending:(int)delta { __atomic_add_fetch(&_linPending, delta, __ATOMIC_ACQ_REL); }
@@ -2633,6 +2746,10 @@ bg_attachment(BGMTLCommandBuffer *cb, MTLRenderPassAttachmentDescriptor *a, stru
       MTLClearColor c = [a clearColor];
       rp.color[i].clear[0] = (float)c.red; rp.color[i].clear[1] = (float)c.green; rp.color[i].clear[2] = (float)c.blue;
       rp.color[i].clear[3] = (float)c.alpha;
+      if (bg_passdump_on() && i < 3) {
+         _dumpTex[i] = [a texture];
+         if (rp.color[i].store_action == 0) rp.color[i].store_action = 1;
+      }
    }
    MTLRenderPassDepthAttachmentDescriptor *da = [d depthAttachment];
    if (da && [da texture]) {
@@ -2798,6 +2915,23 @@ bg_buf_desc(char *s, size_t n, id b, NSUInteger off, NSUInteger bytes)
 - (void)endEncoding
 {
    if (_open) chl_render_end(_cb->_ccb);   // the pass's resolves happen here (store actions)
+   if (_open && bg_passdump_on()) {
+      unsigned pass = _cb->_passdump_n++;
+      for (unsigned i = 0; i < 3; i++) {
+         id<MTLTexture> t = _dumpTex[i];
+         unsigned bpp = t ? bg_passdump_bpp([t pixelFormat]) : 0;
+         if (!bpp || [t width] > 1024 || [t height] > 1024 || pass > 60) continue;
+         unsigned w = (unsigned)[t width], h = (unsigned)[t height], o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+         char why[128] = { 0 };
+         struct chl_buffer *b = chl_buffer_create([(BGMTLDevice *)[_cb device] chl], (size_t)w * h * bpp, why, sizeof(why));
+         if (!b) continue;
+         chl_copy_texture_to_buffer(_cb->_ccb, [(BGMTLTexture *)t chlTextureFor:_cb], 0, 0, o, sz, b, 0, (size_t)w * bpp, (size_t)w * h * bpp);
+         struct bg_passdump *pd = calloc(1, sizeof(*pd));
+         pd->buf = b; pd->size = (size_t)w * h * bpp; pd->next = _cb->_passdumps; _cb->_passdumps = pd;
+         snprintf(pd->name, sizeof(pd->name), "%d-%04lu-%02u-c%u-%ux%u-%lu.raw", getpid(), _cb->_seq, pass, i, w, h, (unsigned long)[t pixelFormat]);
+         BG_TRACE("passdump %s\n", pd->name);
+      }
+   }
    _open = NO;
    [super endEncoding];
 }
