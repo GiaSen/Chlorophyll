@@ -588,6 +588,7 @@ struct bg_passdump;
    BOOL _surfFresh;      // _surfSeed is valid: the surface was decoded or written back at least once (a seed may be 0)
    uint32_t _xrUses;     // uses since the last XR10 decode (bgmtl.xr10log)
    NSUInteger _ncLength;
+   BOOL _ncDone;
    void (^_ncDealloc)(void *, NSUInteger);
    BGMTLTexture *_parent;  // a texture view (newTextureViewWith...): the texture whose memory it shows (retained)
    NSUInteger _parentLevel, _parentSlice;
@@ -2575,10 +2576,18 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       }
       BG_TEX_MARK(BG_TEX_COPY);
    }
-   if (_ncBytes) {
+   // Posters' snapshots from disk come here as ASTC 4x4 (a whole phone screen). Rows of blocks, not of texels, and the length is the mapping's, rounded
+   // up to a 16 KB page: dividing it gave a wrong row size, which was refused (texel rows) or made stripes (block rows). When the
+   // tight rows and that rounding explain the length, the rows are tight. Nothing writes a compressed image in place: once is enough.
+   const unsigned nc_rows = _ncBytes ? chl_format_block_rows((unsigned)[self pixelFormat], _desc.height) : 0;
+   if (_ncBytes && nc_rows && (nc_rows == _desc.height || !_ncDone)) {
       const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
-      if (chl_texture_replace(_tex, 0, 0, o, sz, _ncBytes, _ncLength / (_desc.height ? _desc.height : 1), 0, why, sizeof(why)) != 0)
+      BG_TRACE("no-copy texture %ux%u fmt %lu, %lu bytes, %u rows\n", _desc.width, _desc.height, (unsigned long)[self pixelFormat], (unsigned long)_ncLength, nc_rows);
+      const size_t tight = chl_format_tight_row((unsigned)[self pixelFormat], _desc.width);
+      const size_t need = tight * nc_rows, row = need <= _ncLength && _ncLength - need < 16384 ? tight : _ncLength / nc_rows;
+      if (chl_texture_replace(_tex, 0, 0, o, sz, _ncBytes, row, 0, why, sizeof(why)) != 0)
          BG_LOG("no-copy texture refresh: %s\n", why);
+      else _ncDone = YES;
       BG_TEX_MARK(BG_TEX_NC);
    }
    if (_linSrc && cb && __atomic_load_n(&_linPending, __ATOMIC_ACQUIRE) == 0 && _linSeq != cb->_seq) {

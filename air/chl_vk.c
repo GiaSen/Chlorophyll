@@ -211,6 +211,20 @@ chl_format(unsigned mtl)
    return NULL;
 }
 
+unsigned
+chl_format_block_rows(unsigned pixel_format, unsigned height)
+{
+   const struct chl_format *f = chl_format(pixel_format);
+   return f && f->bh > 1 ? (height + f->bh - 1) / f->bh : height;
+}
+
+size_t
+chl_format_tight_row(unsigned pixel_format, unsigned width)
+{
+   const struct chl_format *f = chl_format(pixel_format);
+   return f ? (size_t)((width + f->bw - 1) / f->bw) * f->bytes : 0;
+}
+
 static VkImageAspectFlags
 vk_aspects(const struct chl_format *f)
 {

@@ -88,6 +88,10 @@ struct chl_texture *chl_texture_view(struct chl_texture *parent, unsigned pixel_
                                      unsigned level_count, unsigned base_slice, unsigned slice_count,
                                      const unsigned char swizzle[4], char *why, size_t why_size);
 /* -replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage: (synchronous: visible to all later GPU work) */
+/* rows of blocks an image of this height has in this pixel format (the height, unless block compressed) */
+unsigned chl_format_block_rows(unsigned pixel_format, unsigned height);
+/* bytes of one such row with no padding */
+size_t chl_format_tight_row(unsigned pixel_format, unsigned width);
 int chl_texture_replace(struct chl_texture *tex, unsigned level, unsigned slice, const unsigned origin[3], const unsigned size[3],
                         const void *bytes, size_t bytes_per_row, size_t bytes_per_image, char *why, size_t why_size);
 /* -getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice: (waits for the GPU work submitted before it) */

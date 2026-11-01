@@ -340,3 +340,15 @@ Measured so nobody has to guess again. `research/chl-work/glass/` (gitignored) h
 **Other YCbCr formats (501 and up, 10-bit) are still refused**, now with the fourcc and the reason in the log.
 
 **Check.** `bgmtl.tracing` on, open Wallet from the home screen, close it, open it again: `YCbCr surface` lines in `bgmtl-trace-<backboardd pid>.txt` and no `texture refused`.
+
+## Poster snapshots: ASTC through newTextureWithBytesNoCopy (2026-11-01, Mi 8)
+
+**In the logs:** `no-copy texture refresh: 832 bytes per row for a region whose rows need 3312`, more than a thousand times over the log, in bursts around the lock screen's wallpaper switcher. It predates everything of today.
+
+**What it was:** lock screen wallpaper snapshots from disk arrive through `newTextureWithBytesNoCopy:length:descriptor:` as `fmt 204`, ASTC 4x4 LDR. `chlTextureFor:` took bytes per row as length / height. Wrong twice: a compressed image has rows of blocks (a quarter of the height), and the length is the mapping's, rounded up to a 16 KB page (828x1792: 207 x 16 x 448 = 1483776, length 1490944; 414x896: 372736, length 376832). So the upload was refused and the texture drew whatever its memory held. Dividing by block rows only (my first try) gave the upload a wrong row size, which showed as horizontal stripes in the wallpaper gallery.
+
+**Fix:** when the tight rows and the rounding explain the length, the rows are tight (`chl_format_block_rows`, `chl_format_tight_row`). Compressed images upload once: nothing writes them in place.
+
+**Check:** no such line in `bgmtl`'s output; with tracing, `no-copy texture 414x896 fmt 204, 376832 bytes, 224 rows`.
+
+**Not seen working yet:** I have not got a clean look at the gallery with this last version, because the lock screen sleeps within seconds and my gestures there are unreliable. The wallpaper gallery's other cards were black when I saw it, and PosterBoard crashed around it (`far 0x228`); I could not tell whether that predates the hidden hosts.
