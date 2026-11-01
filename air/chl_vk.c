@@ -428,6 +428,7 @@ struct chl_device {
    pthread_cond_t done_cv;
    struct chl_cmdbuf *inflight_head, *inflight_tail;
    unsigned n_inflight, inflight_limit;   /* see chl_cmdbuf_commit */
+   long inflight_wait_ns;
    bool passprof;
    char shaderdump[256];              /* /private/var/tmp/chl.shaderdump: fragment functions to dump, see shader_dump */
    bool quit;
@@ -688,12 +689,16 @@ chl_device_open(char *why, size_t why_size)
    if (getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.nomemcache", F_OK) != 0)
       d->memc_cap = 96ull << 20;
    d->passprof = getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.passprof", F_OK) == 0;
-   if (getenv("BGMTL_TEXPOOL_MB")) {
-      FILE *f = fopen("/private/var/tmp/chl.inflight", "r");
-      d->inflight_limit = 2;
+   {
+      /* see chl_cmdbuf_commit */
+      bool server = getenv("BGMTL_TEXPOOL_MB") != NULL;
+      FILE *f = fopen(server ? "/private/var/tmp/chl.inflight" : "/private/var/tmp/chl.inflight.clients", "r");
+      unsigned dflt = server ? 2 : 3;
+      d->inflight_limit = dflt;
+      d->inflight_wait_ns = server ? 100000000 : 1000000000;
       if (f) {
          if (fscanf(f, "%u", &d->inflight_limit) != 1)
-            d->inflight_limit = 2;
+            d->inflight_limit = dflt;
          fclose(f);
       }
    }
@@ -2374,19 +2379,21 @@ chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why,
    cb->committed = true;
 
    /*
-    * The render server's frames, at most inflight_limit on the ring (the inject's BGMTL_TEXPOOL_MB marks that process;
-    * /private/var/tmp/chl.inflight overrides the 2, 0 is no limit). Nothing else holds it back: a compositor that outruns
-    * the GPU queues frames that are stale by the time they are drawn, and the display, which shows the newest finished
-    * one, drops most of them. Waiting here means the next frame is encoded from fresher state. The time limit is there so
-    * that a very long frame costs no more than it did.
+    * At most inflight_limit command buffers on the ring: 2 in the render server (the inject's BGMTL_TEXPOOL_MB marks it;
+    * /private/var/tmp/chl.inflight overrides, 0 is no limit), 3 elsewhere (chl.inflight.clients). Nothing else holds a
+    * process back: a compositor that outruns the GPU queues frames that are stale by the time they are drawn, and the
+    * display, which shows the newest finished one, drops most of them. A client does worse: Mercury's space wallpaper takes
+    * about 110 ms a frame and submits at 60 fps, a backlog of 26 s was measured, and whoever then waits for the GPU behind
+    * it hits the kernel's 5 s patience, which resets a healthy GPU (first boot: 46 frames behind). The time limit is there
+    * so that a very long frame costs no more than it did. Never on the completion thread: it is what makes room.
     */
    uint64_t tw = build_now();
-   if (d->inflight_limit) {
+   if (d->inflight_limit && !pthread_equal(pthread_self(), d->thread)) {
       pthread_mutex_lock(&d->done_lock);
       if (d->n_inflight >= d->inflight_limit) {
          struct timespec deadline;
          clock_gettime(CLOCK_REALTIME, &deadline);
-         deadline.tv_nsec += 100000000;
+         deadline.tv_nsec += d->inflight_wait_ns;
          if (deadline.tv_nsec >= 1000000000) {
             deadline.tv_sec++;
             deadline.tv_nsec -= 1000000000;
