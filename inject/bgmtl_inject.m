@@ -11,22 +11,23 @@
 //   5. the device can actually be made (the sandbox may refuse the GPU user client): otherwise the process stays device-less, never half-registered.
 // Registration is MTLAddDevice(device) in THIS process: MTLCreateSystemDefaultDevice and MTLCopyAllDevices answer ours here, no IOKit service
 // gets MetalPluginName, no other process sees anything.
-// While registered a watchdog thread polls the kernel GPU state once a second: LOST, or 3 failed command buffers, writes bgmtl.off and
-// _exit(0)s; the extension then relaunches as stock Metal-less. After 15 s alive the dead-man counter resets.
+// While registered a watchdog thread polls the kernel GPU state once a second. 3 failed command buffers or a lost GPU go to gpu_failed(): start
+// again on the GPU, or, if that was tried in the last half hour, a bgmtl.off for this boot, and the extension relaunches as stock Metal-less. After 15 s alive the dead-man counter resets.
 // Everything it does is logged to /private/var/tmp/bgmtl.log.
 //
 // backboardd (Chlorophyll as the system compositor): only when bgl-launch chose Metal for this launch and says so with BGMTL_BB=1
 // (bgl-launch has already checked bgmtl-bb.arm, bgmtl-bb.off and that the previous Metal launch became healthy). Here: the device is
 // registered before QuartzCore creates its render server (which then builds CA::OGL::MetalContext itself), framebuffer and IOSurface
 // compression and deep framebuffers are turned off (Apple GPU layouts this GPU does not write), and a stricter watchdog runs: GPU
-// lost, 3 failed command buffers, or no completed command buffer within 180 s of the first commit write bgmtl-bb.off and _exit(0); launchd
-// relaunches backboardd and bgl-launch starts it on the ES path. 10 s after the first completed command buffer with no failure the
+// lost and 3 failed command buffers go to gpu_failed(), and no completed command buffer within 180 s of the first commit writes bgmtl-bb.off and _exit(0)s;
+// launchd relaunches backboardd and bgl-launch starts it on the ES path. 10 s after the first completed command buffer with no failure the
 // launch is marked healthy in bgmtl-bb.state. "crashtest" in bgmtl-bb.arm crashes on purpose 5 s after registration (guard test).
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <dispatch/dispatch.h>
+#include <dirent.h>
 #include <time.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -133,6 +134,85 @@ trip(const char *why)
    _exit(0);
 }
 
+// A kill switch written by gpu_failed() starts with "boot=<id>" and holds for that boot. Any other (written by hand, or by trip(): a process
+// that cannot get through its start) holds until someone removes it.
+static int g_off_expired;
+static int
+off_present(const char *path)
+{
+   FILE *f = fopen(path, "r");
+   if (!f) return exists(path);
+   char b[80] = "";
+   int earlier = fscanf(f, "boot=%79s", b) == 1 && strcmp(b, boot_id()) != 0;
+   fclose(f);
+   if (!earlier) return 1;
+   unlink(path);
+   ilog("%s is from an earlier boot: back on the GPU", path);
+   g_off_expired = 1;
+   return 0;
+}
+
+// iconservicesagent without the GPU caches blanks for what it cannot draw (SF Symbols), so a boot that ended with it on the CPU leaves those
+static void
+empty_icon_cache(void)
+{
+   static const char c[] = "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache/Library/Caches/com.apple.IconsCache";
+   DIR *d = opendir(c);
+   if (!d) return;
+   unsigned n = 0;
+   for (struct dirent *e; (e = readdir(d));) {
+      if (e->d_name[0] == '.') continue;
+      char sub[300];
+      snprintf(sub, sizeof(sub), "%s/%s", c, e->d_name);
+      DIR *ds = opendir(sub);
+      if (!ds) continue;
+      for (struct dirent *f; (f = readdir(ds));) {
+         if (f->d_name[0] == '.') continue;
+         char file[600];
+         snprintf(file, sizeof(file), "%s/%s", sub, f->d_name);
+         if (unlink(file) == 0) n++;
+      }
+      closedir(ds);
+   }
+   closedir(d);
+   ilog("icon cache emptied after a boot on the CPU: %u files", n);
+}
+
+// The GPU was reset or lost. A reset fails every process's work, whoever caused it, and leaves Turnip's device lost, so this process has to
+// start again either way; nothing says the GPU path is bad. So: start again on the GPU, once per half hour. Sooner than that, or with the GPU
+// lost, the CPU path, until the next boot. That bounds backboardd's restarts (launchd gives up on it after a few) and
+// the kernel gives up after three recoveries in a boot anyway.
+static void
+gpu_failed(const char *why, int lost)
+{
+   static volatile int once;
+   if (__sync_lock_test_and_set(&once, 1)) for (;;) sleep(60);
+   char path[208], b[80] = "";
+   long then = 0;
+   snprintf(path, sizeof(path), "%s.restart", g_bb ? F_BB_STATE : g_state);
+   FILE *f = fopen(path, "r");
+   if (f) {
+      if (fscanf(f, "boot=%79s t=%ld", b, &then) != 2 || strcmp(b, boot_id()) != 0) then = 0;
+      fclose(f);
+   }
+   unsigned minor = 0;
+   int st = lost ? 2 : 0;
+   for (int i = 0; !lost && i < 100 && (st = bgmtl_gpu_state(&minor)) == 0; i++) usleep(100000);   // the kernel's recovery
+   long now = (long)time(NULL);
+   if (st == 1 && (!then || now - then >= 1800)) {
+      f = fopen(path, "w");
+      if (f) { fprintf(f, "boot=%s t=%ld\n", boot_id(), now); fclose(f); }
+      if (g_bb) bb_state(1); else write_state(0, 1);
+      ilog("%s: starting again on the GPU", why);
+      _exit(0);
+   }
+   const char *off = g_bb ? F_BB_OFF : g_off;
+   ilog("DEAD-MAN%s: %s (GPU state %d): writing %s until the next boot and exiting", g_bb ? " (backboardd)" : "", why, st, off);
+   f = fopen(off, "w");
+   if (f) { fprintf(f, "boot=%s %s\n", boot_id(), why); fclose(f); }
+   _exit(0);
+}
+
 // Per-present lines from bgmtl.m: the first 120 are logged, then every 30th, and every one whose picture reads black or whose gap to the
 // previous present is over 150 ms (the flicker investigation: a black frame between draws, or a stalled frame loop).
 void
@@ -232,7 +312,7 @@ bgmtl_note_failure(const char *why)
    int n = __sync_add_and_fetch(&g_failures, 1);
    ilog("command buffer failure %d: %s", n, why ? why : "?");
    if (n >= 3)
-      trip("3 failed command buffers");
+      gpu_failed("3 failed command buffers", 0);
 }
 
 // backboardd: the stricter watchdog (see the header)
@@ -245,7 +325,7 @@ watchdog_bb(void *arg)
       sleep(1);
       unsigned minor = 0;
       if (bgmtl_gpu_state(&minor) == 2)
-         trip("the kernel reports the GPU lost");
+         gpu_failed("the kernel reports the GPU lost", 1);
       if (crashtest && t == 5) {
          ilog("backboardd: crashtest armed: crashing on purpose");
          abort();
@@ -273,7 +353,7 @@ watchdog(void *arg)
       sleep(1);
       unsigned minor = 0;
       if (bgmtl_gpu_state(&minor) == 2)
-         trip("the kernel reports the GPU lost");
+         gpu_failed("the kernel reports the GPU lost", 1);
       if (t == 15) {
          write_state(0, 1);
          ilog("alive for 15 s: dead-man counter reset");
@@ -315,7 +395,7 @@ static void
 bb_init(void)
 {
    g_bb = 1;
-   if (exists(F_BB_OFF)) { ilog("backboardd: %s present, stock", F_BB_OFF); return; }
+   if (off_present(F_BB_OFF)) { ilog("backboardd: %s present, stock", F_BB_OFF); return; }
    int crashtest = 0;
    FILE *a = fopen(F_BB_ARM, "r");
    if (!a) { ilog("backboardd: not armed, stock"); return; }
@@ -613,7 +693,8 @@ bgmtl_inject_init(void)
       }
       snprintf(g_state, sizeof(g_state), "%s.%s", F_STATE, [bid UTF8String]);
       snprintf(g_off, sizeof(g_off), "%s.%s", F_OFF, [bid UTF8String]);
-      if (exists(F_OFF) || exists(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }
+      if (exists(F_OFF) || off_present(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }
+      if (g_off_expired && [bid isEqualToString:@"com.apple.iconservicesagent"]) empty_icon_cache();
       if (!exists(F_ARM)) { ilog("%s: not armed, stock", [bid UTF8String]); return; }
       // gate 3: the dead-man
       int unclean = 0, alive = 1;
