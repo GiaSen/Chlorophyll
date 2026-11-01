@@ -67,8 +67,12 @@ static char g_state[192] = F_STATE, g_off[192] = F_OFF;
 // com.apple.PosterBoard (2026-10-26, user: "PosterBoard should run on Chlorophyll"): it hosts the wallpaper posters for
 // SpringBoard and lived without a Metal device; after a SpringBoard restart the wallpaper stayed the poster's flat placeholder
 // colour while Mercury kept rendering frames nobody composited.
+// The Unity 2025, Pride, Astronomy and Kaleidoscope posters (2026-11-01): they draw with Metal, and without a device their gallery previews are the
+// clock on black (Unity, Pride) or the extension dies (Astronomy, Kaleidoscope).
 static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider",
-                                      "com.apple.iconservicesagent", "com.apple.springboard", "com.apple.PosterBoard", NULL };
+                                      "com.apple.iconservicesagent", "com.apple.springboard", "com.apple.PosterBoard",
+                                      "com.apple.Posters.UnityPosterApp.Unity2025Poster", "com.apple.PridePoster.PridePosterExtension",
+                                      "com.apple.NanoUniverse.AegirProxyApp.AegirPoster", "com.apple.Posters.KaleidoscopePosterApp.KaleidoscopePoster", NULL };
 static volatile int g_failures, g_registered, g_bb;
 static volatile unsigned g_completed;
 
@@ -111,7 +115,7 @@ write_state(int unclean, int alive)
 {
    FILE *f = fopen(g_state, "w");
    if (!f) return;
-   fprintf(f, "unclean=%d alive=%d boot=%s\n", unclean, alive, boot_id());
+   fprintf(f, "unclean=%d alive=%d boot=%s pid=%d\n", unclean, alive, boot_id(), getpid());
    fclose(f);
 }
 
@@ -697,11 +701,14 @@ bgmtl_inject_init(void)
       if (g_off_expired && [bid isEqualToString:@"com.apple.iconservicesagent"]) empty_icon_cache();
       if (!exists(F_ARM)) { ilog("%s: not armed, stock", [bid UTF8String]); return; }
       // gate 3: the dead-man
-      int unclean = 0, alive = 1;
+      int unclean = 0, alive = 1, pid = 0;
       char boot[64] = "";
       FILE *f = fopen(g_state, "r");
-      if (f) { if (fscanf(f, "unclean=%d alive=%d boot=%63s", &unclean, &alive, boot) < 2) { unclean = 0; alive = 1; } fclose(f); }
+      if (f) { if (fscanf(f, "unclean=%d alive=%d boot=%63s pid=%d", &unclean, &alive, boot, &pid) < 2) { unclean = 0; alive = 1; } fclose(f); }
       if (!alive && strcmp(boot, boot_id()) != 0) { ilog("last launch was in an earlier boot: not counted as unclean"); alive = 1; }
+      // The wallpaper gallery starts several instances of one poster at once, each on its way to its first frame: the one that wrote this state is
+      // still running, so it did not die (Mercury off for the boot, the iOS 26 cards black).
+      if (!alive && pid > 0 && (kill(pid, 0) == 0 || errno == EPERM)) { ilog("last launch %d is still running: not counted as unclean", pid); alive = 1; }
       if (!alive) unclean++;
       if (unclean >= 2) {
          // for this boot only (off_present): the system ends some of these processes young, a poster extension above all, so this is often no fault
@@ -732,6 +739,10 @@ bgmtl_inject_init(void)
       // (SIGSEGV in CIKernelReflection::consolidate, PhotosPosterProvider on iOS 26). CoreImage reads this switch from the
       // environment first, so it is set before any CIKernel exists.
       setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
+      // MPS keeps its own tables per GPU family and finds nothing for this device: MPSAutoCache read through a null pointer the first time
+      // CoreImage used an MPS blur, which is how PosterBoard makes wallpaper previews (the gallery black, PosterBoard dead, far 0x228). CoreImage does the same
+      // work with its own kernels.
+      setenv("CI_ENABLE_MPS", "0", 0);
       add(dev);
       g_registered = 1;
       ilog("%s: BGMTLDevice registered in this process (kernel ABI minor %u)", [bid UTF8String], minor);

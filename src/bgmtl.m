@@ -769,6 +769,58 @@ ensure_protocol(Class cls, const char *proto)
       BG_LOG("class_addProtocol(%s) refused for %s\n", proto, class_getName(cls));
 }
 
+// What ImageIO asks for to lay ASTC out the way the GPU reads it ("twiddled"): wallpaper previews are saved that way, and a linear ATX is converted on load. Unanswered, a
+// poster with a Metal device saved a file with no pixels, and backboardd then refused every commit of the PosterBoard showing it (CompressedImage port is
+// MACH_PORT_NULL, serialization error: the gallery sheet invisible). This GPU reads ASTC in tight rows, which is the layout given here; nobody but ImageIO has been seen calling.
+struct bg_watermark { uint64_t v[2]; };
+
+@interface BGTextureLayout : NSObject {
+   NSUInteger _width, _blockW, _blockH, _size;
+}
+@end
+
+@implementation BGTextureLayout
+- (id)initWithWidth:(NSUInteger)width height:(NSUInteger)height blockW:(NSUInteger)bw blockH:(NSUInteger)bh
+{
+   if ((self = [super init])) {
+      _width = width;
+      _blockW = bw;
+      _blockH = bh;
+      _size = (width + bw - 1) / bw * 16 * ((height + bh - 1) / bh);
+   }
+   return self;
+}
+- (NSUInteger)size { return _size; }
+- (NSUInteger)alignment { return 16384; }
+- (MTLSize)copyGranularity { return MTLSizeMake(_blockW, _blockH, 1); }
+// saved in the file and compared on load: all zero, as in the files of a poster without a Metal device
+- (struct bg_watermark)watermark { return (struct bg_watermark){ { 0, 0 } }; }
+- (void)initializeTextureMemory:(void *)memory { }
+- (void)finalizeTextureMemory:(void *)memory { }
+- (void)copyFromLinearBytes:(const void *)bytes linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)rowBytes linearBytesPerImage:(NSUInteger)imageBytes
+            toTextureMemory:(void *)memory textureSlice:(NSUInteger)slice textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region
+{
+   NSUInteger pitch = (_width + _blockW - 1) / _blockW * 16;
+   NSUInteger len = (region.size.width + _blockW - 1) / _blockW * 16;
+   NSUInteger rows = (region.size.height + _blockH - 1) / _blockH;
+   char *dst = (char *)memory + region.origin.y / _blockH * pitch + region.origin.x / _blockW * 16;
+   const char *src = (const char *)bytes + offset;
+   for (NSUInteger y = 0; y < rows; y++)
+      memcpy(dst + y * pitch, src + y * rowBytes, len);
+}
+- (void)copyFromTextureMemory:(const void *)memory textureSlice:(NSUInteger)slice textureLevel:(NSUInteger)level textureRegion:(MTLRegion)region
+              toLinearBytes:(void *)bytes linearOffset:(NSUInteger)offset linearBytesPerRow:(NSUInteger)rowBytes linearBytesPerImage:(NSUInteger)imageBytes
+{
+   NSUInteger pitch = (_width + _blockW - 1) / _blockW * 16;
+   NSUInteger len = (region.size.width + _blockW - 1) / _blockW * 16;
+   NSUInteger rows = (region.size.height + _blockH - 1) / _blockH;
+   const char *src = (const char *)memory + region.origin.y / _blockH * pitch + region.origin.x / _blockW * 16;
+   char *dst = (char *)bytes + offset;
+   for (NSUInteger y = 0; y < rows; y++)
+      memcpy(dst + y * rowBytes, src + y * pitch, len);
+}
+@end
+
 @implementation BGMTLDevice
 
 + (void)load
@@ -913,6 +965,16 @@ ensure_protocol(Class cls, const char *proto)
       [inv setReturnValue:z];
       free(z);
    }
+}
+
+- (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBacked:(BOOL)backed
+{
+   static const unsigned char blocks[][2] = { {4,4}, {5,4}, {5,5}, {6,5}, {6,6}, {0,0}, {8,5}, {8,6}, {8,8}, {10,5}, {10,6}, {10,8}, {10,10}, {12,10}, {12,12} };
+   NSUInteger f = d.pixelFormat;
+   NSUInteger b = f >= MTLPixelFormatASTC_4x4_LDR && f <= MTLPixelFormatASTC_12x12_LDR ? f - MTLPixelFormatASTC_4x4_LDR :
+                  f >= MTLPixelFormatASTC_4x4_sRGB && f <= MTLPixelFormatASTC_12x12_sRGB ? f - MTLPixelFormatASTC_4x4_sRGB : NSUIntegerMax;
+   if (b == NSUIntegerMax || !blocks[b][0] || d.textureType != MTLTextureType2D || d.mipmapLevelCount != 1) return nil;
+   return [[BGTextureLayout alloc] initWithWidth:d.width height:d.height blockW:blocks[b][0] blockH:blocks[b][1]];
 }
 
 // traced pass-throughs of the capability queries CoreAnimation makes (what it chooses its renderer conventions from)

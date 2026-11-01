@@ -351,4 +351,30 @@ Measured so nobody has to guess again. `research/chl-work/glass/` (gitignored) h
 
 **Check:** no such line in `bgmtl`'s output; with tracing, `no-copy texture 414x896 fmt 204, 376832 bytes, 224 rows`.
 
-**Not seen working yet:** I have not got a clean look at the gallery with this last version, because the lock screen sleeps within seconds and my gestures there are unreliable. The wallpaper gallery's other cards were black when I saw it, and PosterBoard crashed around it (`far 0x228`); I could not tell whether that predates the hidden hosts.
+**Seen working (2026-11-02):** the Emoji card shows with no stripes. The rest of the gallery is in the next section.
+
+## The wallpaper gallery: four causes behind one black sheet (2026-11-02, Mi 8)
+
+**Symptom (the user's words):** "everything is black, and struggles to load, i think app died i had to close it". Opening Add New Wallpaper dimmed the page and showed no sheet, or a black sheet. The invisible sheet still took touches: a tap on nothing opened the editor.
+
+**1. PosterBoard crashed in MPS.** CoreImage used an MPS blur, MPS has no tables for this GPU, and `MPSAutoCache` read through a null pointer (far 0x228). The inject now sets `CI_ENABLE_MPS=0`, and CoreImage does the blur with its own kernels.
+
+**2. Previews with no pixels hid the whole sheet. This was the sheet going missing.** backboardd logged `PosterBoard : CompressedImage port is MACH_PORT_NULL!`, then `serialization error from context`, and threw that commit away. PosterBoard's own log showed the gallery laying out cells and scrolling, with nothing on screen. The cause was `Composite.atx` files of 16392 bytes: all header, an `astc` chunk of length 0. ImageIO saves wallpaper previews in the GPU's own ASTC layout ("twiddled") and asks for it through `-newTextureLayoutWithDescriptor:isHeapOrBufferBacked:`. We answered nil. A poster with a Metal device therefore wrote an empty image, and every PosterBoard that loaded it lost its commits. A poster without a device writes the same file with linear ASTC, which is why Emoji and Color always worked.
+
+**Fix:** `BGTextureLayout` answers for 2D ASTC with one mip level: tight rows, 16 KB alignment, and a watermark of zero, so files match what a poster without a device writes. The protocol came from this Mac's Metal (`objc_getProtocol("MTLTextureLayout")`): `watermark` returns a 16-byte struct. My first version returned an integer, so the selector pointer left in x1 went into the file header as half a watermark. Those files failed the same way, and the good cards went black.
+
+**Three things tried and dropped:** forcing `twiddling:NO` in `+[PUIImageOnDiskFormat atxWithBlockSize:twiddling:]` writes an `ASTC` chunk, and loading that gave the same null port. Answering with a probe object that returned zeros crashed PosterBoard and Pride. A nil layout in PosterBoard alone left the new files unreadable.
+
+**Empty files stay on disk.** They live in `scratch/SnapshotCache.cachedb` under `descriptors`, `staticdescriptors` and `configurations`, in sizes 16392 and 16408. A driver update does not remove them: the caches holding one had to be deleted by hand, and PosterBoard made them again.
+
+**3. The dead-man counted a running instance as a crash.** The gallery starts several instances of one poster at once. The second read `alive=0` from the first, still on its way to its first frame, and counted it as unclean; the next one wrote `bgmtl.off.<bundle id>`, so Mercury stayed off for the boot and the iOS 26 cards were black. The state file now holds the pid, and a launch whose predecessor is still running does not count.
+
+**4. Metal posters had no device.** Unity 2025, Pride, Astronomy and Kaleidoscope carry a `default.metallib` and were not on the allow-list. They are now, and in `CHL_TARGETS` in the image builder, with the same entitlements Mercury has. Unity, Pride and Kaleidoscope register the device and submit work.
+
+**Check (2026-11-02, screenshots and logs):** fresh PosterBoard, and again after closing and reopening without a restart: the sheet appears within 5 s, with Photos, Color, Emoji and Collections drawn and iOS 26 live. 15-16 GPU clients, 0 recoveries, 0 hangs, no `CompressedImage` line, no PosterBoard crash.
+
+**Still wrong:**
+- Unity Rhythm and Astronomy stay black. Unity and Pride now save a real file, but its image is nearly all zero, with one column at the left edge. That is what the poster's own in-process capture hands to the encoder (`CARenderer` on Metal; a poster without a device goes through `CARenderServerRenderLayer`). Not understood yet.
+- Astronomy (`AegirPoster`) still aborts, now on an exception from QuartzCore through ClockKitUI and NanoUniverse, so its dead-man trips. Kaleidoscope's cards have not been judged on screen with its device; it crashed in ClockKitUI before this.
+- iOS 26 draws, but wrongly (white and dark shapes), as Mercury already did.
+- The customize screen flashes black. The user saw it ("black artifacts"). My screenshots show the gallery without its glass controls in place of the editor, in 5 of 14 frames. backboardd logs `Timer delayed by` 1.1-1.5 s there, every 2-3 s. Cause not known.
