@@ -224,10 +224,10 @@ bgmtl.m misses (400-800 misses per scene). A miss cost a kernel allocation, and 
 turns it off; `memcache:` lines in bgmtl.log count it (bgmtl.perf). Reused memory holds old pixels, as Metal allows; screenshots and a
 5 minute soak showed no damage.
 
-`TU_DEBUG=sysmem` is NOT usable here: GPU time drops by 15-25% but the picture breaks, black wedges and staircases in Control Center
-and on icons. It forces passes with framebuffer fetch off GMEM. Turnip's autotuner keeps those on GMEM by itself, and
-`/private/var/tmp/chl.autotune` = `prefer_sysmem` (TU_AUTOTUNE_ALGO) is clean, but gains nothing because the glass passes are the ones that
-stay on GMEM. Left at the default. Look at screenshots before believing a frame-rate gain.
+`TU_DEBUG=sysmem` alone breaks the picture, black wedges and staircases in Control Center and on icons. It forces passes with framebuffer
+fetch off GMEM. Turnip's autotuner keeps those on GMEM by itself, and `/private/var/tmp/chl.autotune` = `prefer_sysmem` (TU_AUTOTUNE_ALGO) is
+clean, but gains nothing because the glass passes are the ones that stay on GMEM. Look at screenshots before believing a frame-rate gain. (The
+damage turned out to have a cause and a cure: see Direct rendering everywhere, below.)
 
 ## The first gestures after a boot, and what held encoding back (2026-10-31, Mi 8)
 
@@ -271,7 +271,7 @@ The blank 40x40 a root tool got from `prepareImageForDescriptor:` was this too.
 
 **Fix.** `bgCopyWriteBack`: at completion, what the GPU wrote goes back into the surface, and the writer takes the new seed. A reader of a surface drawn into by a command buffer in flight waits for that write-back, at most 500 ms (`bg_surfwb_wait`). backboardd is left out, as for the other surface syncs here.
 
-**The tiled-mode fault, avoided and not understood.** With layers now present, an icon larger than about 220 px, so more than one tile, soon gives an SMMU fault: `TP|VFD`, always in iconservicesagent, at a low address: FAR 0x2504c00, 0x2504000, 0x24d7080, 0x247cd80. Home screen sizes never did, in any run. `TU_DEBUG=sysmem` has none. But direct rendering alone reads stale cache lines in framebuffer fetches: black squares on Mail, blocks on Photos and Music, with or without UBWC, gone with `flushall`. So the inject sets `TU_DEBUG=sysmem,flushall` for this process (`bgmtl.env.com.apple.iconservicesagent` overrides it). It draws little, so the cost does not show.
+**The tiled-mode fault, avoided and not understood.** With layers now present, an icon larger than about 220 px, so more than one tile, soon gives an SMMU fault: `TP|VFD`, always in iconservicesagent, at a low address: FAR 0x2504c00, 0x2504000, 0x24d7080, 0x247cd80. Home screen sizes never did, in any run. `TU_DEBUG=sysmem` has none. But direct rendering alone reads stale cache lines in framebuffer fetches: black squares on Mail, blocks on Photos and Music, with or without UBWC, gone with `flushall`. So the inject set `TU_DEBUG=sysmem,flushall` for this process at first; `rast_order` replaced `flushall` later, see Direct rendering everywhere.
 
 Observed in a capture of the fault (`FD_RD_DUMP=enable,combine`; **`FD_RD_DUMP_PATH` must exist: otherwise `fd_rd_output_write_section` spins forever on a failed gzwrite**): the only low addresses a fetch can start from are the tile-memory descriptors of the input attachments (0x100000 to 0x200000), and all four FARs are multiples of 0x80. A guess that fits all four: FAR = 0x160000 + 16 * (y * 4608 + x * 8), y about 500, x under 530, as if an RGBA16F attachment were read with coordinates still in sixteenths of a pixel. Not confirmed: the 1/16 constant is right in every fetching shader of the capture. Beware cffdump in binning phases: it shows the previous fragment shader's register state, so a set can look as if it held a texture descriptor made of scissor words. It does not; that was a false lead here. SpringBoard's RenderBox stays tiled and may meet this if it ever draws that large with fetches; not seen in any soak.
 
@@ -286,3 +286,13 @@ On the first boot of a fresh root the kernel reported `GPU HANG (no completion)`
 **Fix.** `chl_cmdbuf_commit` holds any process at 3 command buffers on the ring, for at most 1 s per commit (backboardd stays at 2 and 100 ms), and never on the completion thread, which is what makes room. The limit is per process, so several busy clients still add up, but to about a second rather than without bound.
 
 **Checks.** First-boot conditions recreated by hand (poster store and icon cache emptied, first-boot markers removed, phone left locked): worst wait in a poster or icon process 0.57 s, down from 105 s. The one larger value, 3.4 s, is a single backboardd frame about 11 s after boot, before any of this load. 0 resets, 0 dead-men. Warm gestures unchanged: Control Center open 48-51 fps, scroll 54-56, back 51-55, Spotlight about 41. Soak 300 s, 18 app launches, 0 faults.
+
+## Direct rendering everywhere (2026-11-01, Mi 8)
+
+Every process on Chlorophyll now runs `TU_DEBUG=sysmem,rast_order`, set by the inject. `bgmtl-bb.env`, `bgmtl.env.<bundle id>` or `chl.tudebug` override it.
+
+**Why direct.** A frame in backboardd has 20 to 48 render passes. `chl.passprof` with `12 0` (second number: shortest pass worth a line) lists them all: about 83% of the GPU time is in about 7 full-screen passes, each glass or blur layer. In tiles each of those costs a full-screen load and store. The gaps between passes read 0.0 ms, so the full barriers are not the cost; do not spend time on them.
+
+**Why the picture broke before.** A framebuffer fetch reads the attachment through the texture path. In tiles that is tile memory. Direct, it is main memory, and earlier draws may still sit in the colour cache. Turnip flushes per overlapping primitive (`SINGLE_PRIM_MODE`) only for pipelines with rasterization-order access, and Chlorophyll asks for that only on pipelines that fetch, so a draw by any other pipeline before them stayed in the cache: black wedges, staircases, blocks. `rast_order` gives every pipeline the flush. `flushall` also cures it, by flushing everything per draw.
+
+**Results.** GPU ms per frame, tiled -> direct, three warm rounds each: Spotlight 19.4 -> 11.5, app open 12.4 -> 8.5, Control Center open 17.9 -> 14.6, unlock 10.5 -> 10.0, Control Center scroll 14.2 -> 13.3, scroll back 21.0 -> 20.7. Shown fps barely moved, within noise: the GPU is no longer what limits most gestures, encode and SpringBoard's main thread are (see the notes from round 4). What this buys is GPU headroom and less work per frame. It also takes tiled framebuffer fetches, and so the fault of the section on glass icons, out of every process, not only the icon agent. That fault is still not understood. Screenshots against tiled: app screens differ by a mean of 0.15 of 255; home screens by more, which is the moving wallpaper. Soak 300 s, 18 app launches, 0 faults. First boot recreated: done in about 3 minutes, 0 resets, worst wait 0.84 s.

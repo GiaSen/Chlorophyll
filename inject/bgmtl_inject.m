@@ -576,6 +576,11 @@ bgmtl_inject_init(void)
 {
    @autoreleasepool {
       if (!strcmp(getprogname(), "backboardd")) bb_env();
+      // Direct rendering, not tiles: each of a frame's glass passes costs a full-screen load and store in tiles (GPU time 5-25% lower
+      // without), and RenderBox's framebuffer fetches over several tiles fault (TP|VFD, a low FAR, docs/FIXES.md). A fetch in direct mode
+      // needs the earlier draws out of the colour cache, which Turnip only does for pipelines with rasterization-order access: rast_order
+      // gives every pipeline that (without it: black wedges, staircases, blocks). bgmtl-bb.env, bgmtl.env.<bundle id> and chl.tudebug override this.
+      if (!exists("/private/var/tmp/chl.tudebug")) setenv("TU_DEBUG", "sysmem,rast_order", 0);
       // bgl-launch chose Metal for this launch; on iOS 26 there is no bgl-launch (and dyld ignores DYLD_* for backboardd), so the
       // inject is weakly linked into a re-signed backboardd and /private/var/tmp/bgmtl-bb.direct stands in for BGMTL_BB=1
       // (bgmtl-bb.arm, bgmtl-bb.off, the GPU state and the watchdog still apply in bb_init)
@@ -606,10 +611,6 @@ bgmtl_inject_init(void)
          snprintf(ef, sizeof(ef), "/private/var/tmp/bgmtl.env.%s", [bid UTF8String]);
          env_file(ef, [bid UTF8String]);
       }
-      // The icon agent's RenderBox reads its attachments back in the shader. Tiled with several tiles (an icon over about 220 px) that
-      // faults (TP|VFD, a low FAR, in docs/FIXES.md), and direct with ordinary flushes it reads stale cache lines. It draws
-      // little and only when an icon changes, so it can afford direct rendering with everything flushed.
-      if ([bid isEqualToString:@"com.apple.iconservicesagent"]) setenv("TU_DEBUG", "sysmem,flushall", 0);
       snprintf(g_state, sizeof(g_state), "%s.%s", F_STATE, [bid UTF8String]);
       snprintf(g_off, sizeof(g_off), "%s.%s", F_OFF, [bid UTF8String]);
       if (exists(F_OFF) || exists(g_off)) { ilog("%s: kill switch present, stock", [bid UTF8String]); return; }

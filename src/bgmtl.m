@@ -1856,19 +1856,21 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
       else cb->_status = 4;   // Completed
       uint64_t t_done = clock_gettime_nsec_np(CLOCK_MONOTONIC), t_flushed = __atomic_load_n(&cb->_t_flushed, __ATOMIC_RELAXED);
       bg_perf_note(cb->_t_first, d->t_begin, t_flushed ? t_flushed : t_done, t_done, cb->_draws);
-      // /private/var/tmp/chl.passprof holds the GPU time in ms above which a frame's passes are listed (default 80)
+      // /private/var/tmp/chl.passprof holds the GPU time in ms above which a frame's passes are listed (default 80), then optionally
+      // the shortest pass or gap worth a line (default 5)
       static long passprof_ms = -1;
+      static double passprof_min = 5.0;
       if (passprof_ms < 0) {
          FILE *f = fopen("/private/var/tmp/chl.passprof", "r");
          passprof_ms = 80;
          if (f) {
-            if (fscanf(f, "%ld", &passprof_ms) != 1) passprof_ms = 80;
+            if (fscanf(f, "%ld %lf", &passprof_ms, &passprof_min) < 1) passprof_ms = 80;
             fclose(f);
          }
       }
       if (t_flushed && t_done - t_flushed > (uint64_t)passprof_ms * 1000000ull) {
          char line[220];
-         for (unsigned i = 0; chl_cmdbuf_pass_line(cb->_ccb, i, 5.0, line, sizeof(line)); i++)
+         for (unsigned i = 0; chl_cmdbuf_pass_line(cb->_ccb, i, passprof_min, line, sizeof(line)); i++)
             if (line[0]) bgmtl_note_line(line);
       }
       bg_passdump_flush(cb);
