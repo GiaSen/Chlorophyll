@@ -29,6 +29,7 @@
 #import <objc/runtime.h>
 #include <time.h>
 #import <IOSurface/IOSurfaceRef.h>
+#include <arm_neon.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -582,6 +583,7 @@ struct bg_passdump;
    const void *_ncBytes; // newTextureWithBytesNoCopy: the caller's memory, refreshed from at each use like _linSrc
    BOOL _surfCopy;       // an IOSurface the GPU could not import: own memory, refreshed from the surface at each use
    BOOL _xr2p;           // ... a two-plane RGB10A8_2P_XR10 one ('b3a8': XR10 RGB + A8 alpha), decoded into BGRA8 at each refresh
+   BOOL _yuv420;         // ... a two-plane YCbCr 4:2:0 one ('420f', '420v'), its samples unpacked into RGBA8 at each refresh
    uint32_t _surfSeed;   // the surface's seed at the last refresh (an unchanged surface is not copied again)
    BOOL _surfFresh;      // _surfSeed is valid: the surface was decoded or written back at least once (a seed may be 0)
    uint32_t _xrUses;     // uses since the last XR10 decode (bgmtl.xr10log)
@@ -689,6 +691,54 @@ bg_passdump_bpp(NSUInteger fmt)
    case 115: return 8;
    case 125: return 16;
    default: return 0;
+   }
+}
+
+// The matrix a YCbCr surface says it was made with: the IOSurface property holds kCVImageBufferYCbCrMatrix's string. App snapshots have no
+// such property and are 601 (their colours against the live app, 2026-11-01).
+static BOOL
+bg_surface_is_709(IOSurfaceRef sf)
+{
+   CFTypeRef m = IOSurfaceCopyValue(sf, CFSTR("IOSurfaceYCbCrMatrix"));
+   BOOL is709 = m && CFGetTypeID(m) == CFStringGetTypeID() && CFStringFind((CFStringRef)m, CFSTR("709"), 0).location != kCFNotFound;
+   if (m) CFRelease(m);
+   return is709;
+}
+// Two-plane 4:2:0 YCbCr to RGBA8, one chroma pair per two by two texels, coefficients in 1/64
+static void
+bg_yuv420_to_rgba(uint8_t *out, unsigned w, unsigned h, const uint8_t *p0, size_t r0, const uint8_t *p1, size_t r1, BOOL is709, BOOL video)
+{
+   // video range: luma 16..235 and chroma 16..240 are stretched to the whole range
+   const int16_t cr_r = video ? (is709 ? 115 : 102) : (is709 ? 101 : 90), cb_g = video ? (is709 ? 14 : 25) : (is709 ? 12 : 22),
+                 cr_g = video ? (is709 ? 34 : 52) : (is709 ? 30 : 46), cb_b = video ? (is709 ? 135 : 129) : (is709 ? 119 : 113);
+   const int16_t luma = video ? 75 : 64, luma0 = video ? 16 : 0;
+   for (unsigned y = 0; y < h; y++) {
+      const uint8_t *s0 = p0 + y * r0, *s1 = p1 + (y / 2) * r1;
+      uint8_t *o = out + (size_t)y * w * 4;
+      unsigned x = 0;
+      for (; x + 16 <= w; x += 16) {
+         const uint8x8x2_t c = vld2_u8(s1 + x);
+         const int16x8_t cb = vreinterpretq_s16_u16(vsubl_u8(c.val[0], vdup_n_u8(128))), cr = vreinterpretq_s16_u16(vsubl_u8(c.val[1], vdup_n_u8(128)));
+         const int16x8_t dr = vmulq_n_s16(cr, cr_r), dg = vnegq_s16(vaddq_s16(vmulq_n_s16(cb, cb_g), vmulq_n_s16(cr, cr_g))), db = vmulq_n_s16(cb, cb_b);
+         const uint8x16_t yy = vld1q_u8(s0 + x);
+         for (unsigned k = 0; k < 2; k++) {
+            const int16x8_t l = vmulq_n_s16(vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(k ? vget_high_u8(yy) : vget_low_u8(yy))), vdupq_n_s16(luma0)), luma);
+            uint8x8x4_t px;
+            px.val[0] = vqrshrun_n_s16(vqaddq_s16(l, k ? vzip2q_s16(dr, dr) : vzip1q_s16(dr, dr)), 6);
+            px.val[1] = vqrshrun_n_s16(vqaddq_s16(l, k ? vzip2q_s16(dg, dg) : vzip1q_s16(dg, dg)), 6);
+            px.val[2] = vqrshrun_n_s16(vqaddq_s16(l, k ? vzip2q_s16(db, db) : vzip1q_s16(db, db)), 6);
+            px.val[3] = vdup_n_u8(255);
+            vst4_u8(o + 4 * x + 32 * k, px);
+         }
+      }
+      for (; x < w; x++) {
+         const int cb = (int)s1[x & ~1u] - 128, cr = (int)s1[(x & ~1u) + 1] - 128, l = ((int)s0[x] - luma0) * luma + 32;
+         const int r = (l + cr_r * cr) >> 6, g = (l - cb_g * cb - cr_g * cr) >> 6, b = (l + cb_b * cb) >> 6;
+         o[4 * x] = (uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r);
+         o[4 * x + 1] = (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g);
+         o[4 * x + 2] = (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b);
+         o[4 * x + 3] = 255;
+      }
    }
 }
 
@@ -2304,10 +2354,23 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
          char why2[256];
          _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
          if (_tex) { _surfCopy = YES; _xr2p = YES; }
+      } else if (!_tex && [d pixelFormat] == 500 && IOSurfaceGetPlaneCount(sf) == 2) {
+         /* A picture CoreAnimation shows as it is (a decoded JPEG or HEIC, a video frame): luma in plane 0, Cb and Cr at half size in
+          * plane 1. The texture gets its own RGBA8 memory and the samples are unpacked into it when the surface changes; the shader
+          * does the colour conversion. */
+         char why2[256];
+         _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
+         if (_tex) { _surfCopy = YES; _yuv420 = YES; }
+         else snprintf(why, sizeof(why), "%s", why2);
       } else if (!_tex) {
          char why2[256];
          _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
          if (_tex) _surfCopy = YES;
+         else {
+            uint32_t cc = IOSurfaceGetPixelFormat(sf);
+            snprintf(why, sizeof(why), "IOSurface %u '%c%c%c%c', %zu planes, %zux%zu: %s", IOSurfaceGetID(sf), (char)(cc >> 24), (char)(cc >> 16),
+                     (char)(cc >> 8), (char)cc, IOSurfaceGetPlaneCount(sf), IOSurfaceGetWidth(sf), IOSurfaceGetHeight(sf), why2);
+         }
       }
       if (bg_xr10log() && [d pixelFormat] == 550)
          bg_xr10_note("xr10 wrap surface %u tex %p %ux%u planes %zu usage 0x%lx: %s", IOSurfaceGetID(sf), (void *)self, _desc.width,
@@ -2430,6 +2493,30 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
          chl_texture_flush_surface(_tex);
          BG_TEX_MARK(BG_TEX_FLUSH);
       }
+   } else if (_yuv420 && _surface) {
+      IOSurfaceRef sf = (IOSurfaceRef)_surface;
+      uint32_t seed = IOSurfaceGetSeed(sf);
+      if ((!_surfFresh || seed != _surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
+         // plane 0: one luma byte per texel; plane 1: Cb, Cr per two by two texels. CoreAnimation hands this texture to the encoder with a
+         // sampler that converts (setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:) and its shader takes RGB, so the texture holds RGB.
+         const uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
+         size_t r0 = IOSurfaceGetBytesPerRowOfPlane(sf, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(sf, 1);
+         unsigned w = MIN(_desc.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0)), h = MIN(_desc.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
+         uint8_t *out = (p0 && p1 && w && h) ? malloc((size_t)w * h * 4) : NULL;
+         uint64_t t0 = mach_absolute_time();
+         if (out) bg_yuv420_to_rgba(out, w, h, p0, r0, p1, r1, bg_surface_is_709(sf), IOSurfaceGetPixelFormat(sf) == '420v');
+         uint64_t t1 = mach_absolute_time();
+         BG_TRACE("YCbCr surface %u %ux%u rows %zu %zu seed %u: %llu ticks\n", IOSurfaceGetID(sf), w, h, r0, r1, seed, (unsigned long long)(t1 - t0));
+         IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+         if (out) {
+            const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+            if (chl_texture_replace(_tex, 0, 0, o, sz, out, w * 4, 0, why, sizeof(why)) != 0) BG_LOG("YCbCr surface refresh: %s\n", why);
+            free(out);
+            _surfSeed = seed;
+            _surfFresh = YES;
+         }
+      }
+      BG_TEX_MARK(BG_TEX_COPY);
    } else if (_xr2p && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       uint32_t seed = IOSurfaceGetSeed(sf);
@@ -2808,6 +2895,12 @@ bg_attachment(BGMTLCommandBuffer *cb, MTLRenderPassAttachmentDescriptor *a, stru
 - (void)setFragmentTextures:(const id *)t withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setFragmentTexture:t[k] atIndex:r.location + k]; }
 - (void)setVertexSamplerState:(id)s atIndex:(NSUInteger)i { bg_bind_sampler(_cb, CHL_STAGE_VERTEX, i, s); }
 - (void)setFragmentSamplerState:(id)s atIndex:(NSUInteger)i { bg_bind_sampler(_cb, CHL_STAGE_FRAGMENT, i, s); }
+// a YCbCr texture and the sampler that converts it, bound together
+- (void)setFragmentTexture:(id)t atTextureIndex:(NSUInteger)ti samplerState:(id)s atSamplerIndex:(NSUInteger)si
+{
+   [self setFragmentTexture:t atIndex:ti];
+   [self setFragmentSamplerState:s atIndex:si];
+}
 - (void)setFragmentSamplerStates:(const id *)s withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setFragmentSamplerState:s[k] atIndex:r.location + k]; }
 - (void)setViewport:(MTLViewport)v
 {

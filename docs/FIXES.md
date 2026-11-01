@@ -322,3 +322,21 @@ Measured so nobody has to guess again. `research/chl-work/glass/` (gitignored) h
 **Fixed: the memory cache emptied itself between gestures.** It kept memory 3 s, so any gesture after a pause started cold: 378 kernel allocations in its first second, on the render thread, each with zeroing and mappings. That was about 19% of the render thread's running samples. It now keeps memory for 2 minutes (`/private/var/tmp/chl.memckeep`, seconds, overrides), which holds up to the same 96 MB longer. Busy seconds went from about 71% hits (924/378) to mostly 92-100% (276/7, 170/0, 153/5, 242/20), with some seconds still at 78% and 65% (568/163, 146/79). Encoding's share of the gaps, 4 rounds per gesture: unlock 60 and 527 ms in two baselines -> 0, Control Center open 218 and 101 -> 0, page flick 512 and 0 -> 0, app open 1594 and 1333 -> 463. Average fps and worst gaps did not move beyond noise (Control Center open still has 219, 218, 218 ms): the runs differ from each other by more than this changes.
 
 **What is left is not ours.** SpringBoard's main thread takes about 150 ms of CPU at the start of a Control Center opening, spread thinly over UIKit with no hot spot, on an A75 already at full clock. In backboardd's render thread, after the fix, the largest items of ours are kernel calls through libdrm (15.5% of samples, inclusive) and memory allocation (9.9%); the next is 6%.
+
+## App snapshots: a YCbCr surface bound through a call nobody had written (2026-11-01, Mi 8)
+
+**What it looked like in the logs.** Backboardd printed `texture refused:` with no reason, in bursts during app opens. The reason was lost: the fallback's own message went to a second buffer and the log printed the first.
+
+**What it was.** When an app opens, SpringBoard hands the render server the app's last snapshot, a 828x1792 `'420f'` IOSurface (8-bit 4:2:0, full range, two planes), which CoreAnimation wraps as `MTLPixelFormatYCBCR8_420_2P` (500). That format was not in the table, so the wrap failed and the frames that should show the snapshot drew nothing for it. Seen with Wallet, the app `tools/dipper-scenes.py` opens: one surface per opening, on screen for about 2 frames in the trace, up to 51 refusals in a burst when CoreAnimation kept retrying. How much of that a person would notice is not measured.
+
+**Two things were missing.** First the format: 500 now gets its own RGBA8 texture (like 550) and `chlTextureFor:` fills it when the surface's seed moves. Second, once the wrap worked, CoreAnimation bound the texture with `setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:`, which was not implemented, so the catch-all answered with zero and nothing was bound. It now binds the texture and the sampler.
+
+**RGB, not raw samples.** The pipeline is an ordinary image one, `TcimA2Xhf_Ixrg`: its NIR samples the texture and multiplies by the tint, with no matrix. So on Apple's GPU the sampler converts, and our texture has to hold RGB already. `bg_yuv420_to_rgba` does that with NEON in about 4 ms for this size (14-34 ms in plain C at -O1). It is on the render thread, once per snapshot.
+
+**Colours.** The surface has no `IOSurfaceYCbCrMatrix` value; 601 is assumed and checked against the live app at the same pixels: 10 points, 24 levels of difference in total, 66 with 709. Full range is what these are. The `'420v'` and 709 paths are only tested on the Mac against the formulas (within 3 levels); no video surface has been seen here, and a video frame of this size would cost those 4 ms per frame.
+
+**Do not call `IOSurfaceGetYCbCrMatrix` by `dlsym`.** It takes something other than the surface and crashed backboardd (`IOSurfaceClientGetYCbCrMatrix`, 2026-11-01).
+
+**Other YCbCr formats (501 and up, 10-bit) are still refused**, now with the fourcc and the reason in the log.
+
+**Check.** `bgmtl.tracing` on, open Wallet from the home screen, close it, open it again: `YCbCr surface` lines in `bgmtl-trace-<backboardd pid>.txt` and no `texture refused`.

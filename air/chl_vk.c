@@ -190,6 +190,8 @@ static const struct chl_format chl_formats[] = {
    { 260, "MTLPixelFormatDepth32Float_Stencil8", VK_FORMAT_D32_SFLOAT_S8_UINT, 8, 1, 1, ASPECT_DEPTH | ASPECT_STENCIL, 0, false },
    /* Apple's extended-range formats, by a native format of the same size (the XR encoding itself is not reproduced):
     * QuartzCore builds its deep-colour pipelines in these whatever the device answers */
+   /* bgmtl keeps these in their own memory and fills it from the surface's two planes */
+   C(500, "MTLPixelFormatYCBCR8_420_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
    C(550, "MTLPixelFormatRGB10A8_2P_XR10 (as BGRA8)", VK_FORMAT_B8G8R8A8_UNORM, 4),
    C(552, "MTLPixelFormatBGRA10_XR (as RGBA16Float)", VK_FORMAT_R16G16B16A16_SFLOAT, 8),
    C(553, "MTLPixelFormatBGRA10_XR_sRGB (as RGBA16Float)", VK_FORMAT_R16G16B16A16_SFLOAT, 8),
