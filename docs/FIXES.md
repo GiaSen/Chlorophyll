@@ -219,7 +219,7 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
 
 A glass animation makes hundreds of offscreen textures a second, many of a shape never seen before, so the shape-keyed pool in
 bgmtl.m misses (400-800 misses per scene). A miss cost a kernel allocation, and later a kernel free, on the render thread.
-`memc_take` / `memc_give` (air/chl_vk.c) keep released texture memory for 3 s, rounded up to a quarter of its power of two, up to
+`memc_take` / `memc_give` (air/chl_vk.c) keep released texture memory for 2 minutes (3 s at first, see Where the CPU goes below), rounded up to a quarter of its power of two, up to
 96 MB, and only in backboardd (with BGMTL_TEXPOOL_MB). A VkImage over existing memory costs almost nothing. `/private/var/tmp/chl.nomemcache`
 turns it off; `memcache:` lines in bgmtl.log count it (bgmtl.perf). Reused memory holds old pixels, as Metal allows; screenshots and a
 5 minute soak showed no damage.
@@ -306,6 +306,18 @@ The kernel's recovery fails the work of every process, whoever caused the reset,
 - **Again within 30 minutes, or GPU lost:** the kill switch as before, but holding `boot=<id>`, so it counts for this boot only (`off_present`). That bounds backboardd's restarts, which launchd tolerates only a few of. The kernel gives up after three recoveries in a boot anyway.
 - **Next boot:** the stale switch is removed and the process is back on the GPU. If it was the icon agent's, it also empties the icon cache (`empty_icon_cache`), because without the GPU it cached blanks for what it could not draw.
 
-Switches written by hand, and by `trip()` for a process that cannot get through its start (two unclean launches, 180 s with no frame), still hold until removed: those guard against boot loops.
+Two unclean launches in a row also write a switch for this boot only: the system ends some processes young, poster extensions above all (Mercury tripped this on an ordinary boot, 2026-11-01). Switches written by hand, and backboardd's 180 s with no frame, still hold until removed.
 
 **Checks, with real SMMU faults** (the icon agent with a dummy `TU_DEBUG=x`, so tiled, on 528 px icons; it faults on some runs, not all). Screen idle: only the agent restarted. During animation: agent at once, backboardd and SpringBoard at their next frames, all on the GPU, no switches. Then gestures on the real touch path: first round poor while they came back (unlock 31 fps, Control Center 24-27 fps, some gestures missed), second round normal (Control Center open 42, scroll 49, back 47). So touch survives a backboardd restart. Second fault within 5 minutes: backboardd and agent on the CPU, switches tagged. Reboot: `... is from an earlier boot: back on the GPU`, icon cache emptied (135 files), every Settings row present.
+
+## Where the CPU goes in a gesture (2026-11-01, Mi 8)
+
+Measured so nobody has to guess again. `research/chl-work/glass/` (gitignored) has the tools; `sweetev` (per-thread user and system time, faults) and `hitch` tallies are the useful ones.
+
+**Backboardd's gaps over 40 ms, not counting the idle tick:** 65% with the render server waiting for a client, 33% encoding, 2% on the GPU. Read the client share with care: a gap at the start of a gesture includes the idle 10 Hz tick before it, so values at 100 or 117 ms are partly not stutter at all.
+
+**Ruled out, each measured:** contention (all processes together about 11% of the machine during gestures, background daemons barely register); page faults (5/s, no page-ins); kernel overhead (main threads 12-25% system); the kernel's log (40 lines/s); memory and L3 clocks (pinned at maximum: Control Center's first gap 219 -> 235 ms, no gain); barriers between passes (0.0 ms).
+
+**Fixed: the memory cache emptied itself between gestures.** It kept memory 3 s, so any gesture after a pause started cold: 378 kernel allocations in its first second, on the render thread, each with zeroing and mappings. That was about 19% of the render thread's running samples. It now keeps memory for 2 minutes (`/private/var/tmp/chl.memckeep`, seconds, overrides), which holds up to the same 96 MB longer. Busy seconds went from about 71% hits (924/378) to about 90-99% (276/7, 170/0). Encoding's share of the gaps, 4 rounds per gesture: unlock 60 and 527 ms in two baselines -> 0, Control Center open 218 and 101 -> 0, page flick 512 and 0 -> 0, app open 1594 and 1333 -> 463. Average fps and worst gaps did not move beyond noise: the runs differ from each other by more than this changes.
+
+**What is left is not ours.** SpringBoard's main thread takes about 150 ms of CPU at the start of a Control Center opening, spread thinly over UIKit with no hot spot, on an A75 already at full clock. Backboardd's encode is about 6 ms a frame, 40% of it in this driver, with no single large item left: allocation 10%, commit 6%, draws 5%, pipeline binds 5%.

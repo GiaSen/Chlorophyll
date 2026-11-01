@@ -703,7 +703,13 @@ bgmtl_inject_init(void)
       if (f) { if (fscanf(f, "unclean=%d alive=%d boot=%63s", &unclean, &alive, boot) < 2) { unclean = 0; alive = 1; } fclose(f); }
       if (!alive && strcmp(boot, boot_id()) != 0) { ilog("last launch was in an earlier boot: not counted as unclean"); alive = 1; }
       if (!alive) unclean++;
-      if (unclean >= 2) trip("two unclean launches in a row");
+      if (unclean >= 2) {
+         // for this boot only (off_present): the system ends some of these processes young, a poster extension above all, so this is often no fault
+         ilog("DEAD-MAN: two unclean launches in a row: writing %s until the next boot and exiting", g_off);
+         FILE *of = fopen(g_off, "w");
+         if (of) { fprintf(of, "boot=%s two unclean launches in a row\n", boot_id()); fclose(of); }
+         _exit(0);
+      }
       write_state(unclean, 0);
       // gate 4
       unsigned minor = 0;

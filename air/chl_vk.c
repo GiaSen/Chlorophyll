@@ -393,6 +393,7 @@ struct chl_device {
    /* memory of released textures, see memc_take */
    struct { VkDeviceMemory mem; VkDeviceSize size; uint64_t t; } memc[CHL_MEMC_SLOTS];
    VkDeviceSize memc_bytes, memc_cap;
+   uint64_t memc_keep_ns;
    pthread_mutex_t memc_lock;
    unsigned long memc_hits, memc_misses;
    char name[256];
@@ -688,6 +689,17 @@ chl_device_open(char *why, size_t why_size)
    pthread_mutex_init(&d->memc_lock, NULL);
    if (getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.nomemcache", F_OK) != 0)
       d->memc_cap = 96ull << 20;
+   {
+      /* how long released memory stays, in seconds (/private/var/tmp/chl.memckeep) */
+      unsigned secs = 120;
+      FILE *f = fopen("/private/var/tmp/chl.memckeep", "r");
+      if (f) {
+         if (fscanf(f, "%u", &secs) != 1)
+            secs = 120;
+         fclose(f);
+      }
+      d->memc_keep_ns = secs * 1000000000ull;
+   }
    d->passprof = getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.passprof", F_OK) == 0;
    {
       /* see chl_cmdbuf_commit */
@@ -1063,7 +1075,8 @@ storage_view(struct chl_texture *t, unsigned level)
  * The compositor makes hundreds of offscreen textures a second while a glass animation runs, many of a shape it never had
  * before, so the shape-keyed pool in bgmtl.m misses. What a miss costs is the memory: a kernel allocation with its pages and
  * mappings, and a kernel free later, on the render thread. A VkImage over memory that already exists costs almost nothing, so
- * released memory is kept here for a few seconds and rounded up to reuse across sizes. Its contents are undefined, as a new
+ * released memory is kept here for two minutes and rounded up to reuse across sizes (with 3 s a gesture after any pause started cold,
+ * 378 kernel allocations in its first second). Its contents are undefined, as a new
  * image's are, and a texture is only released once no command buffer holds it. On with BGMTL_TEXPOOL_MB (backboardd);
  * /private/var/tmp/chl.nomemcache turns it off.
  */
@@ -1079,7 +1092,7 @@ static void
 memc_expire(struct chl_device *d, uint64_t now)
 {
    for (unsigned i = 0; i < CHL_MEMC_SLOTS; i++)
-      if (d->memc[i].mem && now - d->memc[i].t > 3000000000ull) {
+      if (d->memc[i].mem && now - d->memc[i].t > d->memc_keep_ns) {
          d->vk.vkFreeMemory(d->dev, d->memc[i].mem, NULL);
          d->memc_bytes -= d->memc[i].size;
          d->memc[i].mem = VK_NULL_HANDLE;
