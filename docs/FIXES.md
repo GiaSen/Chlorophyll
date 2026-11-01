@@ -18,6 +18,7 @@ Debugging switches referred to below (files on the phone, read when the process 
 | `/private/var/tmp/bgmtl.env.<bundle id>` | `KEY=VALUE` lines set for that process alone before its device exists (`bgmtl-bb.env` is backboardd's), e.g. `FD_RD_DUMP=enable,combine` |
 | `/private/var/tmp/bgmtl.fidraw` | one `bgmtl.log` line per draw of RenderBox's `primitive_custom_vertex` pipelines |
 | `/private/var/tmp/chl.inflight.clients` | command buffers a process other than backboardd may have on the ring (default 3, 0 is no limit); read at process start. `chl.inflight` is backboardd's (default 2) |
+| `/private/var/tmp/chl.memckeep` | seconds released texture memory stays in backboardd's cache (default 120), read when the device is created |
 | `/private/var/tmp/chl.passdump` | a directory, world-writable, there at process start: every colour attachment of every render pass, memoryless ones too, as it stood when the pass ended, raw in `/private/var/tmp/chlpd-<pid>-<command buffer>-<pass>-c<n>-<w>x<h>-<Metal format>.raw`; with `bgmtl.tracing` a trace line names each |
 | `/private/var/tmp/bgmtl.compilelog` | one `bgmtl.log` line per call that reaches Apple's MTLCompilerService (specialised functions, libraries from source), with who asked and how long it took |
 
@@ -215,7 +216,7 @@ Restart backboardd after changing one (`kill -9` it; launchd restarts it). If `b
   the mapping for most uploads. Probe 18/18; texture uploads 6.4 % -> 4 % of backboardd, our share 37 % -> 30 %;
   `RWA_LINEAR_SAMPLED=0` turns it off.
 
-## Texture memory stays around for a few seconds (2026-10-31, Mi 8)
+## Texture memory stays around between gestures (2026-10-31, Mi 8)
 
 A glass animation makes hundreds of offscreen textures a second, many of a shape never seen before, so the shape-keyed pool in
 bgmtl.m misses (400-800 misses per scene). A miss cost a kernel allocation, and later a kernel free, on the render thread.
@@ -316,8 +317,8 @@ Measured so nobody has to guess again. `research/chl-work/glass/` (gitignored) h
 
 **Backboardd's gaps over 40 ms, not counting the idle tick:** 65% with the render server waiting for a client, 33% encoding, 2% on the GPU. Read the client share with care: a gap at the start of a gesture includes the idle 10 Hz tick before it, so values at 100 or 117 ms are partly not stutter at all.
 
-**Ruled out, each measured:** contention (all processes together about 11% of the machine during gestures, background daemons barely register); page faults (5/s, no page-ins); kernel overhead (main threads 12-25% system); the kernel's log (40 lines/s); memory and L3 clocks (pinned at maximum: Control Center's first gap 219 -> 235 ms, no gain); barriers between passes (0.0 ms).
+**Ruled out, each measured:** contention (all processes together about 11% of the machine during gestures, background daemons barely register); page faults (5/s, no page-ins); kernel overhead (main threads 12-25% system); the kernel's log (40 lines/s); memory and L3 clocks (pinned at maximum: Control Center's largest gaps 219, 219, 204 ms -> 235, 202, 201, no gain); barriers between passes (0.0 ms).
 
-**Fixed: the memory cache emptied itself between gestures.** It kept memory 3 s, so any gesture after a pause started cold: 378 kernel allocations in its first second, on the render thread, each with zeroing and mappings. That was about 19% of the render thread's running samples. It now keeps memory for 2 minutes (`/private/var/tmp/chl.memckeep`, seconds, overrides), which holds up to the same 96 MB longer. Busy seconds went from about 71% hits (924/378) to about 90-99% (276/7, 170/0). Encoding's share of the gaps, 4 rounds per gesture: unlock 60 and 527 ms in two baselines -> 0, Control Center open 218 and 101 -> 0, page flick 512 and 0 -> 0, app open 1594 and 1333 -> 463. Average fps and worst gaps did not move beyond noise: the runs differ from each other by more than this changes.
+**Fixed: the memory cache emptied itself between gestures.** It kept memory 3 s, so any gesture after a pause started cold: 378 kernel allocations in its first second, on the render thread, each with zeroing and mappings. That was about 19% of the render thread's running samples. It now keeps memory for 2 minutes (`/private/var/tmp/chl.memckeep`, seconds, overrides), which holds up to the same 96 MB longer. Busy seconds went from about 71% hits (924/378) to mostly 92-100% (276/7, 170/0, 153/5, 242/20), with some seconds still at 78% and 65% (568/163, 146/79). Encoding's share of the gaps, 4 rounds per gesture: unlock 60 and 527 ms in two baselines -> 0, Control Center open 218 and 101 -> 0, page flick 512 and 0 -> 0, app open 1594 and 1333 -> 463. Average fps and worst gaps did not move beyond noise (Control Center open still has 219, 218, 218 ms): the runs differ from each other by more than this changes.
 
-**What is left is not ours.** SpringBoard's main thread takes about 150 ms of CPU at the start of a Control Center opening, spread thinly over UIKit with no hot spot, on an A75 already at full clock. Backboardd's encode is about 6 ms a frame, 40% of it in this driver, with no single large item left: allocation 10%, commit 6%, draws 5%, pipeline binds 5%.
+**What is left is not ours.** SpringBoard's main thread takes about 150 ms of CPU at the start of a Control Center opening, spread thinly over UIKit with no hot spot, on an A75 already at full clock. In backboardd's render thread, after the fix, the largest items of ours are kernel calls through libdrm (15.5% of samples, inclusive) and memory allocation (9.9%); the next is 6%.
