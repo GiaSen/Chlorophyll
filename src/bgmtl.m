@@ -816,6 +816,16 @@ struct bg_watermark { uint64_t v[2]; };
    NSUInteger rows = (region.size.height + _blockH - 1) / _blockH;
    const char *src = (const char *)memory + region.origin.y / _blockH * pitch + region.origin.x / _blockW * 16;
    char *dst = (char *)bytes + offset;
+   // a preview saved before this layout existed holds no pixels, and ImageIO does not look: SpringBoard read past the end of the mapped file and died
+   for (NSUInteger at = 0; at < _size; at += vm_page_size) {
+      char one;
+      vm_size_t got;
+      if (vm_read_overwrite(mach_task_self(), (vm_address_t)memory + at, 1, (vm_address_t)&one, &got) != KERN_SUCCESS) {
+         for (NSUInteger y = 0; y < rows; y++)
+            memset(dst + y * rowBytes, 0, len);
+         return;
+      }
+   }
    for (NSUInteger y = 0; y < rows; y++)
       memcpy(dst + y * rowBytes, src + y * pitch, len);
 }
