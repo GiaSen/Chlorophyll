@@ -15,6 +15,8 @@ Debugging switches referred to below (files on the phone, read when the process 
 | `/private/var/tmp/bgmtl-bb.inorder` | backboardd: freedreno without batch reordering (`FD_MESA_DEBUG=inorder`) |
 | `/private/var/tmp/bgmtl-bb.fddebug` | backboardd: any `FD_MESA_DEBUG` flags (`flush`, `ddraw`, `sysmem`, ...) |
 | `/private/var/tmp/bgmtl-bb.sync` / `.full` / `.off` | synchronous commits / dirty regions off / Metal off in backboardd |
+| `/private/var/tmp/chl.rest` | a wallpaper's rest, in multiples of its last command buffer's time (default 2, 0 is none) |
+| `/private/var/tmp/bgmtl.generic` | CoreAnimation's generic shader stays on, outside backboardd (`bgmtl-bb.generic` there) |
 | `/private/var/tmp/bgmtl.env.<bundle id>` | `KEY=VALUE` lines set for that process alone before its device exists (`bgmtl-bb.env` is backboardd's), e.g. `FD_RD_DUMP=enable,combine` |
 | `/private/var/tmp/bgmtl.fidraw` | one `bgmtl.log` line per draw of RenderBox's `primitive_custom_vertex` pipelines |
 | `/private/var/tmp/chl.inflight.clients` | command buffers a process other than backboardd may have on the ring (default 3, 0 is no limit); read at process start. `chl.inflight` is backboardd's (default 2) |
@@ -377,7 +379,7 @@ Measured so nobody has to guess again. `research/chl-work/glass/` (gitignored) h
 - Unity Rhythm and Astronomy stay black. Unity now saves a real file, but its image is nearly all zero, with one column at the left edge. That is what the poster's own in-process capture hands to the encoder (a guess at the mechanism: `CARenderer` on Metal, where a poster without a device goes through `CARenderServerRenderLayer`). Not understood yet. Tapping the Unity Rhythm card opened nothing, twice.
 - Astronomy (`AegirPoster`) still aborts, now on an exception from QuartzCore through ClockKitUI and NanoUniverse, so its dead-man trips. Kaleidoscope's cards have not been judged on screen with its device; it crashed in ClockKitUI before this.
 - iOS 26 draws, but wrongly (white and dark shapes), as Mercury already did.
-- The customize screen is slow: about 1.3 frames a second, because Mercury fills the GPU's ring. See the next section.
+- The customize screen runs at about 14 frames a second, because Mercury still takes over 40% of the GPU. See "One wallpaper held the whole GPU".
 
 ### The customize screen's black flashes: frames the GPU had not finished (2026-11-02, Mi 8)
 
@@ -386,3 +388,27 @@ Measured so nobody has to guess again. `research/chl-work/glass/` (gitignored) h
 - **A wrong first answer.** Raising the limit from 50 ms to 1 s (xnu 3033) changed nothing: `EEEEGGEEEEGGEEEEEE`, 12 timeouts in the run. It was a reading of the code, tested afterwards.
 - **Fix (xnu 3034).** The older frame keeps its place until its fence passes and the frame after it is dropped instead, so frames finish. The limit is 3 s and only covers a stuck GPU; when it runs out the older frame goes first.
 - **Check.** Image 55, asynchronous commits, the same screen: 22 of 22 frames `E`, then another 22 of 22 with Mercury limited to one command buffer. 0 timeouts in both, against 12 or more before. 0 recoveries, 0 hangs.
+
+### One wallpaper held the whole GPU (2026-11-02, Mi 8)
+
+- **Symptom.** With the flashes gone, the gallery and the customize screen reached the panel 1.3 times a second.
+- **Why.** `kern.sweet_gpu_by` (xnu 3034) charges each 4 ms governor tick to the process that submitted the oldest unfinished submission. Mercury took 94-102%, also while hidden behind the editor, and backboardd needed 5-8%. The ring runs in order, without preemption, so every compositor frame waited for what Mercury had queued. Holding wallpapers to one command buffer (`chl.inflight.clients`=1) only reached 3.8-4.6 frames a second: about 250 ms of Mercury's work is always ahead while it never stops.
+- **Fix.** `chl_cmdbuf_commit`: a process with "Poster" in its name, other than PosterBoard, runs one command buffer at a time and then rests for twice what the last one took, at most 500 ms.
+- **Check, after a reboot, on the driver from boot, three screens of samples.**
+
+| | before | after |
+|---|---|---|
+| Gallery, frames a second | 1.3 | 29 |
+| Customize screen, frames a second | 1.3 | 13.8 |
+| Mercury's share of the GPU | 94-102% | 42-46% |
+| Submissions queued, average | 13 | 4 |
+
+  0 timeouts, 0 recoveries, 0 hangs, no new crash report. Not tested: Mercury as the wallpaper in use, which will animate more slowly than its 4 frames a second before. The other wallpapers on the GPU have not been judged with this.
+
+### The gallery's PosterBoard killed on every open after a driver rebuild (2026-11-02, Mi 8)
+
+- **Symptom.** After installing a rebuilt `libchlorophyll`, Add New Wallpaper showed nothing and PosterBoard left a `scene-create watchdog transgression` report (0x8badf00d, 10-20 s of wall clock) at each try, also after a reboot.
+- **Wrong first answers.** It looked like the new wallpaper rest, but the old limits (`chl.rest`=0, `chl.inflight.clients`=3) failed the same way. A reboot ruled out damage from killing processes. Thousands of cache misses were ruled out too: only 6 new cache files appeared.
+- **Why.** SIGABRT during the hang gave the stacks, which the watchdog's report has not: the main thread waits inside QuartzCore for the `com.apple.coreanimation.pipelines` queue, and that queue is in `chl_render_pipeline_create`. A rebuilt library invalidates the disk cache. One compile there outlasts the watchdog, so its result is never saved and the next try starts again. **Reading of the code and the result of the fix, not read from the stack:** that pipeline is CoreAnimation's generic shader (see "The first unlock"), which the inject only turned off for backboardd.
+- **Fix.** `CA_DISABLE_GENERIC_SHADERS` in every allowed process (`bgmtl.generic` keeps Apple's behaviour).
+- **Check.** The same rebuilt library, the same missing cache entry: the gallery appears within 5 s of the tap, with a fresh PosterBoard and again after a reboot. 173 new cache files in that run, so compiles now finish.

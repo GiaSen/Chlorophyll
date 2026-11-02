@@ -376,6 +376,7 @@ struct chl_cmdbuf {
    uint32_t pushed_pc[2][64];
    bool vp_set, sc_set;
    struct chl_cmdbuf *next_free, *next_inflight;
+   uint64_t submit_ns;
    /* /private/var/tmp/chl.passprof: the GPU time of each render pass, chl_cmdbuf_pass_line */
    VkQueryPool qp;
    struct chl_pass_note { unsigned w, h, colors, draws, nfs; char fs[4][28]; } *pass_notes;
@@ -446,6 +447,8 @@ struct chl_device {
    struct chl_cmdbuf *inflight_head, *inflight_tail;
    unsigned n_inflight, inflight_limit;   /* see chl_cmdbuf_commit */
    long inflight_wait_ns;
+   unsigned rest;                         /* see chl_cmdbuf_commit */
+   uint64_t rest_done_ns, rest_busy_ns;
    bool passprof;
    char shaderdump[256];              /* /private/var/tmp/chl.shaderdump: fragment functions to dump, see shader_dump */
    bool quit;
@@ -665,6 +668,11 @@ completion_thread(void *arg)
       if (!d->inflight_head)
          d->inflight_tail = NULL;
       d->n_inflight--;
+      if (d->rest) {
+         uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+         d->rest_busy_ns = now - MAX2(cb->submit_ns, d->rest_done_ns);
+         d->rest_done_ns = now;
+      }
       pthread_mutex_unlock(&d->done_lock);
       /* what it held goes first: once it is reported done, its owner may recycle it (chl_cmdbuf_release) */
       cb_retire(cb);
@@ -720,13 +728,22 @@ chl_device_open(char *why, size_t why_size)
    {
       /* see chl_cmdbuf_commit */
       bool server = getenv("BGMTL_TEXPOOL_MB") != NULL;
+      const char *prog = getprogname();
+      bool wallpaper = !server && strstr(prog, "Poster") && strcmp(prog, "PosterBoard");
       FILE *f = fopen(server ? "/private/var/tmp/chl.inflight" : "/private/var/tmp/chl.inflight.clients", "r");
-      unsigned dflt = server ? 2 : 3;
+      unsigned dflt = server ? 2 : wallpaper ? 1 : 3;
       d->inflight_limit = dflt;
       d->inflight_wait_ns = server ? 100000000 : 1000000000;
       if (f) {
          if (fscanf(f, "%u", &d->inflight_limit) != 1)
             d->inflight_limit = dflt;
+         fclose(f);
+      }
+      d->rest = wallpaper ? 2 : 0;
+      f = wallpaper ? fopen("/private/var/tmp/chl.rest", "r") : NULL;
+      if (f) {
+         if (fscanf(f, "%u", &d->rest) != 1)
+            d->rest = 2;
          fclose(f);
       }
    }
@@ -2415,6 +2432,11 @@ chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why,
     * about 110 ms a frame and submits at 60 fps, a backlog of 26 s was measured, and whoever then waits for the GPU behind
     * it hits the kernel's 5 s patience, which resets a healthy GPU (first boot: 46 frames behind). The time limit is there
     * so that a very long frame costs no more than it did. Never on the completion thread: it is what makes room.
+    *
+    * A wallpaper extension runs one at a time, then rests for rest (2, /private/var/tmp/chl.rest, 0 is none) times what its
+    * last one took, at most half a second. The ring runs in order and without preemption, so the compositor's frames wait for
+    * whatever is ahead of them: Mercury kept the GPU at 100% even behind the wallpaper editor, about 250 ms a command buffer,
+    * and backboardd, which needs 5-8%, reached the panel 1.3 times a second. Only a gap lets it through.
     */
    uint64_t tw = build_now();
    if (d->inflight_limit && !pthread_equal(pthread_self(), d->thread)) {
@@ -2431,7 +2453,11 @@ chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why,
                 pthread_cond_timedwait(&d->done_cv, &d->done_lock, &deadline) == 0) {
          }
       }
+      uint64_t rest_until = d->rest ? d->rest_done_ns + MIN2(d->rest_busy_ns * d->rest, 500000000ull) : 0;
       pthread_mutex_unlock(&d->done_lock);
+      uint64_t now = build_now();
+      if (now < rest_until)
+         usleep((rest_until - now) / 1000);
    }
    uint64_t t0 = build_now();
    pthread_mutex_lock(&d->queue_lock);
@@ -2452,6 +2478,7 @@ chl_cmdbuf_commit(struct chl_cmdbuf *cb, chl_done_fn done, void *ctx, char *why,
    if (r == VK_SUCCESS) {
       pthread_mutex_lock(&d->done_lock);
       d->n_inflight++;
+      cb->submit_ns = t3;
       cb->next_inflight = NULL;
       if (d->inflight_tail)
          d->inflight_tail->next_inflight = cb;

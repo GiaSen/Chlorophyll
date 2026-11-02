@@ -677,6 +677,10 @@ bgmtl_inject_init(void)
       for (const char *const *a = kAllow; *a; a++)
          if (bid && !strcmp([bid UTF8String], *a)) allowed = 1;
       if (!allowed) return;                                   // gate 1: silent in every other process
+      // Not only backboardd: PosterBoard and the wallpapers draw with CoreAnimation in their own process. Compiling A2Xghfc there takes
+      // longer than FrontBoard's 10-20 s for a scene, so without a cached copy (after any driver rebuild) the gallery's PosterBoard was
+      // killed every time, before the result could be saved. /private/var/tmp/bgmtl.generic keeps Apple's behaviour.
+      if (!exists("/private/var/tmp/bgmtl.generic")) setenv("CA_DISABLE_GENERIC_SHADERS", "1", 1);
       if (!strcmp([bid UTF8String], "com.apple.springboard")) {   // not a GPU matter: before the gates
          restart_stale_posterboard();
          atx_contents_install();
