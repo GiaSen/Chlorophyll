@@ -69,10 +69,12 @@ static char g_state[192] = F_STATE, g_off[192] = F_OFF;
 // colour while Mercury kept rendering frames nobody composited.
 // The Unity 2025, Astronomy and Kaleidoscope posters (2026-11-01): they draw with Metal, and without a device their gallery previews are the clock on
 // black (Unity) or the extension dies (Astronomy, Kaleidoscope). Not Pride: it calls MPS itself, and MPS has no tables for this GPU (null + 0x228).
+// com.apple.MediaRemoteUI (2026-11-03): the Now Playing UI force-unwraps MediaCoreUI.MetalContext.shared for its artwork backdrop
+// (Backdrop.CompositeRenderer) and died with a SIGTRAP whenever a video started playing.
 static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.PhotosUIPrivate.PhotosPosterProvider",
                                       "com.apple.iconservicesagent", "com.apple.springboard", "com.apple.PosterBoard",
                                       "com.apple.Posters.UnityPosterApp.Unity2025Poster", "com.apple.NanoUniverse.AegirProxyApp.AegirPoster",
-                                      "com.apple.Posters.KaleidoscopePosterApp.KaleidoscopePoster", NULL };
+                                      "com.apple.Posters.KaleidoscopePosterApp.KaleidoscopePoster", "com.apple.MediaRemoteUI", NULL };
 static volatile int g_failures, g_registered, g_bb;
 static volatile unsigned g_completed;
 
