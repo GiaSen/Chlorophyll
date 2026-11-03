@@ -433,6 +433,10 @@ bb_init(void)
    // fetches, 40-58 ms for one full-screen draw on this GPU, while the specialised shader it would otherwise build is 10-50 instructions
    // and costs a few ms (the first unlock after a boot, 1.2 s for one pass). /private/var/tmp/bgmtl-bb.generic keeps Apple's behaviour.
    if (!exists("/private/var/tmp/bgmtl-bb.generic")) setenv("CA_DISABLE_GENERIC_SHADERS", "1", 1);
+   // Video: CoreAnimation puts a video layer on a display plane of its own ("detached"), and the kernel's framebuffer shows only the
+   // BGRA main plane, so the video area stayed black while the decoder ran (2026-11-03). Composited by the GPU instead, as everything
+   // else. /private/var/tmp/bgmtl-bb.detach keeps Apple's behaviour.
+   if (!exists("/private/var/tmp/bgmtl-bb.detach")) setenv("CA_DISABLE_DETACHED", "1", 1);
    // A/B switch: "scheduled" only once the GPU finished, as before 0229/0240 (see -commit in src/bgmtl.m)
    if (exists("/private/var/tmp/bgmtl-bb.defersched")) { setenv("BGMTL_DEFER_SCHEDULED", "1", 1); ilog("backboardd: BGMTL_DEFER_SCHEDULED=1"); }
    if (exists("/private/var/tmp/bgmtl-bb.sync")) {     // A/B: synchronous commits (the frame-order glitches after the async change)
