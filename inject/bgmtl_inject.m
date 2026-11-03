@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -76,6 +77,7 @@ static const char *const kAllow[] = { "com.apple.MercuryPoster", "com.apple.Phot
                                       "com.apple.Posters.UnityPosterApp.Unity2025Poster", "com.apple.NanoUniverse.AegirProxyApp.AegirPoster",
                                       "com.apple.Posters.KaleidoscopePosterApp.KaleidoscopePoster", "com.apple.MediaRemoteUI", NULL };
 static volatile int g_failures, g_registered, g_bb;
+extern int bgmtl_mps_blur_install(void);   // src/bgmtl.m: MPSImageGaussianBlur with the driver's own kernel
 static volatile unsigned g_completed;
 
 static void
@@ -90,6 +92,19 @@ ilog(const char *fmt, ...)
    fputc('\n', f);
    va_end(ap);
    fclose(f);
+}
+
+// MPS has no tables for this GPU (see CI_ENABLE_MPS below); MediaRemoteUI's lock screen backdrop calls MPSImageGaussianBlur itself and died
+// in MPSAutoCache (far 0x228). Installed once the device is registered, or when MPSImage is loaded later.
+static void
+mps_image_added(const struct mach_header *mh, intptr_t slide)
+{
+   (void)mh; (void)slide;
+   static int noted;
+   if (bgmtl_mps_blur_install() && !noted) {
+      noted = 1;
+      ilog("MPSImageGaussianBlur: blurs with the driver's own kernel in this process");
+   }
 }
 
 static int
@@ -756,6 +771,7 @@ bgmtl_inject_init(void)
       add(dev);
       g_registered = 1;
       ilog("%s: BGMTLDevice registered in this process (kernel ABI minor %u)", [bid UTF8String], minor);
+      _dyld_register_func_for_add_image(mps_image_added);   // runs at once for the images already loaded
       touchlog_install();
       atexit(clean_exit);
       pthread_t th;

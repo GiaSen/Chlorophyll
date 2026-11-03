@@ -33,6 +33,7 @@
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3212,4 +3213,160 @@ struct chl_device *
 bgmtl_chl(id device)
 {
    return [(BGMTLDevice *)device chl];
+}
+
+// --- MPSImageGaussianBlur on this device ------------------------------------------------------------------------------------------------
+// MPS keeps tables per GPU family and has none for this device: MPSAutoCache reads through a null pointer (far 0x228) at the first encode
+// (CI_ENABLE_MPS=0 in the inject keeps CoreImage away from it). MediaCoreUI's Now Playing backdrop, in MediaRemoteUI behind the lock screen
+// player, calls MPSImageGaussianBlur itself for its artwork. bgmtl_mps_blur_install() gives that class its own two encode methods: a separable
+// Gaussian in two compute passes on the caller's command buffer, from MSL compiled here once per process (-newLibraryWithSource: works on this
+// device; CoreImage, tried first, draws nothing on it). Edges clamped (MPS's default edge mode), the kernel's sigma, the destination's extent;
+// offset and clipRect are not honoured (not used there). Wide kernels take at most 2 * 24 + 1 taps per pass, spread over the radius.
+static NSString *const bg_blur_src =
+   @"#include <metal_stdlib>\nusing namespace metal;\n"
+    "kernel void bg_blur(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],\n"
+    "                    constant float *w [[buffer(0)]], constant int4 &a [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {\n"
+    "   if (p.x >= dst.get_width() || p.y >= dst.get_height()) return;\n"
+    "   int2 lim = int2(src.get_width(), src.get_height()) - 1, d = a.z ? int2(0, 1) : int2(1, 0);\n"
+    "   float4 acc = 0;\n"
+    "   for (int i = -a.x; i <= a.x; i++)\n"
+    "      acc += w[abs(i)] * src.read(uint2(clamp(int2(p) + d * (i * a.y), int2(0), lim)));\n"
+    "   dst.write(acc, p);\n"
+    "}\n";
+static id bg_blur_dev, bg_blur_ps, bg_blur_tmp;
+
+static int
+bg_blur_pass(id cb, id src, id dst, const float *w, int taps, int step, int vertical)
+{
+   id<MTLComputeCommandEncoder> ce = [(id<MTLCommandBuffer>)cb computeCommandEncoder];
+   if (!ce) return 0;
+   int a[4] = { taps, step, vertical, 0 };
+   [ce setComputePipelineState:bg_blur_ps];
+   [ce setTexture:src atIndex:0];
+   [ce setTexture:dst atIndex:1];
+   [ce setBytes:w length:(taps + 1) * sizeof(float) atIndex:0];
+   [ce setBytes:a length:sizeof(a) atIndex:1];
+   [ce dispatchThreads:MTLSizeMake([(id<MTLTexture>)dst width], [(id<MTLTexture>)dst height], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+   [ce endEncoding];
+   return 1;
+}
+
+int
+bgmtl_gauss_blur(float sigma, id cb, id src, id dst)
+{
+   if (!cb || !src || !dst) return 0;
+   id<MTLDevice> dev = [(id<MTLCommandBuffer>)cb device];
+   @synchronized([BGMTLDevice class]) {
+      if (bg_blur_dev != dev) {
+         NSError *e = nil;
+         id lib = [dev newLibraryWithSource:bg_blur_src options:nil error:&e];
+         id fn = [lib newFunctionWithName:@"bg_blur"];
+         id ps = fn ? [dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+         [fn release];
+         [lib release];
+         if (!ps) {
+            BG_LOG("blur kernel: %s\n", e ? [[e description] UTF8String] : "no pipeline");
+            return 0;
+         }
+         [bg_blur_ps release];
+         bg_blur_ps = ps;
+         bg_blur_dev = dev;
+         [bg_blur_tmp release];
+         bg_blur_tmp = nil;
+      }
+      // the horizontal pass's output, kept for the next call of the same shape
+      id<MTLTexture> t = bg_blur_tmp;
+      if (!t || [t width] != [(id<MTLTexture>)dst width] || [t height] != [(id<MTLTexture>)dst height]) {
+         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                     width:[(id<MTLTexture>)dst width] height:[(id<MTLTexture>)dst height] mipmapped:NO];
+         d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+         d.storageMode = MTLStorageModePrivate;
+         [bg_blur_tmp release];
+         bg_blur_tmp = t = [dev newTextureWithDescriptor:d];
+         if (!t) return 0;
+      }
+      int radius = sigma > 0 ? (int)ceilf(3 * sigma) : 0, step = radius > 24 ? (radius + 23) / 24 : 1, taps = radius / step;
+      float w[25], sum = 0;
+      for (int i = 0; i <= taps; i++) {
+         float x = (float)(i * step);
+         w[i] = sigma > 0 ? expf(-x * x / (2 * sigma * sigma)) : 1;
+         sum += i ? 2 * w[i] : w[i];
+      }
+      for (int i = 0; i <= taps; i++) w[i] /= sum;
+      return bg_blur_pass(cb, src, t, w, taps, step, 0) && bg_blur_pass(cb, t, dst, w, taps, step, 1);
+   }
+}
+
+static void
+bg_mps_note(const char *what, int ok)
+{
+   static int noted;
+   if (__atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 4) {
+      char line[160];
+      snprintf(line, sizeof(line), "MPSImageGaussianBlur %s on this device: %s", what, ok ? "done" : "FAILED (nothing drawn)");
+      bgmtl_note_line(line);
+   }
+}
+
+static float
+bg_mps_sigma(id kernel)
+{
+   return ((float (*)(id, SEL))objc_msgSend)(kernel, sel_getUid("sigma"));
+}
+
+static void
+bg_mps_encode(id self, SEL _cmd, id cb, id src, id dst)
+{
+   (void)_cmd;
+   bg_mps_note("encode", bgmtl_gauss_blur(bg_mps_sigma(self), cb, src, dst));
+}
+
+// MPSCopyAllocator returns a retained texture; *texture is a strong reference the callee replaces on success
+static BOOL
+bg_mps_encode_in_place(id self, SEL _cmd, id cb, id *texture, id (^alloc)(id, id, id))
+{
+   (void)_cmd;
+   id src = texture ? *texture : nil;
+   if (!src) return NO;
+   id dst = nil;
+   if (alloc) {
+      dst = alloc(self, cb, src);
+   } else {
+      MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[(id<MTLTexture>)src pixelFormat]
+                                                                                  width:[(id<MTLTexture>)src width] height:[(id<MTLTexture>)src height] mipmapped:NO];
+      d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+      d.storageMode = MTLStorageModePrivate;
+      dst = [[(id<MTLTexture>)src device] newTextureWithDescriptor:d];
+   }
+   int ok = dst && bgmtl_gauss_blur(bg_mps_sigma(self), cb, src, dst);
+   bg_mps_note("in place", ok);
+   if (!ok) {
+      [dst release];
+      return NO;
+   }
+   [*texture release];
+   *texture = dst;
+   return YES;
+}
+
+static void
+bg_mps_override(Class c, SEL s, IMP imp)
+{
+   Method m = class_getInstanceMethod(c, s);
+   if (!m) return;
+   if (!class_addMethod(c, s, imp, method_getTypeEncoding(m)))   // the class's own method, not the superclass's
+      method_setImplementation(class_getInstanceMethod(c, s), imp);
+}
+
+// 1 when the class is there and now blurs with bgmtl_gauss_blur()
+int
+bgmtl_mps_blur_install(void)
+{
+   static int done;
+   Class c = objc_getClass("MPSImageGaussianBlur");
+   if (done || !c) return done;
+   bg_mps_override(c, sel_getUid("encodeToCommandBuffer:sourceTexture:destinationTexture:"), (IMP)bg_mps_encode);
+   bg_mps_override(c, sel_getUid("encodeToCommandBuffer:inPlaceTexture:fallbackCopyAllocator:"), (IMP)bg_mps_encode_in_place);
+   done = 1;
+   return done;
 }

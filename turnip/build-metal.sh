@@ -36,6 +36,8 @@ probe bgmtl_carenderer_probe -framework QuartzCore -framework CoreGraphics
 probe bgmtl_xr2p_test -framework QuartzCore
 probe bgmtl_adddev
 probe bgmtl_texpool_test
+probe bgmtl_mps_blur_test -framework MetalPerformanceShaders
+probe bgmtl_src_test
 # the injection dylib (inert unless armed; see inject/bgmtl_inject.m)
 $CC $OBJC -c "$HERE/inject/bgmtl_inject.m" -o "$OUT/bgmtl_inject.o"
 $CC -dynamiclib -o "$OUT/bgmtl-inject.dylib" "$OUT/bgmtl.o" "$OUT/bgmtl_inject.o" "${LIBS[@]}" -framework Foundation -framework Metal \
