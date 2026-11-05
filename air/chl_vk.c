@@ -55,7 +55,7 @@ typedef struct VkPipelineShaderStageNirCreateInfoMESA {
 extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 
 #define CHL_FENCE_TIMEOUT_NS 5000000000ull
-#define CHL_MEMC_SLOTS 64
+#define CHL_MEMC_SLOTS 256      /* enough for the cap: an app open holds 15-40 full-screen targets (6 MB each) at once */
 #define CHL_RING_SLAB (256u << 10)
 
 static int chl_trace = -1;
@@ -711,8 +711,17 @@ chl_device_open(char *why, size_t why_size)
    pthread_mutex_init(&d->share_lock, NULL);
    pthread_mutex_init(&d->done_lock, NULL);
    pthread_mutex_init(&d->memc_lock, NULL);
-   if (getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.nomemcache", F_OK) != 0)
-      d->memc_cap = 96ull << 20;
+   if (getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.nomemcache", F_OK) != 0) {
+      /* the cap in MB: /private/var/tmp/chl.memcmb overrides it (Mi 8, app open: 72-213 misses a second at 96 MB, held 93.6) */
+      unsigned mb = 96;
+      FILE *f = fopen("/private/var/tmp/chl.memcmb", "r");
+      if (f) {
+         if (fscanf(f, "%u", &mb) != 1 || mb < 16 || mb > 1024)
+            mb = 96;
+         fclose(f);
+      }
+      d->memc_cap = (VkDeviceSize)mb << 20;
+   }
    {
       /* how long released memory stays, in seconds (/private/var/tmp/chl.memckeep) */
       unsigned secs = 120;
