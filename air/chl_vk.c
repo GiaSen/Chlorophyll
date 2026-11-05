@@ -712,12 +712,13 @@ chl_device_open(char *why, size_t why_size)
    pthread_mutex_init(&d->done_lock, NULL);
    pthread_mutex_init(&d->memc_lock, NULL);
    if (getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.nomemcache", F_OK) != 0) {
-      /* the cap in MB: /private/var/tmp/chl.memcmb overrides it (Mi 8, app open: 72-213 misses a second at 96 MB, held 93.6) */
-      unsigned mb = 96;
+      /* the cap in MB, 256 (Mi 8, app open: 72-213 misses a second at 96 MB, held 93.6; 0-57 at 256, which drains to tens of MB
+       * within the keep time; memorystatus level 83 either way); /private/var/tmp/chl.memcmb overrides it */
+      unsigned mb = 256;
       FILE *f = fopen("/private/var/tmp/chl.memcmb", "r");
       if (f) {
          if (fscanf(f, "%u", &mb) != 1 || mb < 16 || mb > 1024)
-            mb = 96;
+            mb = 256;
          fclose(f);
       }
       d->memc_cap = (VkDeviceSize)mb << 20;
