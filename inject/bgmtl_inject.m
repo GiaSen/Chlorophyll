@@ -27,6 +27,7 @@
 #import <objc/message.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <dispatch/dispatch.h>
+#include <mach/mach_time.h>
 #include <dirent.h>
 #include <time.h>
 #include <dlfcn.h>
@@ -676,6 +677,57 @@ atx_contents_install(void)
    g_setcontents_orig = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)atx_setcontents);
 }
 
+// iconservicesagent: its ISGPUIdleTimer purges the GPU resources 3 s after the last icon render ("#ISGPUIDleTimer purge"), and the next
+// render builds a device and its pipelines again (48 pipelines, 150-200 ms, then the render): Calendar's and Clock's live icons, drawn
+// again each time their home page comes back, showed as empty glass for about half a second (user, Mi 8, 2026-11-05). What the purge
+// frees is small here (idle trim: 0.3 MB of textures, 0.4 MB of buffers). Now the purge waits until there has been no icon work for
+// ICON_IDLE_S: a timer fire before then arms the timer again instead. /private/var/tmp/bgmtl.iconpurge keeps Apple's 3 s.
+#define ICON_IDLE_S 120
+static void (*g_icon_fired_orig)(id, SEL, unsigned long long);
+static void (*g_icon_arm_orig)(id, SEL);
+static uint64_t g_icon_work;            /* mach time of the last arm by icon work (not by us) */
+static int g_icon_rearm;
+
+static void
+icon_arm(id self, SEL sel)
+{
+   if (!g_icon_rearm) __atomic_store_n(&g_icon_work, mach_absolute_time(), __ATOMIC_RELAXED);
+   g_icon_arm_orig(self, sel);
+}
+
+static void
+icon_fired(id self, SEL sel, unsigned long long gen)
+{
+   static mach_timebase_info_data_t tb;
+   if (!tb.denom) mach_timebase_info(&tb);
+   uint64_t idle_ns = (mach_absolute_time() - __atomic_load_n(&g_icon_work, __ATOMIC_RELAXED)) * tb.numer / tb.denom;
+   unsigned long long cur = ((unsigned long long (*)(id, SEL))objc_msgSend)(self, sel_registerName("generation"));
+   if (gen == cur && idle_ns < (uint64_t)ICON_IDLE_S * NSEC_PER_SEC) {
+      g_icon_rearm = 1;                 /* the fire Apple would purge on: keep the resources, look again in 3 s */
+      g_icon_arm_orig(self, sel_registerName("armTimer"));
+      g_icon_rearm = 0;
+      return;
+   }
+   g_icon_fired_orig(self, sel, gen);
+}
+
+static void
+icon_idle_install(void)
+{
+   if (exists("/private/var/tmp/bgmtl.iconpurge")) return;
+   Class c = objc_getClass("ISGPUIdleTimer");
+   Method arm = c ? class_getInstanceMethod(c, sel_registerName("armTimer")) : NULL;
+   Method fired = c ? class_getInstanceMethod(c, sel_registerName("_timerFiredForGeneration:")) : NULL;
+   if (!arm || !fired || !class_getInstanceMethod(c, sel_registerName("generation"))) {
+      ilog("iconservicesagent: ISGPUIdleTimer not as expected: GPU purge left at Apple's 3 s");
+      return;
+   }
+   g_icon_work = mach_absolute_time();
+   g_icon_arm_orig = (void (*)(id, SEL))method_setImplementation(arm, (IMP)icon_arm);
+   g_icon_fired_orig = (void (*)(id, SEL, unsigned long long))method_setImplementation(fired, (IMP)icon_fired);
+   ilog("iconservicesagent: GPU resources purged after %d s without icon work (Apple: 3 s)", ICON_IDLE_S);
+}
+
 __attribute__((constructor)) static void
 bgmtl_inject_init(void)
 {
@@ -706,6 +758,7 @@ bgmtl_inject_init(void)
          restart_stale_posterboard();
          atx_contents_install();
       }
+      if (!strcmp([bid UTF8String], "com.apple.iconservicesagent")) icon_idle_install();
       // /private/var/tmp/bgmtl.mesalog: Mesa's own log (ir3 compile errors, with the failing shader printed) to a file of
       // its own -- these processes' stderr goes nowhere
       if (exists("/private/var/tmp/bgmtl.mesalog") && !getenv("MESA_LOG_FILE")) {
