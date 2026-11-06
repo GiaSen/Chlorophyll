@@ -594,6 +594,12 @@ struct bg_passdump;
    BGMTLTexture *_parent;  // a texture view (newTextureViewWith...): the texture whose memory it shows (retained)
    NSUInteger _parentLevel, _parentSlice;
    MTLTextureSwizzleChannels _swizzle;
+   // A rotated framebuffer (MTLTextureDescriptor.rotation, see bg_desc_rotation): CoreAnimation draws the landscape screen in
+   // landscape coordinates into this texture's own memory, and every command buffer that drew into it ends with a draw that
+   // copies it, turned, into _rotPhys (the same IOSurface, unrotated and imported), which is what the panel shows.
+   unsigned _rot;              // quarter turns, 1-3 (0: not rotated)
+   BGMTLTexture *_rotPhys;     // the surface as it is (retained)
+   BGMTLTexture *_rotOwner;    // on a _rotPhys: the rotated texture it belongs to (not retained, only compared)
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d;
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane;
@@ -606,7 +612,73 @@ struct bg_passdump;
 - (BOOL)bgXR10WriteBack;
 - (void)bgCopyWriteBack;
 - (void)bgCopyPending:(int)delta;
+- (void)bgRotFill;
 @end
+
+// ---- rotated framebuffers ---------------------------------------------------------------------------------------------
+// iOS 26's CoreAnimation draws a rotated screen (landscape apps) straight into the portrait framebuffer through Metal's render
+// target rotation: backboardd wraps the framebuffer IOSurface (828x1792 on the Mi 8's iPhone 11 identity) as a 1792x828 texture
+// whose descriptor carries a private `rotation` (quarter turns; Metal's -supportsRenderTargetTextureRotation is YES for every
+// Apple1 device, which this one says it is). Before 2026-11-07 that texture was a plain copy that never reached the surface
+// ("surface copy refresh: 3328 bytes per row for a region whose rows need 7168"), so the panel kept the last portrait frame
+// until the app turned back. /private/var/tmp/bgmtl.norot: the old behaviour; bgmtl.rotflip: the other turning direction for
+// 1 and 3 (a test switch).
+static int
+bg_rot_switch(const char *path, int *cache)
+{
+   if (*cache < 0) *cache = access(path, F_OK) == 0;
+   return *cache;
+}
+static int g_rot_off = -1, g_rot_flip = -1;
+static __thread int g_rot_twin;   // making a rotated texture's twin: its import refusal is always logged
+
+static unsigned
+bg_desc_rotation(MTLTextureDescriptor *d)
+{
+   static SEL s;
+   if (!s) s = sel_registerName("rotation");
+   if (!d || ![d respondsToSelector:s]) return 0;
+   NSUInteger r = ((NSUInteger (*)(id, SEL))objc_msgSend)(d, s);
+   return r <= 3 ? (unsigned)r : 0;
+}
+
+// a texel (x, y) of the rotated W x H texture -> (u, v) of the surface: 1 = a quarter turn clockwise, 3 = counter-clockwise
+static inline void
+bg_rot_map(unsigned rot, unsigned x, unsigned y, unsigned w, unsigned h, unsigned *u, unsigned *v)
+{
+   switch (rot) {
+   case 1: *u = h - 1 - y; *v = x; break;
+   case 2: *u = w - 1 - x; *v = h - 1 - y; break;
+   case 3: *u = y; *v = w - 1 - x; break;
+   default: *u = x; *v = y; break;
+   }
+}
+
+// which texture last drew into a surface (by IOSurface ID; a rotated texture stands for its _rotPhys): a rotated texture whose
+// surface someone else drew into since (the screen was portrait in between) is filled from the surface again before it is used
+static struct { uint32_t id; const void *w; } g_surf_writer[16];
+static os_unfair_lock g_surf_writer_lock = OS_UNFAIR_LOCK_INIT;
+static unsigned g_surf_writer_next;
+static void
+bg_surf_writer_set(uint32_t id, const void *w)
+{
+   os_unfair_lock_lock(&g_surf_writer_lock);
+   unsigned i;
+   for (i = 0; i < 16 && g_surf_writer[i].id != id; i++) {}
+   if (i == 16) i = g_surf_writer_next++ % 16;
+   g_surf_writer[i].id = id;
+   g_surf_writer[i].w = w;
+   os_unfair_lock_unlock(&g_surf_writer_lock);
+}
+static const void *
+bg_surf_writer_get(uint32_t id)
+{
+   const void *w = NULL;
+   os_unfair_lock_lock(&g_surf_writer_lock);
+   for (unsigned i = 0; i < 16; i++) if (g_surf_writer[i].id == id) { w = g_surf_writer[i].w; break; }
+   os_unfair_lock_unlock(&g_surf_writer_lock);
+   return w;
+}
 
 @interface BGMTLSampler : _MTLSamplerState {
    BGMTLDevice *_owner;
@@ -1775,6 +1847,8 @@ bg_return_slot(BGMTLCommandBuffer *cb, BGMTLCommandQueue *queue)
    if (!_written) _written = [[NSMutableSet alloc] init];
    [_written addObject:t];
    BGMTLTexture *root = [t bgRoot];
+   if ([root iosurface] && (g_rot_off <= 0))   // the surface's last writer (bgRotFill); a rotated texture's twin stands for it
+      bg_surf_writer_set(IOSurfaceGetID((IOSurfaceRef)[root iosurface]), root->_rotOwner ? root->_rotOwner : root);
    if (root->_linSrc) {
       if (!_linWritten) _linWritten = [[NSMutableSet alloc] init];
       [_linWritten addObject:root];
@@ -2005,8 +2079,98 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
    [cb release];
 }
 
+// The turn of a rotated framebuffer into its surface: one triangle over the whole surface whose fragments read the rotated
+// texture at the turned position. MSL compiled here once per pixel format (as bg_blur_src).
+static NSString *const bg_rot_src =
+   @"#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct bg_rot_v { float4 pos [[position]]; };\n"
+    "vertex bg_rot_v bg_rot_vs(uint vid [[vertex_id]]) {\n"
+    "   bg_rot_v o;\n"
+    "   float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+    "   o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "   return o;\n"
+    "}\n"
+    "fragment float4 bg_rot_fs(bg_rot_v in [[stage_in]], texture2d<float, access::read> src [[texture(0)]], constant int4 &a [[buffer(0)]]) {\n"
+    "   uint2 p = uint2(in.pos.xy), s = p;\n"
+    "   uint sw = src.get_width(), sh = src.get_height();\n"
+    "   if (a.x == 1) s = uint2(p.y, sh - 1 - p.x);\n"
+    "   else if (a.x == 2) s = uint2(sw - 1 - p.x, sh - 1 - p.y);\n"
+    "   else if (a.x == 3) s = uint2(sw - 1 - p.y, p.x);\n"
+    "   return src.read(min(s, uint2(sw - 1, sh - 1)));\n"
+    "}\n";
+
+static id
+bg_rot_pipeline(id dev, NSUInteger fmt)
+{
+   static struct { id dev; NSUInteger fmt; id ps; } cache[4];
+   static unsigned failures;
+   @synchronized([BGMTLDevice class]) {
+      for (unsigned i = 0; i < 4; i++) if (cache[i].ps && cache[i].dev == dev && cache[i].fmt == fmt) return cache[i].ps;
+      if (failures > 3) return nil;
+      NSError *e = nil;
+      id lib = [dev newLibraryWithSource:bg_rot_src options:nil error:&e];
+      id vf = [lib newFunctionWithName:@"bg_rot_vs"], ff = [lib newFunctionWithName:@"bg_rot_fs"];
+      MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+      pd.vertexFunction = vf;
+      pd.fragmentFunction = ff;
+      pd.colorAttachments[0].pixelFormat = fmt;
+      id ps = vf && ff ? [dev newRenderPipelineStateWithDescriptor:pd error:&e] : nil;
+      [pd release];
+      [vf release];
+      [ff release];
+      [lib release];
+      char line[300];
+      snprintf(line, sizeof(line), "rotated framebuffer: turning pipeline for format %lu: %s", (unsigned long)fmt,
+               ps ? "built" : e ? [[e description] UTF8String] : "no library or function");
+      bgmtl_note_line(line);
+      if (!ps) { failures++; return nil; }
+      for (unsigned i = 0; i < 4; i++) {
+         if (!cache[i].ps || i == 3) {
+            [cache[i].ps release];
+            cache[i].dev = dev;
+            cache[i].fmt = fmt;
+            cache[i].ps = ps;
+            break;
+         }
+      }
+      return ps;
+   }
+}
+
+// before the commit: every rotated framebuffer this command buffer drew into, turned into its surface
+- (void)bgRotWriteBacks
+{
+   NSMutableSet *rots = nil;
+   for (BGMTLTexture *t in _written) {
+      BGMTLTexture *r = [t bgRoot];
+      if (r->_rot && r->_rotPhys) {
+         if (!rots) rots = [NSMutableSet set];
+         [rots addObject:r];
+      }
+   }
+   for (BGMTLTexture *r in rots) {
+      id<MTLTexture> p = (id<MTLTexture>)r->_rotPhys;
+      id ps = bg_rot_pipeline([self device], [p pixelFormat]);
+      if (!ps) continue;
+      MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.colorAttachments[0].texture = p;
+      rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+      id<MTLRenderCommandEncoder> enc = [self renderCommandEncoderWithDescriptor:rp];
+      if (!enc) continue;
+      [enc setRenderPipelineState:ps];
+      [enc setViewport:(MTLViewport){ 0, 0, (double)[p width], (double)[p height], 0, 1 }];
+      [enc setFragmentTexture:(id<MTLTexture>)r atIndex:0];
+      const int a[4] = { (int)r->_rot, 0, 0, 0 };
+      [enc setFragmentBytes:a length:sizeof(a) atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+      [enc endEncoding];
+   }
+}
+
 - (void)commit
 {
+   if (_written.count && g_rot_off <= 0) [self bgRotWriteBacks];
    __atomic_add_fetch(&g_bg_commit_seq, 1, __ATOMIC_RELAXED);
    bgmtl_note_committed();
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -2127,6 +2291,7 @@ bg_idle_trim_schedule(void)
             bg_xr10_note("drew into surface %u %zux%zu fmt %lu: %s", IOSurfaceGetID((IOSurfaceRef)[t iosurface]),
                          IOSurfaceGetWidth((IOSurfaceRef)[t iosurface]), IOSurfaceGetHeight((IOSurfaceRef)[t iosurface]), (unsigned long)[root pixelFormat],
                          root->_xr2p ? "two-plane" : root->_surfCopy ? "copied" : "imported");
+         if (root->_rot) continue;   // its own memory; its surface was written through its _rotPhys, also in _written
          if (root->_xr2p) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }
          if (root->_surfCopy) { if (!copied) copied = [NSMutableSet set]; [copied addObject:root]; continue; }
          chl_texture_flush_surface([t chlTexture]);
@@ -2140,6 +2305,12 @@ bg_idle_trim_schedule(void)
       for (BGMTLTexture *t in xr) [t bgXR10WriteBack];   // the write unlock moves these surfaces' seeds
       for (BGMTLTexture *t in copied) [t bgCopyWriteBack];
    }
+   // a rotated framebuffer whose surface could not be imported: its twin's copy goes back into the surface (the CPU, 6 MB a frame)
+   if (_status == 4 && in_compositor)
+      for (BGMTLTexture *t in _written) {
+         BGMTLTexture *root = [t bgRoot];
+         if (root->_rotOwner && root->_surfCopy) [root bgCopyWriteBack];
+      }
    if (!in_compositor) for (BGMTLTexture *t in _written) [[t bgRoot] bgCopyPending:-1];
    if (_status == 4 && [_presents count]) {
       uint64_t t_end = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -2385,9 +2556,9 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device descriptor:(MTLTextureDescriptor *)d iosurface:(void *)surface plane:(NSUInteger)plane
 {
-   BG_TRACE("texture %lux%lu fmt %lu type %lu usage %lu storage %lu %s\n", (unsigned long)d.width, (unsigned long)d.height,
+   BG_TRACE("texture %lux%lu fmt %lu type %lu usage %lu storage %lu rotation %u %s\n", (unsigned long)d.width, (unsigned long)d.height,
             (unsigned long)d.pixelFormat, (unsigned long)d.textureType, (unsigned long)d.usage, (unsigned long)d.storageMode,
-            surface ? "iosurface" : "own memory");
+            bg_desc_rotation(d), surface ? "iosurface" : "own memory");
    self = [super init];
    if (!self) return nil;
    if (![device chl] || !d) { [self release]; return nil; }
@@ -2408,11 +2579,37 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    if (surface) {
       IOSurfaceRef sf = (IOSurfaceRef)surface;
       _desc.usage |= 5;   /* a drawable is rendered into and may be sampled whatever CA asked for (RenderTarget | ShaderRead) */
+      /* a rotated framebuffer (see bg_desc_rotation): own memory in the rotated shape, and the surface itself unrotated */
+      unsigned rot = bg_desc_rotation(d);
+      if (rot && plane == 0 && IOSurfaceGetPlaneCount(sf) <= 1 && IOSurfaceGetBytesPerElement(sf) == 4 &&
+          !bg_rot_switch("/private/var/tmp/bgmtl.norot", &g_rot_off)) {
+         if (rot != 2 && bg_rot_switch("/private/var/tmp/bgmtl.rotflip", &g_rot_flip)) rot = 4 - rot;
+         _tex = chl_texture_create([device chl], &_desc, why, sizeof(why));
+         if (_tex) {
+            MTLTextureDescriptor *pd = [[d copy] autorelease];
+            ((void (*)(id, SEL, NSUInteger))objc_msgSend)(pd, sel_registerName("setRotation:"), 0);
+            [pd setWidth:IOSurfaceGetWidth(sf)];
+            [pd setHeight:IOSurfaceGetHeight(sf)];
+            g_rot_twin = 1;
+            _rotPhys = [[BGMTLTexture alloc] initWithBGDevice:device descriptor:pd iosurface:surface plane:0];
+            g_rot_twin = 0;
+            if (_rotPhys) _rotPhys->_rotOwner = self;
+            _rot = rot;
+            static unsigned notes;   // the first few, in bgmtl.log
+            if (__atomic_add_fetch(&notes, 1, __ATOMIC_RELAXED) <= 8) {
+               char line[300];
+               snprintf(line, sizeof(line), "rotated framebuffer: IOSurface %u (%zux%zu) as %ux%u, rotation %u: drawn in own memory, turned into the surface "
+                        "at each commit%s", IOSurfaceGetID(sf), IOSurfaceGetWidth(sf), IOSurfaceGetHeight(sf), _desc.width, _desc.height, rot,
+                        !_rotPhys ? " (NO: the surface could not be wrapped)" : _rotPhys->_surfCopy ? " (NO: the surface is a copy, not imported)" : "");
+               bgmtl_note_line(line);
+            }
+         }
+      }
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
-      if (plane == 0 && IOSurfaceGetPlaneCount(sf) <= 1) {
+      if (!_tex && plane == 0 && IOSurfaceGetPlaneCount(sf) <= 1) {
          _tex = chl_texture_from_iosurface([device chl], &_desc, (int)IOSurfaceGetID(sf), why, sizeof(why));
-         static unsigned refusals;   // the first few refused imports, in bgmtl.log (which surfaces are copied instead)
-         if (!_tex && __atomic_add_fetch(&refusals, 1, __ATOMIC_RELAXED) <= 8) {
+         static unsigned refusals;   // the first few refused imports, in bgmtl.log (which surfaces are copied instead), and every rotation twin's
+         if (!_tex && (g_rot_twin || __atomic_add_fetch(&refusals, 1, __ATOMIC_RELAXED) <= 8)) {
             char line[640];
             snprintf(line, sizeof(line), "IOSurface %u (%ux%u fmt %lu) copied, not imported: %s", IOSurfaceGetID(sf), _desc.width,
                      _desc.height, (unsigned long)[d pixelFormat], why);
@@ -2529,6 +2726,8 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       __atomic_sub_fetch(&g_bg_tex_bytes, bg_tex_bytes(&_desc), __ATOMIC_RELAXED);
    }
    if (_surface) CFRelease(_surface);
+   if (_rotPhys) _rotPhys->_rotOwner = nil;
+   [_rotPhys release];
    [_parent release];
    [_linSrc release];
    if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
@@ -2548,6 +2747,10 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 - (struct chl_texture *)chlTextureFor:(BGMTLCommandBuffer *)cb
 {
    if (_parent) { [_parent chlTextureFor:cb]; return _tex; }
+   if (_rot) {   // a rotated framebuffer: its own memory is what CoreAnimation drew last, unless the surface was drawn since
+      if (_rotPhys && bg_surf_writer_get(IOSurfaceGetID((IOSurfaceRef)_surface)) != self) [self bgRotFill];
+      return _tex;
+   }
    char why[256] = { 0 };
    BG_TEX_START();
    if (_surface && !_surfCopy) {
@@ -2742,6 +2945,33 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    IOSurfaceUnlock(sf, 0, NULL);
    _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture
    _surfFresh = YES;
+}
+// A rotated framebuffer about to be drawn into after its surface was drawn some other way (the screen was portrait): the
+// surface's pixels, turned into the rotated shape, so that what CoreAnimation does not redraw (it loads the framebuffer) is
+// the screen as it is. Once per turn of the screen per framebuffer: 828x1792 x 4 bytes on the CPU.
+- (void)bgRotFill
+{
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   bg_surf_writer_set(IOSurfaceGetID(sf), self);
+   const unsigned w = _desc.width, h = _desc.height;
+   const size_t sw = IOSurfaceGetWidth(sf), sh = IOSurfaceGetHeight(sf), bpr = IOSurfaceGetBytesPerRow(sf);
+   uint32_t *out = malloc((size_t)w * h * 4);
+   if (!out) return;
+   if (IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) != 0) { free(out); return; }
+   const uint8_t *base = IOSurfaceGetBaseAddress(sf);
+   for (unsigned y = 0; y < h; y++) {
+      uint32_t *o = out + (size_t)y * w;
+      for (unsigned x = 0; x < w; x++) {
+         unsigned u, v;
+         bg_rot_map(_rot, x, y, w, h, &u, &v);
+         o[x] = u < sw && v < sh ? *(const uint32_t *)(base + v * bpr + (size_t)u * 4) : 0;
+      }
+   }
+   IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+   char why[256] = { 0 };
+   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+   if (chl_texture_replace(_tex, 0, 0, o, sz, out, w * 4, 0, why, sizeof(why)) != 0) BG_LOG("rotated framebuffer fill: %s\n", why);
+   free(out);
 }
 - (void)bgCopyPending:(int)delta
 {
