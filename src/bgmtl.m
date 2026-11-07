@@ -575,6 +575,7 @@ struct bg_passdump;
    CFTypeRef _surface;   // retained IOSurface, when the memory is one
    NSUInteger _plane;
    @public
+   BOOL _memoryless;     // made with MTLStorageModeMemoryless (see bg_ml_mode)
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
    unsigned long _linSeq; // the command buffer (g_bg_cb_seq) it was last filled from its buffer for: once per command buffer
@@ -2070,7 +2071,7 @@ bg_cmdbuf_done(void *ctx, int status, const char *why)
          }
       }
       if (t_flushed && t_done - t_flushed > (uint64_t)passprof_ms * 1000000ull) {
-         char line[220];
+         char line[400];
          for (unsigned i = 0; chl_cmdbuf_pass_line(cb->_ccb, i, passprof_min, line, sizeof(line)); i++)
             if (line[0]) bgmtl_note_line(line);
       }
@@ -2559,6 +2560,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    self = [super init];
    if (!self) return nil;
    if (![device chl] || !d) { [self release]; return nil; }
+   _memoryless = !surface && [d storageMode] == 3;   // MTLStorageModeMemoryless
    _desc.pixel_format = (unsigned)[d pixelFormat];
    _desc.type = (unsigned)[d textureType];
    _desc.width = (unsigned)[d width];
@@ -3172,6 +3174,27 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 - (id)device { return _owner; }
 @end
 
+// MTLStorageModeMemoryless textures (CoreAnimation 26's second colour attachment, RGBA16Float, in every pass it draws) live in
+// the tile memory of Apple's GPUs: nothing reads them after their pass, and their contents at its start are undefined. Here they
+// have memory, so Metal's Store and its DontCare load (cleared to zero here: CoreAnimation relies on that for its other
+// textures) cost a full-size half-float write per pass. So such an attachment is not stored (bit 1) and not cleared at the start
+// (bit 2, Vulkan's DONT_CARE). Measured 2026-11-07 (NOTES): the heavy App Library / Today view frames 14.7 -> 13.5 ms of GPU time
+// (median), half as many over 12 ms, screenshots clean. /private/var/tmp/bgmtl.mloff: the old way (stored, cleared to zero);
+// bgmtl.mlstoreonly: only the store is dropped. Looked at twice a second, so a running process switches.
+static unsigned
+bg_ml_mode(void)
+{
+   static unsigned mode = 3;
+   static uint64_t next;
+   uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+   if (now >= __atomic_load_n(&next, __ATOMIC_RELAXED)) {
+      unsigned m = access("/private/var/tmp/bgmtl.mloff", F_OK) == 0 ? 0u : access("/private/var/tmp/bgmtl.mlstoreonly", F_OK) == 0 ? 1u : 3u;
+      __atomic_store_n(&mode, m, __ATOMIC_RELAXED);
+      __atomic_store_n(&next, now + 500000000ull, __ATOMIC_RELAXED);
+   }
+   return __atomic_load_n(&mode, __ATOMIC_RELAXED);
+}
+
 @implementation BGMTLRenderEncoder
 static void
 bg_attachment(BGMTLCommandBuffer *cb, MTLRenderPassAttachmentDescriptor *a, struct chl_attachment *out)
@@ -3181,6 +3204,13 @@ bg_attachment(BGMTLCommandBuffer *cb, MTLRenderPassAttachmentDescriptor *a, stru
    out->slice = (unsigned)([a slice] + [a depthPlane]);
    out->load_action = (unsigned)[a loadAction];
    out->store_action = (unsigned)[a storeAction];
+   BGMTLTexture *mlroot = [(BGMTLTexture *)[a texture] bgRoot];
+   if (mlroot && mlroot->_memoryless) {
+      unsigned ml = bg_ml_mode();
+      if ((ml & 1) && out->store_action == 1) out->store_action = 0;        // Store -> DontCare
+      else if ((ml & 1) && out->store_action == 3) out->store_action = 2;   // StoreAndMultisampleResolve -> MultisampleResolve
+      if ((ml & 2) && out->load_action == 0) out->load_action = 3;          // DontCare -> undefined (chl: VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+   }
    if ((out->store_action == 2 || out->store_action == 3) && [a resolveTexture]) {
       out->resolve = [(BGMTLTexture *)[a resolveTexture] chlTextureFor:cb];
       out->resolve_level = (unsigned)[a resolveLevel];

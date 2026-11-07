@@ -379,7 +379,11 @@ struct chl_cmdbuf {
    uint64_t submit_ns;
    /* /private/var/tmp/chl.passprof: the GPU time of each render pass, chl_cmdbuf_pass_line */
    VkQueryPool qp;
-   struct chl_pass_note { unsigned w, h, colors, draws, nfs; char fs[4][28]; } *pass_notes;
+   struct chl_pass_note {
+      unsigned w, h, colors, draws, nfs, fetch_draws;
+      char fs[4][28];
+      char att[8][24];   /* each colour attachment: its format, Metal's load action (d/L/C) and store action (d/S/r/R) */
+   } *pass_notes;
    unsigned n_pass;
 };
 
@@ -450,6 +454,7 @@ struct chl_device {
    unsigned rest;                         /* see chl_cmdbuf_commit */
    uint64_t rest_done_ns, rest_busy_ns;
    bool passprof;
+   bool noroa;                        /* /private/var/tmp/chl.noroa: no rasterization-order access on fetching pipelines (an experiment) */
    char shaderdump[256];              /* /private/var/tmp/chl.shaderdump: fragment functions to dump, see shader_dump */
    bool quit;
 };
@@ -735,6 +740,7 @@ chl_device_open(char *why, size_t why_size)
       d->memc_keep_ns = secs * 1000000000ull;
    }
    d->passprof = getenv("BGMTL_TEXPOOL_MB") && access("/private/var/tmp/chl.passprof", F_OK) == 0;
+   d->noroa = access("/private/var/tmp/chl.noroa", F_OK) == 0;
    {
       /* see chl_cmdbuf_commit */
       bool server = getenv("BGMTL_TEXPOOL_MB") != NULL;
@@ -2317,9 +2323,13 @@ chl_cmdbuf_pass_line(struct chl_cmdbuf *cb, unsigned i, double min_ms, char *out
    const double ms = d->props.limits.timestampPeriod / 1e6;
    const double gap = (t[1 + 2 * i] - t[2 * i]) * ms, pass = (t[2 + 2 * i] - t[1 + 2 * i]) * ms;
    const struct chl_pass_note *n = &cb->pass_notes[i];
-   if (gap >= min_ms || pass >= min_ms)
-      snprintf(out, size, "pass %u/%u: gap %.1f, %.1f ms, %ux%u c%u, %u draws: %s %s %s %s", i, cb->n_pass, gap, pass, n->w, n->h, n->colors, n->draws,
-               n->nfs > 0 ? n->fs[0] : "", n->nfs > 1 ? n->fs[1] : "", n->nfs > 2 ? n->fs[2] : "", n->nfs > 3 ? n->fs[3] : "");
+   if (gap >= min_ms || pass >= min_ms) {
+      int len = snprintf(out, size, "pass %u/%u: gap %.1f, %.1f ms, %ux%u c%u, %u draws (%u fetch): %s %s %s %s |", i, cb->n_pass, gap, pass, n->w,
+                         n->h, n->colors, n->draws, n->fetch_draws, n->nfs > 0 ? n->fs[0] : "", n->nfs > 1 ? n->fs[1] : "",
+                         n->nfs > 2 ? n->fs[2] : "", n->nfs > 3 ? n->fs[3] : "");
+      for (unsigned c = 0; c < n->colors && c < 8 && len > 0 && (size_t)len < size; c++)
+         len += snprintf(out + len, size - len, " %s", n->att[c]);
+   }
    return 1;
 }
 

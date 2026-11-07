@@ -278,9 +278,11 @@ chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipelin
    ms.alphaToCoverageEnable = desc->alpha_to_coverage;
    VkPipelineDepthStencilStateCreateInfo dss = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
    dss.minDepthBounds = 0, dss.maxDepthBounds = 1;
-   /* a framebuffer fetch sees what the earlier primitives left, as on Apple's tile memory: rasterization-order access */
+   /* a framebuffer fetch sees what the earlier primitives left, as on Apple's tile memory: rasterization-order access
+    * (/private/var/tmp/chl.noroa, an experiment: without it; Turnip then draws such a pipeline in GMEM without SINGLE_PRIM_MODE
+    * FLUSH_PER_OVERLAP, and keeps the pass in GMEM anyway for its input attachments) */
    VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL,
-                                               p->fs.nir && p->fs.info.fbfetch_targets
+                                               p->fs.nir && p->fs.info.fbfetch_targets && !d->noroa
                                                   ? VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT : 0,
                                                VK_FALSE, VK_LOGIC_OP_COPY, p->color_count, blend, { 0, 0, 0, 0 } };
    static const VkDynamicState dyn[] = {
@@ -363,8 +365,11 @@ attachment_info(struct chl_cmdbuf *cb, const struct chl_attachment *a, VkRenderi
       return;
    out->imageView = attachment_view(a->texture, a->level, a->slice);
    out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-   /* MTLLoadActionDontCare reads as zero: CoreAnimation relies on it */
-   out->loadOp = a->load_action == 1 ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+   /* MTLLoadActionDontCare reads as zero: CoreAnimation relies on it. 3 (not Metal's): contents undefined, as Vulkan's DONT_CARE
+    * (the caller's choice for a memoryless attachment) */
+   out->loadOp = a->load_action == 1   ? VK_ATTACHMENT_LOAD_OP_LOAD
+                 : a->load_action == 3 ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                       : VK_ATTACHMENT_LOAD_OP_CLEAR;
    out->storeOp = (a->store_action == 1 || a->store_action == 3) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
    if (depth || stencil) {
       out->clearValue.depthStencil.depth = depth ? (a->load_action == 2 ? a->clear[0] : 0.0f) : 0.0f;
@@ -423,6 +428,17 @@ chl_render_begin(struct chl_cmdbuf *cb, const struct chl_render_pass *pass, char
       n->w = w;
       n->h = h;
       n->colors = ncolor;
+      for (unsigned i = 0; i < ncolor && i < 8; i++) {
+         const struct chl_attachment *a = &pass->color[i];
+         if (!a->texture)
+            continue;
+         const char *fn = a->texture->fmt && a->texture->fmt->name ? a->texture->fmt->name : "?";
+         if (!strncmp(fn, "MTLPixelFormat", 14))
+            fn += 14;
+         const struct chl_texture *root = a->texture->parent ? a->texture->parent : a->texture;
+         snprintf(n->att[i], sizeof(n->att[i]), "%s%s %c/%c", fn, root->surface_handle ? "(surf)" : "", "dLCu"[a->load_action % 4],
+                  "dSrR"[a->store_action % 4]);
+      }
       d->vk.vkCmdWriteTimestamp(cb->cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, cb->qp, 1 + 2 * cb->n_pass);
    }
    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO, NULL, 0, { { 0, 0 }, { w, h } }, 1, 0, ncolor, col,
@@ -572,8 +588,11 @@ chl_draw(struct chl_cmdbuf *cb, unsigned mtl_primitive, unsigned vertex_start, u
 {
    if (!vertex_count)
       return 0;
-   if (cb->qp && cb->n_pass < CHL_PASS_MAX)
+   if (cb->qp && cb->n_pass < CHL_PASS_MAX) {
       cb->pass_notes[cb->n_pass].draws++;
+      if (cb->rp && cb->rp->fs.info.fbfetch_targets)
+         cb->pass_notes[cb->n_pass].fetch_draws++;
+   }
    if (draw_prologue(cb, mtl_primitive, false, why, why_size) != 0)
       return -1;
    P_START(pt);
@@ -589,8 +608,11 @@ chl_draw_indexed(struct chl_cmdbuf *cb, unsigned mtl_primitive, unsigned index_c
 {
    if (!index_count)
       return 0;
-   if (cb->qp && cb->n_pass < CHL_PASS_MAX)
+   if (cb->qp && cb->n_pass < CHL_PASS_MAX) {
       cb->pass_notes[cb->n_pass].draws++;
+      if (cb->rp && cb->rp->fs.info.fbfetch_targets)
+         cb->pass_notes[cb->n_pass].fetch_draws++;
+   }
    if (!index_buffer || mtl_index_type > 1) {
       say(why, why_size, "an indexed draw with %s", index_buffer ? "an index type that is not MTLIndexType's" : "no index buffer");
       return -1;

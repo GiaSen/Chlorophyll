@@ -200,7 +200,7 @@ void chl_set_sampler(struct chl_cmdbuf *cb, unsigned stage, unsigned index, stru
 struct chl_attachment {
    struct chl_texture *texture;
    unsigned level, slice;
-   unsigned load_action;     /* MTLLoadAction: 0 DontCare, 1 Load, 2 Clear */
+   unsigned load_action;     /* MTLLoadAction: 0 DontCare (cleared to zero), 1 Load, 2 Clear; 3 undefined (Vulkan DONT_CARE) */
    unsigned store_action;    /* MTLStoreAction: 0 DontCare, 1 Store, 2 MultisampleResolve, 3 StoreAndMultisampleResolve */
    struct chl_texture *resolve;
    unsigned resolve_level, resolve_slice;
