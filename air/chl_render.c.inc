@@ -175,6 +175,19 @@ chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipelin
       say(why, why_size, "a render pipeline needs a vertex function");
       return NULL;
    }
+   /* Chlorophyll: the same description made again gets the pipeline already made (the camera's preview stages create their
+    * render pipeline states anew for every frame, expecting Apple's binary archives to make that cheap: here each was a Turnip
+    * compile of ~30 ms, the stage ran at ~4 frames a second and the frames waiting for it filled the surfaces).
+    * /private/var/tmp/chl.nopipecache: off */
+   uint64_t key[2];
+   bool cacheable = rp_cache_key(desc, key) && access("/private/var/tmp/chl.nopipecache", F_OK) != 0;
+   if (cacheable) {
+      struct chl_render_pipeline *hit = rp_cache_find(d, key);
+      if (hit) {
+         fill_info(d, info, &hit->vs, hit->fs.nir ? &hit->fs : NULL);
+         return hit;   /* retained by rp_cache_find */
+      }
+   }
    struct chl_render_pipeline *p = calloc(1, sizeof(*p));
    if (!p) {
       say(why, why_size, "out of memory making a render pipeline");
@@ -311,6 +324,8 @@ chl_render_pipeline_create(struct chl_device *d, const struct chl_render_pipelin
    if (d->shaderdump[0] && p->fs.nir && p->fs.info.entry_point)
       shader_dump(d, &gci, p->fs.info.entry_point);
    fill_info(d, info, &p->vs, p->fs.nir ? &p->fs : NULL);
+   if (cacheable)
+      rp_cache_add(d, key, p);
    return p;
 fail:
    free_layout(d, &p->layout);

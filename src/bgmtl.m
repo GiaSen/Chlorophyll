@@ -587,6 +587,8 @@ struct bg_passdump;
    BOOL _xr2p;           // ... a two-plane RGB10A8_2P_XR10 one ('b3a8': XR10 RGB + A8 alpha), decoded into BGRA8 at each refresh
    BOOL _yuv420;         // ... a two-plane YCbCr 4:2:0 one ('420f', '420v'), its samples unpacked into RGBA8 at each refresh
    BOOL _rgb420;         // ... and drawn into as RGB (MTLPixelFormatRGB8_420_2P 540, RGB10_420_2P 543): encoded back (bgRGB420WriteBack)
+   BGMTLTexture *_yccY, *_yccC;   // ... its surface's luma and chroma planes as GPU images (bgYccTwins): encoded on the GPU at commit
+   BOOL _yccGPU;         // ... and this command buffer's encode was made on the GPU (no CPU write-back after it)
    uint32_t _surfSeed;   // the surface's seed at the last refresh (an unchanged surface is not copied again)
    BOOL _surfFresh;      // _surfSeed is valid: the surface was decoded or written back at least once (a seed may be 0)
    uint32_t _xrUses;     // uses since the last XR10 decode (bgmtl.xr10log)
@@ -614,6 +616,7 @@ struct bg_passdump;
 - (void)bgLinearWriteBack;
 - (BOOL)bgXR10WriteBack;
 - (BOOL)bgRGB420WriteBack;
+- (BOOL)bgYccTwins;
 - (void)bgCopyWriteBack;
 - (void)bgCopyPending:(int)delta;
 - (void)bgRotFill;
@@ -637,6 +640,7 @@ bg_rot_switch(const char *path, int *cache)
 }
 static int g_rot_off = -1, g_rot_flip = -1;
 static __thread int g_rot_twin;   // making a rotated texture's twin: its import refusal is always logged
+static __thread int g_plane_twin; // making a plane twin (bgYccTwins): plane `plane` of a multi-plane surface imported on its own
 
 static unsigned
 bg_desc_rotation(MTLTextureDescriptor *d)
@@ -1306,6 +1310,19 @@ bg_air_slice(NSData *d)
    return [[BGMTLSampler alloc] initWithBGDevice:self descriptor:d];
 }
 
+// BGMTL_DENY="name,name": pipelines of these functions refused (fragment functions of render pipelines, compute functions)
+static NSArray *
+bg_deny_list(void)
+{
+   static NSArray *deny;
+   static dispatch_once_t once;
+   dispatch_once(&once, ^{
+      const char *e = getenv("BGMTL_DENY");
+      deny = e && *e ? [[[NSString stringWithUTF8String:e] componentsSeparatedByString:@","] retain] : nil;
+   });
+   return deny;
+}
+
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
 {
    static SEL bitcode;
@@ -1313,6 +1330,11 @@ bg_air_slice(NSData *d)
    if (!_dev) return [self bgFail:error with:[NSString stringWithFormat:@"no GPU: %s", _why]];
    id vertex = [descriptor vertexFunction], fragment = [descriptor fragmentFunction];
    BG_TRACE("render pipeline: vertex %s fragment %s\n", vertex ? [[vertex name] UTF8String] : "-", fragment ? [[fragment name] UTF8String] : "-");
+   // BGMTL_DENY="name,name": render pipelines of these fragment functions refused (the camera's preview stages that are too slow
+   // here and that its pipeline does without: sweetcam sets it in cameracaptured only)
+   NSArray *deny = bg_deny_list();
+   if (deny && fragment && [deny containsObject:[fragment name]])
+      return [self bgFail:error with:[NSString stringWithFormat:@"%@ refused here (BGMTL_DENY)", [fragment name]]];
    if (bg_trace()) {
       for (unsigned i = 0; i < 8; i++) {
          MTLRenderPipelineColorAttachmentDescriptor *ca = descriptor.colorAttachments[i];
@@ -1461,6 +1483,8 @@ bg_air_slice(NSData *d)
    static SEL bitcode;
    if (!bitcode) bitcode = sel_getUid("bitcodeData");
    if (!function) return [self bgFail:error with:@"no compute function"];
+   if (bg_deny_list() && [bg_deny_list() containsObject:[function name]])
+      return [self bgFail:error with:[NSString stringWithFormat:@"%@ refused here (BGMTL_DENY)", [function name]]];
    if (!_dev) return [self bgFail:error with:[NSString stringWithFormat:@"no GPU: %s", _why]];
    if (![function respondsToSelector:bitcode]) return [self bgFail:error with:@"function has no bitcodeData selector"];
    NSData *air = ((NSData * (*)(id, SEL))objc_msgSend)(function, bitcode);
@@ -2145,6 +2169,110 @@ bg_rot_pipeline(id dev, NSUInteger fmt)
    }
 }
 
+// Chlorophyll: RGB-over-YCbCr textures (540-545) encoded into their surface's planes on the GPU at commit: luma per texel,
+// chroma per 2x2 / 2x1 / 1x1 texels (their mean). k = (kr, kb, video range, scale to the plane's unorm), r = (sx, sy).
+static NSString *const bg_ycc_src =
+   @"#include <metal_stdlib>\nusing namespace metal;\n"
+    "struct bg_ycc_v { float4 pos [[position]]; };\n"
+    "struct bg_ycc_p { float4 k; float4 r; };\n"
+    "vertex bg_ycc_v bg_ycc_vs(uint vid [[vertex_id]]) {\n"
+    "   bg_ycc_v o;\n"
+    "   float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+    "   o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "   return o;\n"
+    "}\n"
+    "fragment float4 bg_y_fs(bg_ycc_v in [[stage_in]], texture2d<float, access::read> src [[texture(0)]], constant bg_ycc_p &p [[buffer(0)]]) {\n"
+    "   uint2 q = min(uint2(in.pos.xy), uint2(src.get_width() - 1, src.get_height() - 1));\n"
+    "   float3 c = src.read(q).rgb;\n"
+    "   float y = p.k.x * c.r + (1.0 - p.k.x - p.k.y) * c.g + p.k.y * c.b;\n"
+    "   if (p.k.z > 0.5) y = (16.0 + 219.0 * y) / 255.0;\n"
+    "   return float4(y * p.k.w, 0.0, 0.0, 1.0);\n"
+    "}\n"
+    "fragment float4 bg_c_fs(bg_ycc_v in [[stage_in]], texture2d<float, access::read> src [[texture(0)]], constant bg_ycc_p &p [[buffer(0)]]) {\n"
+    "   uint sx = uint(p.r.x), sy = uint(p.r.y);\n"
+    "   uint2 b = uint2(in.pos.xy) * uint2(sx, sy), m = uint2(src.get_width() - 1, src.get_height() - 1);\n"
+    "   float3 s = float3(0.0);\n"
+    "   for (uint dy = 0; dy < sy; dy++) for (uint dx = 0; dx < sx; dx++) s += src.read(min(b + uint2(dx, dy), m)).rgb;\n"
+    "   s /= float(sx * sy);\n"
+    "   float y = p.k.x * s.r + (1.0 - p.k.x - p.k.y) * s.g + p.k.y * s.b;\n"
+    "   float sc = p.k.z > 0.5 ? 224.0 / 255.0 : 1.0;\n"
+    "   float cb = 128.0 / 255.0 + sc * (s.b - y) / (2.0 * (1.0 - p.k.y)), cr = 128.0 / 255.0 + sc * (s.r - y) / (2.0 * (1.0 - p.k.x));\n"
+    "   return float4(cb * p.k.w, cr * p.k.w, 0.0, 1.0);\n"
+    "}\n";
+
+static id
+bg_ycc_pipeline(id dev, BOOL chroma, NSUInteger fmt)
+{
+   static struct { id dev; NSUInteger fmt; BOOL chroma; id ps; } cache[4];
+   static unsigned failures;
+   @synchronized([BGMTLDevice class]) {
+      for (unsigned i = 0; i < 4; i++)
+         if (cache[i].ps && cache[i].dev == dev && cache[i].fmt == fmt && cache[i].chroma == chroma) return cache[i].ps;
+      if (failures > 3) return nil;
+      NSError *e = nil;
+      id lib = [dev newLibraryWithSource:bg_ycc_src options:nil error:&e];
+      id vf = [lib newFunctionWithName:@"bg_ycc_vs"], ff = [lib newFunctionWithName:chroma ? @"bg_c_fs" : @"bg_y_fs"];
+      MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+      pd.vertexFunction = vf;
+      pd.fragmentFunction = ff;
+      pd.colorAttachments[0].pixelFormat = fmt;
+      id ps = vf && ff ? [dev newRenderPipelineStateWithDescriptor:pd error:&e] : nil;
+      [pd release];
+      [vf release];
+      [ff release];
+      [lib release];
+      char line[300];
+      snprintf(line, sizeof(line), "RGB 4:2:0 on the GPU: %s pipeline for format %lu: %s", chroma ? "chroma" : "luma", (unsigned long)fmt,
+               ps ? "built" : e ? [[e description] UTF8String] : "no library or function");
+      bgmtl_note_line(line);
+      if (!ps) { failures++; return nil; }
+      for (unsigned i = 0; i < 4; i++)
+         if (!cache[i].ps) { cache[i].dev = dev; cache[i].fmt = fmt; cache[i].chroma = chroma; cache[i].ps = ps; return ps; }
+      return ps;
+   }
+}
+
+// before the commit: every RGB-over-YCbCr texture this command buffer drew into, encoded into its planes on the GPU
+- (void)bgYccWriteBacks
+{
+   NSMutableSet *ts = nil;
+   for (BGMTLTexture *t in _written) {
+      BGMTLTexture *r = [t bgRoot];
+      if (r->_rgb420 && [r bgYccTwins]) {
+         if (!ts) ts = [NSMutableSet set];
+         [ts addObject:r];
+      }
+   }
+   for (BGMTLTexture *r in ts) {
+      IOSurfaceRef sf = (IOSurfaceRef)[r iosurface];
+      uint32_t fmt = IOSurfaceGetPixelFormat(sf);
+      BOOL video = fmt == '420v' || fmt == 'x420' || fmt == '422v' || fmt == 'x422' || fmt == '444v' || fmt == 'x444', is709 = bg_surface_is_709(sf);
+      BOOL wide = IOSurfaceGetBytesPerElementOfPlane(sf, 0) == 2;
+      size_t cw = IOSurfaceGetWidthOfPlane(sf, 1), ch = IOSurfaceGetHeightOfPlane(sf, 1);
+      float sx = cw * 2 <= IOSurfaceGetWidthOfPlane(sf, 0) + 1 ? 2 : 1, sy = ch * 2 <= IOSurfaceGetHeightOfPlane(sf, 0) + 1 ? 2 : 1;
+      const float params[8] = { is709 ? 0.2126f : 0.299f, is709 ? 0.0722f : 0.114f, video ? 1.f : 0.f, wide ? 65472.f / 65535.f : 1.f, sx, sy, 0, 0 };
+      BOOL ok = YES;
+      for (unsigned p = 0; p < 2 && ok; p++) {
+         BGMTLTexture *dst = p ? r->_yccC : r->_yccY;
+         id ps = bg_ycc_pipeline([self device], p == 1, [dst pixelFormat]);
+         if (!ps) { ok = NO; break; }
+         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+         rp.colorAttachments[0].texture = (id<MTLTexture>)dst;
+         rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+         id<MTLRenderCommandEncoder> enc = [self renderCommandEncoderWithDescriptor:rp];
+         if (!enc) { ok = NO; break; }
+         [enc setRenderPipelineState:ps];
+         [enc setViewport:(MTLViewport){ 0, 0, (double)[dst width], (double)[dst height], 0, 1 }];
+         [enc setFragmentTexture:(id<MTLTexture>)r atIndex:0];
+         [enc setFragmentBytes:params length:sizeof(params) atIndex:0];
+         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+         [enc endEncoding];
+      }
+      r->_yccGPU = ok;
+   }
+}
+
 // before the commit: every rotated framebuffer this command buffer drew into, turned into its surface
 - (void)bgRotWriteBacks
 {
@@ -2179,6 +2307,7 @@ bg_rot_pipeline(id dev, NSUInteger fmt)
 - (void)commit
 {
    if (_written.count && g_rot_off <= 0) [self bgRotWriteBacks];
+   if (_written.count) [self bgYccWriteBacks];
    __atomic_add_fetch(&g_bg_commit_seq, 1, __ATOMIC_RELAXED);
    bgmtl_note_committed();
    uint64_t t_begin = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -2301,6 +2430,16 @@ bg_idle_trim_schedule(void)
                          root->_xr2p ? "two-plane" : root->_surfCopy ? "copied" : "imported");
          if (root->_rot) continue;   // its own memory; its surface was written through its _rotPhys, also in _written
          if (root->_xr2p) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }
+         if (root->_rgb420 && root->_yccGPU) {
+            // encoded on the GPU at commit (bgYccWriteBacks): its planes' lines out of the caches, the seed moved
+            root->_yccGPU = NO;
+            chl_texture_flush_surface([root->_yccY chlTexture]);
+            IOSurfaceLock((IOSurfaceRef)[root iosurface], 0, NULL);
+            IOSurfaceUnlock((IOSurfaceRef)[root iosurface], 0, NULL);
+            root->_surfSeed = IOSurfaceGetSeed((IOSurfaceRef)[root iosurface]);
+            root->_surfFresh = YES;
+            continue;
+         }
          if (root->_rgb420) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }   // bgXR10WriteBack passes it on
          if (root->_surfCopy) { if (!copied) copied = [NSMutableSet set]; [copied addObject:root]; continue; }
          chl_texture_flush_surface([t chlTexture]);
@@ -2611,6 +2750,23 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
             }
          }
       }
+      /* Chlorophyll: one plane of a multi-plane surface, imported on its own (bgYccTwins) */
+      if (!_tex && g_plane_twin && plane < IOSurfaceGetPlaneCount(sf)) {
+         uintptr_t b0 = (uintptr_t)IOSurfaceGetBaseAddress(sf), bp = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(sf, plane);
+         if (b0 && bp >= b0)
+            _tex = chl_texture_from_iosurface_plane([device chl], &_desc, (int)IOSurfaceGetID(sf), (uint32_t)(bp - b0),
+                                                    (uint32_t)IOSurfaceGetBytesPerRowOfPlane(sf, plane), why, sizeof(why));
+         if (!_tex) {
+            static unsigned said;
+            if (__atomic_add_fetch(&said, 1, __ATOMIC_RELAXED) <= 8) {
+               char line[640];
+               snprintf(line, sizeof(line), "IOSurface %u plane %lu not imported: %s", IOSurfaceGetID(sf), (unsigned long)plane, why);
+               bgmtl_note_line(line);
+            }
+            [self release];
+            return nil;
+         }
+      }
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
       if (!_tex && plane == 0 && IOSurfaceGetPlaneCount(sf) <= 1) {
          _tex = chl_texture_from_iosurface([device chl], &_desc, (int)IOSurfaceGetID(sf), why, sizeof(why));
@@ -2734,6 +2890,8 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    if (_surface) CFRelease(_surface);
    if (_rotPhys && _rotPhys->_rotOwner == self) _rotPhys->_rotOwner = nil;
    [_rotPhys release];
+   [_yccY release];
+   [_yccC release];
    [_parent release];
    [_linSrc release];
    if (_ncDealloc) { _ncDealloc((void *)_ncBytes, _ncLength); Block_release(_ncDealloc); }
@@ -2979,12 +3137,37 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    return YES;
 }
 
+// the two plane twins of an RGB-over-YCbCr texture's surface (kept by the texture; nil when a plane cannot be imported)
+- (BOOL)bgYccTwins
+{
+   if (_yccY && _yccC) return YES;
+   if (!_rgb420 || !_surface || IOSurfaceGetPlaneCount((IOSurfaceRef)_surface) != 2) return NO;
+   static int off = -1;
+   if (off < 0) off = access("/private/var/tmp/bgmtl.ycccpu", F_OK) == 0;   // the CPU write-back only (a test switch)
+   if (off) return NO;
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   BOOL wide = IOSurfaceGetBytesPerElementOfPlane(sf, 0) == 2;
+   for (unsigned p = 0; p < 2; p++) {
+      MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)(p ? (wide ? 60 : 30) : (wide ? 20 : 10))
+                                                                                    width:IOSurfaceGetWidthOfPlane(sf, p)
+                                                                                   height:IOSurfaceGetHeightOfPlane(sf, p) mipmapped:NO];
+      pd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+      g_plane_twin = 1;
+      BGMTLTexture *t = [[BGMTLTexture alloc] initWithBGDevice:_owner descriptor:pd iosurface:sf plane:p];
+      g_plane_twin = 0;
+      if (!t) { [_yccY release]; _yccY = nil; return NO; }
+      if (p) _yccC = t; else _yccY = t;
+   }
+   return YES;
+}
+
 // Chlorophyll: an RGB8_420_2P / RGB10_420_2P texture (the camera's FigColorCube draws into these) back into its two-plane 4:2:0
 // surface after a command buffer drew into it: luma per texel, chroma per two by two texels (their mean), the surface's matrix
 // (601 or 709) and range (video for '420v' and 'x420'); 8-bit samples, or 10 bits at the top of 16-bit ones.
 - (BOOL)bgRGB420WriteBack
 {
    if (!_rgb420 || !_tex || !_surface) return NO;
+   uint64_t wb_t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
    IOSurfaceRef sf = (IOSurfaceRef)_surface;
    unsigned w = MIN(_desc.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0)), h = MIN(_desc.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
    uint8_t *px = (w && h) ? malloc((size_t)w * h * 4) : NULL;
@@ -2992,25 +3175,32 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    char why[256] = { 0 };
    const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
    if (chl_texture_get(_tex, 0, 0, o, sz, px, w * 4, 0, why, sizeof(why)) != 0) { BG_LOG("RGB 4:2:0 write-back: %s\n", why); free(px); return YES; }
+   uint64_t wb_t_got = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   static uint64_t wb_get_ns;
+   wb_get_ns += wb_t_got - wb_t0;
    uint32_t fmt = IOSurfaceGetPixelFormat(sf);
    BOOL video = fmt == '420v' || fmt == 'x420' || fmt == '422v' || fmt == 'x422' || fmt == '444v' || fmt == 'x444', is709 = bg_surface_is_709(sf),
         wide = IOSurfaceGetBytesPerElementOfPlane(sf, 0) == 2;
    size_t cw1 = IOSurfaceGetWidthOfPlane(sf, 1), ch1 = IOSurfaceGetHeightOfPlane(sf, 1);
    const unsigned sx = cw1 && cw1 * 2 <= IOSurfaceGetWidthOfPlane(sf, 0) + 1 ? 2 : 1, sy = ch1 && ch1 * 2 <= IOSurfaceGetHeightOfPlane(sf, 0) + 1 ? 2 : 1;
-   const float kr = is709 ? 0.2126f : 0.299f, kb = is709 ? 0.0722f : 0.114f, kg = 1.f - kr - kb;
-   const float ys = video ? 219.f / 255.f : 1.f, yo = video ? 16.f : 0.f, cs = video ? 224.f / 255.f : 1.f;
+   // fixed point, 1/65536: luma and the two colour differences, the range folded in
+   const double kr = is709 ? 0.2126 : 0.299, kb = is709 ? 0.0722 : 0.114, kg = 1.0 - kr - kb;
+   const double ys = video ? 219.0 / 255.0 : 1.0, cs = video ? 224.0 / 255.0 : 1.0;
+   const int32_t yr = (int32_t)(kr * ys * 65536 + .5), yg = (int32_t)(kg * ys * 65536 + .5), yb = (int32_t)(kb * ys * 65536 + .5);
+   const int32_t yo = video ? 16 << 16 : 0;
+   const double cbn = cs / (2.0 * (1.0 - kb)), crn = cs / (2.0 * (1.0 - kr));
+   const int32_t br = (int32_t)(-kr * cbn * 65536), bg = (int32_t)(-kg * cbn * 65536), bb = (int32_t)((1.0 - kb) * cbn * 65536);
+   const int32_t rr = (int32_t)((1.0 - kr) * crn * 65536), rg = (int32_t)(-kg * crn * 65536), rb = (int32_t)(-kb * crn * 65536);
    if (IOSurfaceLock(sf, 0, NULL) == 0) {
       uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
       size_t r0 = IOSurfaceGetBytesPerRowOfPlane(sf, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(sf, 1);
       for (unsigned y = 0; p0 && p1 && y < h; y += sy) {
          for (unsigned x = 0; x < w; x += sx) {
-            float sr = 0, sg = 0, sb = 0;
-            unsigned n = 0;
+            int32_t sr = 0, sg = 0, sb = 0, n = 0;
             for (unsigned dy = 0; dy < sy && y + dy < h; dy++)
                for (unsigned dx = 0; dx < sx && x + dx < w; dx++) {
-                  const uint8_t *s = px + ((size_t)(y + dy) * w + x + dx) * 4;
-                  float l = kr * s[0] + kg * s[1] + kb * s[2], v = yo + ys * l;
-                  int iv = (int)(v + 0.5f);
+                  const uint8_t *q = px + ((size_t)(y + dy) * w + x + dx) * 4;
+                  int32_t iv = (yr * q[0] + yg * q[1] + yb * q[2] + yo + 32768) >> 16;
                   iv = iv < 0 ? 0 : iv > 255 ? 255 : iv;
                   if (wide) {
                      uint16_t w16 = (uint16_t)(((iv * 1023 + 127) / 255) << 6);
@@ -3018,12 +3208,10 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
                   } else {
                      p0[(y + dy) * r0 + x + dx] = (uint8_t)iv;
                   }
-                  sr += s[0]; sg += s[1]; sb += s[2]; n++;
+                  sr += q[0]; sg += q[1]; sb += q[2]; n++;
                }
-            sr /= n; sg /= n; sb /= n;
-            float l = kr * sr + kg * sg + kb * sb;
-            float cb = 128.f + cs * (sb - l) / (2.f * (1.f - kb)), cr = 128.f + cs * (sr - l) / (2.f * (1.f - kr));
-            int icb = (int)(cb + 0.5f), icr = (int)(cr + 0.5f);
+            int32_t icb = ((br * sr + bg * sg + bb * sb) / n + (128 << 16) + 32768) >> 16;
+            int32_t icr = ((rr * sr + rg * sg + rb * sb) / n + (128 << 16) + 32768) >> 16;
             icb = icb < 0 ? 0 : icb > 255 ? 255 : icb;
             icr = icr < 0 ? 0 : icr > 255 ? 255 : icr;
             if (wide) {
@@ -3040,6 +3228,30 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       _surfFresh = YES;
    }
    free(px);
+   // what these cost, each 5 s, in bgmtl.log
+   static uint64_t wb_window, wb_busy;
+   static unsigned wb_n;
+   uint64_t wb_t1 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+   wb_busy += wb_t1 - wb_t0;
+   wb_n++;
+   if (!wb_window) wb_window = wb_t1;
+   if (wb_t1 - wb_window > 5000000000ull) {
+      char line[420], name[64] = "";
+      CFTypeRef nm = IOSurfaceCopyValue(sf, CFSTR("IOSurfaceName"));
+      if (nm && CFGetTypeID(nm) == CFStringGetTypeID()) CFStringGetCString((CFStringRef)nm, name, sizeof(name), kCFStringEncodingUTF8);
+      if (nm) CFRelease(nm);
+      uint32_t sfmt = IOSurfaceGetPixelFormat(sf);
+      uint64_t gt[4];
+      chl_texture_get_times(gt);
+      snprintf(line, sizeof(line), "RGB 4:2:0 write-backs: %u (%ux%u fmt %lu over '%c%c%c%c' \"%s\" last), %.0f ms of CPU in %.1f s, of it %.0f ms reading the texture (staging %.0f, GPU %.0f, copy %.0f, release %.0f)",
+               wb_n, w, h, (unsigned long)[self pixelFormat], (char)(sfmt >> 24), (char)(sfmt >> 16), (char)(sfmt >> 8), (char)sfmt, name,
+               wb_busy / 1e6, (wb_t1 - wb_window) / 1e9, wb_get_ns / 1e6, gt[0] / 1e6, gt[1] / 1e6, gt[2] / 1e6, gt[3] / 1e6);
+      bgmtl_note_line(line);
+      wb_window = wb_t1;
+      wb_busy = 0;
+      wb_get_ns = 0;
+      wb_n = 0;
+   }
    return YES;
 }
 

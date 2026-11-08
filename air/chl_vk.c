@@ -82,7 +82,8 @@ say(char *why, size_t why_size, const char *fmt, ...)
 #define CHL_DEVICE_FNS(X) \
    X(vkGetDeviceQueue) X(vkDestroyDevice) X(vkDeviceWaitIdle) X(vkQueueSubmit) X(vkCreateFence) X(vkDestroyFence) \
    X(vkWaitForFences) X(vkResetFences) X(vkGetFenceStatus) \
-   X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
+   X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkInvalidateMappedMemoryRanges) X(vkCreateBuffer) X(vkDestroyBuffer) \
+   X(vkGetBufferMemoryRequirements) \
    X(vkBindBufferMemory) X(vkGetBufferDeviceAddress) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) \
    X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) \
    X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
@@ -420,6 +421,10 @@ struct chl_device {
    VkPhysicalDeviceProperties props;
    VkPhysicalDeviceMemoryProperties memprops;
    uint32_t mt_host;                 /* host-visible, coherent */
+   uint32_t mt_read;                 /* host-visible and cached, for reading back (mt_host when there is none) */
+   bool mt_read_coherent;            /* ... and whether it needs vkInvalidateMappedMemoryRanges */
+   pthread_mutex_t read_lock;        /* the readback staging buffer below */
+   struct chl_buffer *read_staging;  /* chl_texture_get's, kept and grown */
    /* memory of released textures, see memc_take */
    struct { VkDeviceMemory mem; VkDeviceSize size; uint64_t t; } memc[CHL_MEMC_SLOTS];
    VkDeviceSize memc_bytes, memc_cap;
@@ -830,6 +835,22 @@ chl_device_open(char *why, size_t why_size)
           (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
          d->mt_host = i;
    }
+   /* readbacks (chl_texture_get): a cached type if Turnip has one (reading uncached memory runs at ~18 MB/s here: the camera's
+    * 1734x1300 frames took half a second each) */
+   d->mt_read = d->mt_host;
+   d->mt_read_coherent = true;
+   for (uint32_t i = 0; i < d->memprops.memoryTypeCount; i++) {
+      VkMemoryPropertyFlags f = d->memprops.memoryTypes[i].propertyFlags;
+      if ((f & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+         bool coherent = f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+         if (d->mt_read == d->mt_host || coherent) {
+            d->mt_read = i;
+            d->mt_read_coherent = coherent;
+         }
+      }
+   }
+   pthread_mutex_init(&d->read_lock, NULL);
    if (d->mt_host == ~0u) {
       say(why, why_size, "%s has no host-visible coherent memory", d->name);
       goto fail;
@@ -989,8 +1010,16 @@ chl_device_name(const struct chl_device *d)
 /* ---------------------------------------------------------------------------------------------------------------------
  * Buffers
  */
+static struct chl_buffer *buffer_new_in(struct chl_device *d, size_t size, uint32_t mt, char *why, size_t why_size);
+
 static struct chl_buffer *
 buffer_new(struct chl_device *d, size_t size, char *why, size_t why_size)
+{
+   return buffer_new_in(d, size, d->mt_host, why, why_size);
+}
+
+static struct chl_buffer *
+buffer_new_in(struct chl_device *d, size_t size, uint32_t mt, char *why, size_t why_size)
 {
    struct chl_buffer *b = calloc(1, sizeof(*b));
    if (!b) {
@@ -1013,7 +1042,7 @@ buffer_new(struct chl_device *d, size_t size, char *why, size_t why_size)
    VkMemoryRequirements req;
    d->vk.vkGetBufferMemoryRequirements(d->dev, b->vk, &req);
    VkMemoryAllocateFlagsInfo fl = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0 };
-   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, req.size, d->mt_host };
+   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, req.size, mt };
    if (d->vk.vkAllocateMemory(d->dev, &ai, NULL, &b->mem) != VK_SUCCESS ||
        d->vk.vkBindBufferMemory(d->dev, b->vk, b->mem, 0) != VK_SUCCESS ||
        d->vk.vkMapMemory(d->dev, b->mem, 0, VK_WHOLE_SIZE, 0, &b->map) != VK_SUCCESS) {
@@ -1393,6 +1422,17 @@ extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t 
 struct chl_texture *
 chl_texture_from_iosurface(struct chl_device *d, const struct chl_texture_desc *desc, int surface_id, char *why, size_t why_size)
 {
+   return chl_texture_from_iosurface_plane(d, desc, surface_id, ~0u, 0, why, why_size);
+}
+
+/* Chlorophyll: one plane of a multi-plane IOSurface (the camera's two-plane YCbCr surfaces, written by the GPU through bgmtl's
+ * RGB-over-YCbCr write-back): the image laid over the surface's memory from plane_offset (bytes past its start) with
+ * plane_bytes_per_row; desc gives the plane's size and format. plane_offset ~0u: the whole single-plane surface. */
+struct chl_texture *
+chl_texture_from_iosurface_plane(struct chl_device *d, const struct chl_texture_desc *desc, int surface_id, uint32_t plane_offset,
+                                 uint32_t plane_bytes_per_row, char *why, size_t why_size)
+{
+   bool one_plane = plane_offset != ~0u;
    const struct chl_format *f = desc ? chl_format(desc->pixel_format) : NULL;
    if (!f || (f->aspects & ~ASPECT_COLOR) || f->bw != 1) {
       say(why, why_size, "an IOSurface as pixel format %u: only uncompressed colour formats can be laid over one",
@@ -1406,6 +1446,20 @@ chl_texture_from_iosurface(struct chl_device *d, const struct chl_texture_desc *
    }
    struct chl_sbo sb;
    int pfd = sweet_drm_surface_prime(surface_id, &sb);
+   if (pfd >= 0 && one_plane) {
+      /* the plane's own place in the surface's memory */
+      if (!plane_bytes_per_row || (uint64_t)plane_offset + (uint64_t)plane_bytes_per_row * (desc->height ? desc->height : 1) > sb.size) {
+         say(why, why_size, "IOSurface %d: a plane at %u with %u bytes a row does not fit its %llu bytes", surface_id, plane_offset,
+             plane_bytes_per_row, (unsigned long long)sb.size);
+         sbo_give_back(pfd, &sb);
+         return NULL;
+      }
+      sb.offset += plane_offset;
+      sb.bytes_per_row = plane_bytes_per_row;
+      sb.width = desc->width;
+      sb.height = desc->height;
+      sb.planes = 1;
+   }
    if (pfd < 0 || !sb.bytes_per_row || sb.planes > 1) {
       say(why, why_size, "the kernel would not describe IOSurface %d (planes %u, %u bytes a row)", surface_id, sb.planes,
           sb.bytes_per_row);
@@ -1671,6 +1725,8 @@ chl_texture_replace(struct chl_texture *t, unsigned level, unsigned slice, const
    return 0;
 }
 
+static uint64_t chl_get_ns[4];
+
 int
 chl_texture_get(struct chl_texture *t, unsigned level, unsigned slice, const unsigned origin[3], const unsigned size[3],
                 void *bytes, size_t bytes_per_row, size_t bytes_per_image, char *why, size_t why_size)
@@ -1681,11 +1737,30 @@ chl_texture_get(struct chl_texture *t, unsigned level, unsigned slice, const uns
       return -1;
    size_t row = bytes_per_row ? bytes_per_row : r.row_bytes;
    size_t img = bytes_per_image ? bytes_per_image : row * ((r.size[1] + t->fmt->bh - 1) / t->fmt->bh);
-   r.staging = buffer_new(d, r.image_bytes * r.size[2], why, why_size);
-   if (!r.staging)
+   uint64_t t0 = os_time_get_nano();
+   size_t need = r.image_bytes * r.size[2];
+   pthread_mutex_lock(&d->read_lock);
+   if (!d->read_staging || d->read_staging->size < need) {
+      if (d->read_staging)
+         obj_release(&d->read_staging->o);
+      d->read_staging = buffer_new_in(d, need, d->mt_read, why, why_size);
+      if (!d->read_staging)
+         d->read_staging = buffer_new(d, need, why, why_size);   /* the cached type refused: the coherent one */
+   }
+   r.staging = d->read_staging;
+   if (!r.staging) {
+      pthread_mutex_unlock(&d->read_lock);
       return -1;
+   }
+   obj_retain(&r.staging->o);
+   uint64_t t1 = os_time_get_nano();
    r.to_image = false;
    int rc = run_now(d, record_region_copy, &r, why, why_size);
+   uint64_t t2 = os_time_get_nano();
+   if (rc == 0 && !d->mt_read_coherent) {
+      VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, NULL, r.staging->mem, 0, VK_WHOLE_SIZE };
+      d->vk.vkInvalidateMappedMemoryRanges(d->dev, 1, &mr);
+   }
    if (rc == 0) {
       unsigned rows = (r.size[1] + t->fmt->bh - 1) / t->fmt->bh;
       for (unsigned z = 0; z < r.size[2]; z++)
@@ -1693,8 +1768,22 @@ chl_texture_get(struct chl_texture *t, unsigned level, unsigned slice, const uns
             memcpy((uint8_t *)bytes + z * img + y * row, (const uint8_t *)r.staging->map + z * r.image_bytes + y * r.row_bytes,
                    r.row_bytes);
    }
+   uint64_t t3 = os_time_get_nano();
    obj_release(&r.staging->o);
+   pthread_mutex_unlock(&d->read_lock);
+   __atomic_add_fetch(&chl_get_ns[0], t1 - t0, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&chl_get_ns[1], t2 - t1, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&chl_get_ns[2], t3 - t2, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&chl_get_ns[3], os_time_get_nano() - t3, __ATOMIC_RELAXED);
    return rc;
+}
+
+/* time spent in chl_texture_get since the last call, ns: staging allocation, GPU copy and wait, CPU copy, release */
+void
+chl_texture_get_times(uint64_t out[4])
+{
+   for (int i = 0; i < 4; i++)
+      out[i] = __atomic_exchange_n(&chl_get_ns[i], 0, __ATOMIC_RELAXED);
 }
 
 /* ---------------------------------------------------------------------------------------------------------------------
@@ -2238,6 +2327,93 @@ fill_info(struct chl_device *d, struct chl_pipeline_info *info, const struct chl
 /* ---------------------------------------------------------------------------------------------------------------------
  * Compute pipelines
  */
+/* ---- the render pipeline cache (chl_render_pipeline_create) ---- */
+#include "util/xxhash.h"
+#define RP_CACHE_MAX 512
+static struct { uint64_t key[2]; struct chl_render_pipeline *p; struct chl_device *d; } rp_cache[RP_CACHE_MAX];
+static unsigned rp_cache_n;
+static struct { uint64_t key[2]; struct chl_compute_pipeline *p; struct chl_device *d; } cp_cache[RP_CACHE_MAX];
+static unsigned cp_cache_n;
+static pthread_mutex_t rp_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+rp_hash_function(XXH64_state_t *h, const struct chl_function *f)
+{
+   uint64_t sz = f->bitcode ? f->size : 0;
+   XXH64_update(h, &sz, sizeof(sz));
+   if (f->bitcode)
+      XXH64_update(h, f->bitcode, f->size);
+   if (f->entry)
+      XXH64_update(h, f->entry, strlen(f->entry) + 1);
+   uint64_t nc = f->num_constants;
+   XXH64_update(h, &nc, sizeof(nc));
+   if (f->constants && f->num_constants)
+      XXH64_update(h, f->constants, f->num_constants * sizeof(struct air_constant_value));
+   uint64_t nl = f->num_linked;
+   XXH64_update(h, &nl, sizeof(nl));
+   for (unsigned i = 0; i < f->num_linked; i++) {
+      if (f->linked[i].bitcode)
+         XXH64_update(h, f->linked[i].bitcode, f->linked[i].size);
+      if (f->linked[i].name)
+         XXH64_update(h, f->linked[i].name, strlen(f->linked[i].name) + 1);
+   }
+}
+
+static bool
+rp_cache_key(const struct chl_render_pipeline_desc *desc, uint64_t key[2])
+{
+   for (unsigned k = 0; k < 2; k++) {
+      XXH64_state_t h;
+      XXH64_reset(&h, k ? 0x9e3779b97f4a7c15ull : 0);
+      rp_hash_function(&h, &desc->vertex);
+      rp_hash_function(&h, &desc->fragment);
+      XXH64_update(&h, desc->color_format, sizeof(desc->color_format));
+      XXH64_update(&h, desc->blend, sizeof(desc->blend));
+      XXH64_update(&h, &desc->depth_format, sizeof(desc->depth_format));
+      XXH64_update(&h, &desc->stencil_format, sizeof(desc->stencil_format));
+      XXH64_update(&h, &desc->sample_count, sizeof(desc->sample_count));
+      XXH64_update(&h, &desc->alpha_to_coverage, sizeof(desc->alpha_to_coverage));
+      XXH64_update(&h, &desc->topology_class, sizeof(desc->topology_class));
+      XXH64_update(&h, &desc->has_vertex_descriptor, sizeof(desc->has_vertex_descriptor));
+      if (desc->has_vertex_descriptor) {
+         XXH64_update(&h, desc->attribute, sizeof(desc->attribute));
+         XXH64_update(&h, desc->layout, sizeof(desc->layout));
+      }
+      key[k] = XXH64_digest(&h);
+   }
+   return true;
+}
+
+static struct chl_render_pipeline *
+rp_cache_find(struct chl_device *d, const uint64_t key[2])
+{
+   struct chl_render_pipeline *p = NULL;
+   pthread_mutex_lock(&rp_cache_lock);
+   for (unsigned i = 0; i < rp_cache_n; i++)
+      if (rp_cache[i].d == d && rp_cache[i].key[0] == key[0] && rp_cache[i].key[1] == key[1]) {
+         p = rp_cache[i].p;
+         obj_retain(&p->o);
+         break;
+      }
+   pthread_mutex_unlock(&rp_cache_lock);
+   return p;
+}
+
+static void
+rp_cache_add(struct chl_device *d, const uint64_t key[2], struct chl_render_pipeline *p)
+{
+   pthread_mutex_lock(&rp_cache_lock);
+   if (rp_cache_n < RP_CACHE_MAX) {
+      rp_cache[rp_cache_n].key[0] = key[0];
+      rp_cache[rp_cache_n].key[1] = key[1];
+      rp_cache[rp_cache_n].d = d;
+      rp_cache[rp_cache_n].p = p;
+      obj_retain(&p->o);   /* the cache's own reference: kept for the process's life */
+      rp_cache_n++;
+   }
+   pthread_mutex_unlock(&rp_cache_lock);
+}
+
 struct chl_compute_pipeline *
 chl_compute_pipeline_create(struct chl_device *d, const struct chl_function *fn, struct chl_pipeline_info *info, char *why,
                             size_t why_size)
@@ -2245,6 +2421,27 @@ chl_compute_pipeline_create(struct chl_device *d, const struct chl_function *fn,
    if (!fn || !fn->bitcode || fn->size < 4) {
       say(why, why_size, "no function to make a compute pipeline of");
       return NULL;
+   }
+   /* the same function made again: the pipeline already made (see chl_render_pipeline_create's cache) */
+   uint64_t ckey[2];
+   bool cacheable = access("/private/var/tmp/chl.nopipecache", F_OK) != 0;
+   if (cacheable) {
+      for (unsigned k = 0; k < 2; k++) {
+         XXH64_state_t h;
+         XXH64_reset(&h, k ? 0x9e3779b97f4a7c15ull : 0x7f4a7c15ull);
+         rp_hash_function(&h, fn);
+         ckey[k] = XXH64_digest(&h);
+      }
+      pthread_mutex_lock(&rp_cache_lock);
+      for (unsigned i = 0; i < cp_cache_n; i++)
+         if (cp_cache[i].d == d && cp_cache[i].key[0] == ckey[0] && cp_cache[i].key[1] == ckey[1]) {
+            struct chl_compute_pipeline *hit = cp_cache[i].p;
+            obj_retain(&hit->o);
+            pthread_mutex_unlock(&rp_cache_lock);
+            fill_info(d, info, &hit->cs, NULL);
+            return hit;
+         }
+      pthread_mutex_unlock(&rp_cache_lock);
    }
    struct chl_compute_pipeline *p = calloc(1, sizeof(*p));
    if (!p) {
@@ -2263,6 +2460,18 @@ chl_compute_pipeline_create(struct chl_device *d, const struct chl_function *fn,
    if (!make_layout(d, &p->layout, st, 1, VK_SHADER_STAGE_COMPUTE_BIT, why, why_size))
       goto fail;
    fill_info(d, info, &p->cs, NULL);
+   if (cacheable) {
+      pthread_mutex_lock(&rp_cache_lock);
+      if (cp_cache_n < RP_CACHE_MAX) {
+         cp_cache[cp_cache_n].key[0] = ckey[0];
+         cp_cache[cp_cache_n].key[1] = ckey[1];
+         cp_cache[cp_cache_n].d = d;
+         cp_cache[cp_cache_n].p = p;
+         obj_retain(&p->o);
+         cp_cache_n++;
+      }
+      pthread_mutex_unlock(&rp_cache_lock);
+   }
    return p;
 fail:
    free_layout(d, &p->layout);

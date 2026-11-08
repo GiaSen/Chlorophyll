@@ -80,6 +80,9 @@ struct chl_texture_desc {
 struct chl_texture *chl_texture_create(struct chl_device *dev, const struct chl_texture_desc *desc, char *why, size_t why_size);
 /* -newTextureWithDescriptor:iosurface:plane: (plane 0): the texture IS the surface's memory, linear with the surface's pitch.
  * chl_texture_flush_surface makes what the GPU wrote visible to the processor and to the compositor (the kernel's cache clean). */
+/* one plane of a multi-plane IOSurface: from plane_offset bytes into its memory, plane_bytes_per_row a row; desc = the plane */
+struct chl_texture *chl_texture_from_iosurface_plane(struct chl_device *dev, const struct chl_texture_desc *desc, int surface_id,
+                                                     uint32_t plane_offset, uint32_t plane_bytes_per_row, char *why, size_t why_size);
 struct chl_texture *chl_texture_from_iosurface(struct chl_device *dev, const struct chl_texture_desc *desc, int surface_id,
                                                char *why, size_t why_size);
 int chl_texture_flush_surface(struct chl_texture *tex);
@@ -95,6 +98,8 @@ size_t chl_format_tight_row(unsigned pixel_format, unsigned width);
 int chl_texture_replace(struct chl_texture *tex, unsigned level, unsigned slice, const unsigned origin[3], const unsigned size[3],
                         const void *bytes, size_t bytes_per_row, size_t bytes_per_image, char *why, size_t why_size);
 /* -getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice: (waits for the GPU work submitted before it) */
+/* time spent in chl_texture_get since the last call, ns: staging allocation, GPU copy and wait, CPU copy, release */
+void chl_texture_get_times(uint64_t out[4]);
 int chl_texture_get(struct chl_texture *tex, unsigned level, unsigned slice, const unsigned origin[3], const unsigned size[3],
                     void *bytes, size_t bytes_per_row, size_t bytes_per_image, char *why, size_t why_size);
 void chl_texture_size(const struct chl_texture *tex, unsigned *w, unsigned *h, unsigned *d, unsigned *levels, unsigned *slices,
