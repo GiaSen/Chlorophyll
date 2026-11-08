@@ -244,6 +244,12 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_ftrunc(&c->b, a[0]);
    } else if (!strcmp(op, "fast_fract") || !strcmp(op, "fract")) {
       r = nir_ffract(&c->b, a[0]);
+   } else if (!strcmp(op, "fast_cospi") || !strcmp(op, "cospi") || !strcmp(op, "fast_sinpi") || !strcmp(op, "sinpi") ||
+              !strcmp(op, "fast_tanpi") || !strcmp(op, "tanpi")) {
+      /* Chlorophyll (NRF's sparse rendering): cos(pi x), sin(pi x), tan(pi x) */
+      nir_def *x = nir_fmul_imm(&c->b, a[0], M_PI);
+      r = strstr(op, "cospi") ? nir_fcos(&c->b, x) : strstr(op, "sinpi") ? nir_fsin(&c->b, x)
+                                                     : nir_fdiv(&c->b, nir_fsin(&c->b, x), nir_fcos(&c->b, x));
    } else if (!strcmp(op, "fast_sin") || !strcmp(op, "sin")) {
       r = nir_fsin(&c->b, a[0]);
    } else if (!strcmp(op, "fast_cos") || !strcmp(op, "cos")) {
@@ -533,6 +539,25 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
        */
       r = nir_reduce(&c->b, a[0],
                      .reduction_op = is_float ? nir_op_fadd : nir_op_iadd);
+   } else if (!strcmp(op, "simd_min") || !strcmp(op, "simd_max") || !strcmp(op, "simd_product") || !strcmp(op, "quad_sum") ||
+              !strcmp(op, "quad_min") || !strcmp(op, "quad_max") || !strcmp(op, "simd_and") || !strcmp(op, "simd_or") ||
+              !strcmp(op, "simd_xor")) {
+      /* Chlorophyll (the camera's libraries): the other reductions, over the SIMD group as simd_sum is, or over the quad
+       * (cluster of 4) */
+      bool quad = !strncmp(op, "quad_", 5);
+      const char *what = op + 5;
+      nir_op rop = !strcmp(what, "min") ? (is_float ? nir_op_fmin : is_signed ? nir_op_imin : nir_op_umin) :
+                   !strcmp(what, "max") ? (is_float ? nir_op_fmax : is_signed ? nir_op_imax : nir_op_umax) :
+                   !strcmp(what, "product") ? (is_float ? nir_op_fmul : nir_op_imul) :
+                   !strcmp(what, "sum") ? (is_float ? nir_op_fadd : nir_op_iadd) :
+                   !strcmp(what, "and") ? nir_op_iand : !strcmp(what, "or") ? nir_op_ior : nir_op_ixor;
+      r = nir_reduce(&c->b, a[0], .reduction_op = rop, .cluster_size = quad ? 4 : 0);
+   } else if (!strcmp(op, "simd_prefix_inclusive_sum") || !strcmp(op, "simd_prefix_exclusive_sum") ||
+              !strcmp(op, "simd_prefix_inclusive_product") || !strcmp(op, "simd_prefix_exclusive_product")) {
+      bool sum = strstr(op, "_sum") != NULL;
+      nir_op rop = sum ? (is_float ? nir_op_fadd : nir_op_iadd) : (is_float ? nir_op_fmul : nir_op_imul);
+      r = strstr(op, "inclusive") ? nir_inclusive_scan(&c->b, a[0], .reduction_op = rop)
+                                  : nir_exclusive_scan(&c->b, a[0], .reduction_op = rop);
    } else if (!strcmp(op, "normalize_function_constant_predicate")) {
       /* Metal's compiler stores the predicates that say whether a dependent
        * function constant applies in `__metal_implicit_fc_pred_N` bytes, and
@@ -571,6 +596,39 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       if (x->bit_size != 32)
          x = nir_f2f32(&c->b, x);
       r = nir_pack_unorm_4x8(&c->b, x);
+   } else if ((!strcmp(op, "pack") || !strcmp(op, "unpack")) && n->num >= 2 &&
+              (!strcmp(n->part[1], "snorm2x16") || !strcmp(n->part[1], "unorm2x16"))) {
+      /* Chlorophyll (NRF): pack_float_to_snorm2x16 / unorm2x16 and back, component 0 in the low half: GLSL's and NIR's */
+      bool snorm = n->part[1][0] == 's';
+      if (!strcmp(op, "pack")) {
+         nir_def *x = a[0]->bit_size != 32 ? nir_f2f32(&c->b, a[0]) : a[0];
+         r = snorm ? nir_pack_snorm_2x16(&c->b, x) : nir_pack_unorm_2x16(&c->b, x);
+      } else {
+         r = snorm ? nir_unpack_snorm_2x16(&c->b, a[0]) : nir_unpack_unorm_2x16(&c->b, a[0]);
+         if (air_nir_bit_size(c, in->base.type) == 16)
+            r = nir_f2f16(&c->b, r);
+      }
+   } else if ((!strcmp(op, "pack") || !strcmp(op, "unpack")) && n->num >= 3 && !strcmp(n->part[1], "unorm") &&
+              !strcmp(n->part[2], "rgb10a2")) {
+      /* Chlorophyll (NRF): four unorm values in one word as MTLPixelFormatRGB10A2Unorm lays them out, R in bits 0-9, G 10-19,
+       * B 20-29, A 30-31; each clamped to [0, 1] and rounded to nearest */
+      static const unsigned shift[4] = { 0, 10, 20, 30 }, maxv[4] = { 1023, 1023, 1023, 3 };
+      if (!strcmp(op, "pack")) {
+         nir_def *x = nir_fsat(&c->b, a[0]->bit_size != 32 ? nir_f2f32(&c->b, a[0]) : a[0]);
+         r = nir_imm_int(&c->b, 0);
+         for (unsigned k = 0; k < 4 && k < x->num_components; k++) {
+            nir_def *q = nir_f2u32(&c->b, nir_fround_even(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, x, k), maxv[k])));
+            r = nir_ior(&c->b, r, nir_ishl_imm(&c->b, q, shift[k]));
+         }
+      } else {
+         nir_def *w = air_u2u32(&c->b, a[0]), *comps[4];
+         for (unsigned k = 0; k < 4; k++)
+            comps[k] = nir_fmul_imm(&c->b, nir_u2f32(&c->b, nir_ubitfield_extract_imm(&c->b, w, shift[k], k == 3 ? 2 : 10)),
+                                    1.0 / maxv[k]);
+         r = nir_vec(&c->b, comps, 4);
+         if (air_nir_bit_size(c, in->base.type) == 16)
+            r = nir_f2f16(&c->b, r);
+      }
    } else if (!strcmp(op, "convert")) {
       /* air.convert.<dst sign>.<dst type>.<src sign>.<src type> */
       if (n->num < 5) {
@@ -1037,6 +1095,39 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       return true;
    }
 
+   /* Chlorophyll (the camera's libraries): the shuffles by a distance, within the SIMD group or the quad; a lane whose
+    * source falls outside keeps its own value, as Metal defines them */
+   if (!strcmp(op, "simd_shuffle_down") || !strcmp(op, "simd_shuffle_up") || !strcmp(op, "quad_shuffle_down") ||
+       !strcmp(op, "quad_shuffle_up") || !strcmp(op, "quad_shuffle")) {
+      if (in->num_operands < 3)
+         return air_error(c, "intrinsic: air.%s without a lane", n->part[0]);
+      nir_def *d = air_get_ssa(c, in->operands[2]);
+      if (!a0 || !d)
+         return false;
+      d = air_u2u32(&c->b, d);
+      nir_def *lane = nir_load_subgroup_invocation(&c->b);
+      bool quad = !strncmp(op, "quad_", 5);
+      nir_def *src, *inside;
+      if (!strcmp(op, "quad_shuffle")) {
+         src = nir_ior(&c->b, nir_iand_imm(&c->b, lane, ~3u), nir_iand_imm(&c->b, d, 3));
+         inside = nir_imm_true(&c->b);
+      } else if (strstr(op, "_down")) {
+         src = nir_iadd(&c->b, lane, d);
+         inside = quad ? nir_ult_imm(&c->b, nir_iadd(&c->b, nir_iand_imm(&c->b, lane, 3), d), 4)
+                       : nir_ult(&c->b, src, nir_load_subgroup_size(&c->b));
+      } else {
+         src = nir_isub(&c->b, lane, d);
+         inside = quad ? nir_uge(&c->b, nir_iand_imm(&c->b, lane, 3), d) : nir_uge(&c->b, lane, d);
+      }
+      nir_def *got = nir_shuffle(&c->b, a0, nir_bcsel(&c->b, inside, src, lane));
+      air_set(c, &in->base, air_val_ssa(c, nir_bcsel(&c->b, inside, got, a0)));
+      return true;
+   }
+   if (!strcmp(op, "simd_is_first")) {
+      air_set(c, &in->base, air_val_ssa(c, nir_elect(&c->b, 1)));
+      return true;
+   }
+
    if (!strcmp(op, "quad_shuffle_xor")) {
       /* quad_shuffle_xor(data, mask) hands each lane the value of the lane
        * whose number is its own exclusive-ored with the mask. Within a quad
@@ -1109,6 +1200,8 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
 {
    if (!strncmp(name, "llvm.lifetime.", 14))
       return true; /* scope markers: nothing to emit */
+   if (!strcmp(name, "llvm.assume") || !strncmp(name, "llvm.experimental.noalias", 25))
+      return true; /* Chlorophyll: an optimiser's hint, nothing to emit */
    if (!strncmp(name, "llvm.memcpy.", 12)) {
       /* a copy between two of our pointers, of a constant length */
       struct air_val *dst = air_get(c, in->operands[1]);
@@ -1125,6 +1218,14 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
        */
       if (bytes % 4)
          return air_error(c, "intrinsic: memcpy of %u bytes", (unsigned)bytes);
+      /* Chlorophyll: pointers kept in the source's private memory go along (air_ctx.scratch_ptrs) */
+      uint32_t so, dof;
+      if (air_scratch_const_offset(&src->ptr, &so) && air_scratch_const_offset(&dst->ptr, &dof))
+         for (uint64_t off = 0; off < bytes; off += 4) {
+            struct air_val *kept = air_scratch_ptr_load(c, so + (uint32_t)off);
+            if (kept)
+               air_scratch_ptr_store(c, dof + (uint32_t)off, kept);
+         }
       for (uint64_t off = 0; off < bytes; off += 4) {
          struct air_ptr s = air_ptr_add(c, src->ptr, nir_imm_int(&c->b, off));
          struct air_ptr d = air_ptr_add(c, dst->ptr, nir_imm_int(&c->b, off));
@@ -1143,15 +1244,23 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       if (dst->kind != AIR_VAL_PTR)
          return air_error(c, "intrinsic: memset of something that is not a pointer");
       uint64_t bytes;
-      if (!air_const_uint(in->operands[3], &bytes) || bytes % 4)
-         return air_error(c, "intrinsic: memset of a length that is not a multiple of 4");
+      if (!air_const_uint(in->operands[3], &bytes))
+         return air_error(c, "intrinsic: memset of a run-time length");
       if (!nir_src_is_const(nir_src_for_ssa(byte)))
          return air_error(c, "intrinsic: memset of a run-time byte");
       uint32_t b = nir_src_as_uint(nir_src_for_ssa(byte)) & 0xff;
       uint32_t word = b | b << 8 | b << 16 | b << 24;
-      for (uint64_t off = 0; off < bytes; off += 4) {
+      /* Chlorophyll: whole words, then the bytes past the last one (bgmtl's own bg_splat and NRF's kernels clear 6- and
+       * 10-byte structs); the destination of a word store is assumed 4-aligned as before, a byte store asks for nothing */
+      uint64_t off = 0;
+      for (; off + 4 <= bytes; off += 4) {
          struct air_ptr d = air_ptr_add(c, dst->ptr, nir_imm_int(&c->b, off));
          if (!air_store_ptr(c, d, nir_imm_int(&c->b, word), 4))
+            return false;
+      }
+      for (; off < bytes; off++) {
+         struct air_ptr d = air_ptr_add(c, dst->ptr, nir_imm_int(&c->b, off));
+         if (!air_store_ptr(c, d, nir_imm_intN_t(&c->b, b, 8), 1))
             return false;
       }
       return true;
@@ -1200,8 +1309,12 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
    }
    /* Bergamota (iOS 26): the integer min/max LLVM folds `select (icmp)` into; VideoToolbox's VTMTSComputeFunction1x1 has
     * llvm.umax.i32 */
+   /* Chlorophyll (iOS 26's camera libraries): the float forms too. minnum/maxnum answer the other operand for one NaN, as
+    * fmin/fmax do; minimum/maximum would answer NaN, which these kernels never rely on (fast math) */
    static const struct { const char *p; nir_op op; } minmax[] = {
       { "llvm.smax.", nir_op_imax }, { "llvm.smin.", nir_op_imin }, { "llvm.umax.", nir_op_umax }, { "llvm.umin.", nir_op_umin },
+      { "llvm.minnum.", nir_op_fmin }, { "llvm.maxnum.", nir_op_fmax }, { "llvm.minimum.", nir_op_fmin },
+      { "llvm.maximum.", nir_op_fmax },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(minmax); i++) {
       if (strncmp(name, minmax[i].p, strlen(minmax[i].p)))
@@ -1210,6 +1323,14 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       if (!a || !b)
          return false;
       air_set(c, &in->base, air_val_ssa(c, nir_build_alu2(&c->b, minmax[i].op, a, b)));
+      return true;
+   }
+   /* Chlorophyll: llvm.abs.<ty>(x, i1 int_min_is_poison) */
+   if (!strncmp(name, "llvm.abs.", 9)) {
+      nir_def *a = air_get_ssa(c, in->operands[1]);
+      if (!a)
+         return false;
+      air_set(c, &in->base, air_val_ssa(c, nir_iabs(&c->b, a)));
       return true;
    }
    if (!strcmp(name, "llvm.trap"))
@@ -2197,6 +2318,184 @@ texture_op_chosen(struct air_ctx *c, const struct air_inst *in, const struct air
    return true;
 }
 
+/* Chlorophyll: a compute kernel's EXPLICIT imageblock (air_shader_info.explicit_imageblock_bytes). Its storage is workgroup
+ * shared memory whose width, height and byte base the runtime fills in per dispatch (nir_load_ray_launch_size stands for them
+ * until then: air_lower_explicit_imageblock). Element (x, y) is at base + (y * width + x) * bytes. */
+static nir_def *
+explicit_imageblock_dims(struct air_ctx *c)
+{
+   return nir_load_ray_launch_size(&c->b);
+}
+
+static nir_block *
+loop_block(struct air_ctx *c)
+{
+   nir_block *n = nir_block_create(c->b.impl);
+   exec_list_push_tail(&c->b.impl->body, &n->cf_node.node);
+   n->cf_node.parent = &c->b.impl->cf_node;
+   return n;
+}
+
+/* air.imageblock_data(<2 x i16> coord, i32 slice, i16 sample) -> ptr addrspace(4): the element at coord */
+static bool
+imageblock_data_op(struct air_ctx *c, const struct air_inst *in)
+{
+   if (!c->has_explicit_imageblock)
+      return air_error(c, "intrinsic: air.imageblock_data in a function without an explicit imageblock");
+   if (in->num_operands < 2)
+      return air_error(c, "intrinsic: air.imageblock_data without a coordinate");
+   uint64_t k;
+   for (unsigned i = 2; i < in->num_operands; i++)
+      if (!air_const_uint(in->operands[i], &k) || k != 0)
+         return air_error(c, "intrinsic: air.imageblock_data with argument %u not a constant 0 (slices and samples, not yet)", i - 1);
+   nir_def *coord = air_get_ssa(c, in->operands[1]);
+   if (!coord || coord->num_components != 2)
+      return coord ? air_error(c, "intrinsic: air.imageblock_data with a %u-component coordinate", coord->num_components) : false;
+   coord = air_u2u32(&c->b, coord);
+   nir_def *dims = explicit_imageblock_dims(c);
+   nir_def *index = nir_iadd(&c->b, nir_imul(&c->b, nir_channel(&c->b, coord, 1), nir_channel(&c->b, dims, 0)),
+                             nir_channel(&c->b, coord, 0));
+   struct air_ptr p = { .class = AIR_PTR_SHARED };
+   p.offset = nir_iadd(&c->b, nir_channel(&c->b, dims, 2), nir_imul_imm(&c->b, index, c->info->explicit_imageblock_bytes));
+   air_set(c, &in->base, air_val_ptr(c, p));
+   return true;
+}
+
+/* air.get_imageblock_width() / air.get_imageblock_height() -> i16 */
+static bool
+imageblock_size_op(struct air_ctx *c, const struct air_inst *in, unsigned comp)
+{
+   if (!c->has_explicit_imageblock)
+      return air_error(c, "intrinsic: air.get_imageblock_%s in a function without an explicit imageblock", comp ? "height" : "width");
+   nir_def *v = nir_channel(&c->b, explicit_imageblock_dims(c), comp);
+   unsigned bits = in->base.type ? air_nir_bit_size(c, in->base.type) : 16;
+   air_set(c, &in->base, air_val_ssa(c, air_u2uN(&c->b, v, bits)));
+   return true;
+}
+
+/*
+ * air.write_imageblock_slice_to_texture_2d[_array].[i16.]<T>(texture, ptr member, i1 region, <2 x i16> origin, <2 x i16> size,
+ *    <2 x i16|i32> coord, [i16 layer,] lod, i1, i32): writes the member `member` points into, over the region (or the whole
+ * imageblock when `region` is false), to the texture from coord on. Apple's kernels call it from one thread after a barrier,
+ * so that thread walks the region here: a loop of blocks (this translator's CFG is unstructured until nir_lower_goto_ifs),
+ * each texel inside the texture stored. The member's byte offset in the element is the pointer's offset past the base,
+ * modulo the element size.
+ */
+static bool
+imageblock_write_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
+{
+   if (!c->has_explicit_imageblock)
+      return air_error(c, "intrinsic: air.%s in a function without an explicit imageblock", n->part[0]);
+   bool is_array = !strcmp(n->part[0], "write_imageblock_slice_to_texture_2d_array");
+   if (!is_array && strcmp(n->part[0], "write_imageblock_slice_to_texture_2d"))
+      return air_error(c, "intrinsic: air.%s", n->part[0]);
+   /* the stored type: the last part of the name, [v<N>]f16|f32|i16|i32|u16|u32 */
+   const char *ty = n->part[n->num - 1];
+   unsigned comps = 1;
+   if (ty[0] == 'v') {
+      comps = (unsigned)strtoul(ty + 1, (char **)&ty, 10);
+   }
+   unsigned bits = (unsigned)strtoul(ty + 1, NULL, 10);
+   if ((ty[0] != 'f' && ty[0] != 'i' && ty[0] != 'u') || (bits != 16 && bits != 32) || comps < 1 || comps > 4)
+      return air_error(c, "intrinsic: air.%s of a type %s", n->part[0], n->part[n->num - 1]);
+   unsigned want = is_array ? 11 : 10;
+   if (in->num_operands != want)
+      return air_error(c, "intrinsic: air.%s with %u arguments", n->part[0], in->num_operands - 1);
+
+   struct air_ptr tex;
+   if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
+      return false;
+   if (!tex.is_image)
+      return air_error(c, "intrinsic: air.%s to a texture the interface says is not written", n->part[0]);
+   struct air_val *pv = air_get(c, in->operands[2]);
+   if (!pv)
+      return false;
+   if (pv->kind != AIR_VAL_PTR || pv->ptr.class != AIR_PTR_SHARED)
+      return air_error(c, "intrinsic: air.%s from something that is not the imageblock", n->part[0]);
+   uint64_t region = 0;
+   if (!air_const_uint(in->operands[3], &region))
+      return air_error(c, "intrinsic: air.%s whose region flag is not a constant", n->part[0]);
+   nir_def *dims = explicit_imageblock_dims(c);
+   nir_def *origin, *size;
+   if (region) {
+      origin = air_get_ssa(c, in->operands[4]);
+      size = air_get_ssa(c, in->operands[5]);
+      if (!origin || !size)
+         return false;
+      origin = air_u2u32(&c->b, origin);
+      size = air_u2u32(&c->b, size);
+   } else {
+      origin = nir_imm_ivec2(&c->b, 0, 0);
+      size = nir_channels(&c->b, dims, 0x3);
+   }
+   nir_def *coord = air_get_ssa(c, in->operands[6]);
+   if (!coord)
+      return false;
+   coord = air_u2u32(&c->b, coord);
+   unsigned arg = 7;
+   nir_def *layer = NULL;
+   if (is_array) {
+      layer = air_get_ssa(c, in->operands[arg++]);
+      if (!layer)
+         return false;
+      layer = air_u2u32(&c->b, layer);
+   }
+   nir_def *lod = air_get_ssa(c, in->operands[arg]);
+   if (!lod)
+      return false;
+   nir_def *index = image_level_index(c, &tex, lod);
+   if (!index)
+      return false;
+   lod = air_u2u32(&c->b, lod);
+
+   unsigned bytes = c->info->explicit_imageblock_bytes;
+   nir_def *member = nir_umod_imm(&c->b, nir_isub(&c->b, pv->ptr.offset ? pv->ptr.offset : nir_imm_int(&c->b, 0),
+                                                  nir_channel(&c->b, dims, 2)), bytes);
+   nir_def *isize = nir_image_size(&c->b, is_array ? 3 : 2, 32, index, nir_imm_int(&c->b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+                                   .image_array = is_array);
+   nir_def *total = nir_imul(&c->b, nir_channel(&c->b, size, 0), nir_channel(&c->b, size, 1));
+
+   nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
+   nir_def *ireg = nir_decl_reg(&entry, 1, 32, 0);
+   nir_store_reg(&c->b, nir_imm_int(&c->b, 0), ireg);
+   nir_block *head = loop_block(c), *body = loop_block(c), *store = loop_block(c), *next = loop_block(c), *done = loop_block(c);
+   nir_goto(&c->b, head);
+
+   c->b.cursor = nir_after_block(head);
+   nir_def *i = nir_load_reg(&c->b, ireg);
+   nir_goto_if(&c->b, body, nir_ult(&c->b, i, total), done);
+
+   c->b.cursor = nir_after_block(body);
+   i = nir_load_reg(&c->b, ireg);
+   nir_def *x = nir_umod(&c->b, i, nir_channel(&c->b, size, 0));
+   nir_def *y = nir_udiv(&c->b, i, nir_channel(&c->b, size, 0));
+   nir_def *tx = nir_iadd(&c->b, nir_channel(&c->b, coord, 0), x), *ty_ = nir_iadd(&c->b, nir_channel(&c->b, coord, 1), y);
+   nir_def *inside = nir_iand(&c->b, nir_ult(&c->b, tx, nir_channel(&c->b, isize, 0)), nir_ult(&c->b, ty_, nir_channel(&c->b, isize, 1)));
+   nir_goto_if(&c->b, store, inside, next);
+
+   c->b.cursor = nir_after_block(store);
+   i = nir_load_reg(&c->b, ireg);
+   x = nir_umod(&c->b, i, nir_channel(&c->b, size, 0));
+   y = nir_udiv(&c->b, i, nir_channel(&c->b, size, 0));
+   nir_def *ex = nir_iadd(&c->b, nir_channel(&c->b, origin, 0), x), *ey = nir_iadd(&c->b, nir_channel(&c->b, origin, 1), y);
+   nir_def *elem = nir_iadd(&c->b, nir_imul(&c->b, ey, nir_channel(&c->b, dims, 0)), ex);
+   nir_def *src = nir_iadd(&c->b, nir_iadd(&c->b, nir_channel(&c->b, dims, 2), nir_imul_imm(&c->b, elem, bytes)), member);
+   nir_def *val = nir_load_shared(&c->b, comps, bits, src, .base = 0, .align_mul = bits / 8);
+   nir_def *tc[4] = { nir_iadd(&c->b, nir_channel(&c->b, coord, 0), x), nir_iadd(&c->b, nir_channel(&c->b, coord, 1), y),
+                      layer ? layer : nir_imm_int(&c->b, 0), nir_imm_int(&c->b, 0) };
+   nir_alu_type st = (ty[0] == 'f' ? nir_type_float : ty[0] == 'u' ? nir_type_uint : nir_type_int) | bits;
+   nir_image_store(&c->b, index, nir_vec(&c->b, tc, 4), nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, val, 4), lod,
+                   .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = is_array, .src_type = st);
+   nir_goto(&c->b, next);
+
+   c->b.cursor = nir_after_block(next);
+   nir_store_reg(&c->b, nir_iadd_imm(&c->b, nir_load_reg(&c->b, ireg), 1), ireg);
+   nir_goto(&c->b, head);
+
+   c->b.cursor = nir_after_block(done);
+   return true;
+}
+
 bool
 air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *name)
 {
@@ -2256,6 +2555,12 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       return discard_op(c, in);
    if (n.num >= 2 && (!strcmp(n.part[0], "load") || !strcmp(n.part[0], "store")) && !strcmp(n.part[1], "implicit_imageblock"))
       return imageblock_op(c, in, &n);
+   if (!strcmp(n.part[0], "imageblock_data"))
+      return imageblock_data_op(c, in);
+   if (!strcmp(n.part[0], "get_imageblock_width") || !strcmp(n.part[0], "get_imageblock_height"))
+      return imageblock_size_op(c, in, !strcmp(n.part[0], "get_imageblock_height"));
+   if (!strncmp(n.part[0], "write_imageblock_slice_to_texture_", 34))
+      return imageblock_write_op(c, in, &n);
 
    /* Bergamota: air.sincos / air.fast_sincos(x, ptr): returns sin(x) and stores cos(x) through the pointer (Mercury's fluidity shaders) */
    if (!strcmp(n.part[0], "sincos") || !strcmp(n.part[0], "fast_sincos")) {
@@ -2270,6 +2575,22 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       if (!air_store_ptr(c, pv->ptr, nir_fcos(&c->b, x), 0))
          return false;
       air_set(c, &in->base, air_val_ssa(c, nir_fsin(&c->b, x)));
+      return true;
+   }
+
+   /* Chlorophyll: air.is_uniform.<ty>(x): x is the same in every active lane of the SIMD group */
+   if (!strcmp(n.part[0], "is_uniform")) {
+      nir_def *x = air_get_ssa(c, in->operands[1]);
+      if (!x)
+         return false;
+      nir_def *r;
+      if (x->bit_size == 1)
+         r = nir_ior(&c->b, nir_vote_all(&c->b, 1, x), nir_inot(&c->b, nir_vote_any(&c->b, 1, x)));
+      else if (n.num > 1 && n.part[n.num - 1][0] != 'i' && strchr(n.part[n.num - 1], 'f'))
+         r = nir_vote_feq(&c->b, 1, x);
+      else
+         r = nir_vote_ieq(&c->b, 1, x);
+      air_set(c, &in->base, air_val_ssa(c, r));
       return true;
    }
 

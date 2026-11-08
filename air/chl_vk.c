@@ -192,6 +192,14 @@ static const struct chl_format chl_formats[] = {
     * QuartzCore builds its deep-colour pipelines in these whatever the device answers */
    /* bgmtl keeps these in their own memory and fills it from the surface's two planes */
    C(500, "MTLPixelFormatYCBCR8_420_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
+   /* the camera's still processing (FigColorCube) renders RGB into two-plane 4:2:0 YCbCr surfaces through these: bgmtl decodes
+    * the planes into the stand-in and encodes it back after a command buffer drew into it (bgRGB420WriteBack) */
+   C(540, "MTLPixelFormatRGB8_420_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
+   C(541, "MTLPixelFormatRGB8_422_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
+   C(542, "MTLPixelFormatRGB8_444_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
+   C(543, "MTLPixelFormatRGB10_420_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
+   C(544, "MTLPixelFormatRGB10_422_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
+   C(545, "MTLPixelFormatRGB10_444_2P (as RGBA8)", VK_FORMAT_R8G8B8A8_UNORM, 4),
    C(550, "MTLPixelFormatRGB10A8_2P_XR10 (as BGRA8)", VK_FORMAT_B8G8R8A8_UNORM, 4),
    C(552, "MTLPixelFormatBGRA10_XR (as RGBA16Float)", VK_FORMAT_R16G16B16A16_SFLOAT, 8),
    C(553, "MTLPixelFormatBGRA10_XR_sRGB (as RGBA16Float)", VK_FORMAT_R16G16B16A16_SFLOAT, 8),
@@ -304,7 +312,7 @@ struct chl_compute_pipeline {
    struct chl_stage_info cs;
    struct chl_layout layout;
    bool dynamic_threadgroup;
-   struct { unsigned threads[3]; unsigned shared; VkPipeline vk; } variant[CHL_COMPUTE_VARIANTS];
+   struct { unsigned threads[3]; unsigned shared; unsigned ib[2]; VkPipeline vk; } variant[CHL_COMPUTE_VARIANTS];
    unsigned n_variants;
    pthread_mutex_t lock;
 };
@@ -362,6 +370,7 @@ struct chl_cmdbuf {
    enum chl_encoder enc;
    struct chl_stage_bind bind[2];
    uint32_t tg_len[AIR_VK_BUFFER_SLOTS];
+   unsigned ib_size[2];   /* the compute encoder's imageblock size (setImageblockWidth:height:), 0 = the threadgroup's */
    struct chl_compute_pipeline *cp;
    struct chl_render_pipeline *rp;
    struct chl_depth_stencil *ds;
@@ -2208,6 +2217,7 @@ fill_info(struct chl_device *d, struct chl_pipeline_info *info, const struct chl
    memset(info, 0, sizeof(*info));
    info->max_threads_per_group = d->props.limits.maxComputeWorkGroupInvocations;
    info->thread_execution_width = 64;
+   info->imageblock_bytes = s0 ? s0->info.explicit_imageblock_bytes : 0;
    const struct chl_stage_info *st[2] = { s0, s1 };
    for (int i = 0; i < 2; i++) {
       if (!st[i] || !st[i]->nir)
@@ -2262,12 +2272,20 @@ fail:
 }
 
 static VkPipeline
-compute_variant(struct chl_compute_pipeline *p, const unsigned threads[3], unsigned dyn_shared, char *why, size_t why_size)
+compute_variant(struct chl_compute_pipeline *p, const unsigned threads[3], unsigned dyn_shared, const unsigned ib_in[2], char *why,
+                size_t why_size)
 {
    struct chl_device *d = p->o.dev;
+   /* an explicit imageblock (air_shader_info.explicit_imageblock_bytes): the encoder's size, else the threadgroup's */
+   unsigned ib[2] = { 0, 0 };
+   if (p->cs.info.explicit_imageblock_bytes) {
+      ib[0] = ib_in && ib_in[0] ? ib_in[0] : threads[0];
+      ib[1] = ib_in && ib_in[1] ? ib_in[1] : threads[1];
+   }
    pthread_mutex_lock(&p->lock);
    for (unsigned i = 0; i < p->n_variants; i++)
-      if (!memcmp(p->variant[i].threads, threads, sizeof(p->variant[i].threads)) && p->variant[i].shared == dyn_shared) {
+      if (!memcmp(p->variant[i].threads, threads, sizeof(p->variant[i].threads)) && p->variant[i].shared == dyn_shared &&
+          p->variant[i].ib[0] == ib[0] && p->variant[i].ib[1] == ib[1]) {
          VkPipeline v = p->variant[i].vk;
          pthread_mutex_unlock(&p->lock);
          return v;
@@ -2279,6 +2297,17 @@ compute_variant(struct chl_compute_pipeline *p, const unsigned threads[3], unsig
    cs->info.workgroup_size_variable = false;
    if (dyn_shared)
       cs->info.shared_size = cs->info.shared_size + dyn_shared;
+   if (p->cs.info.explicit_imageblock_bytes) {
+      air_lower_explicit_imageblock(cs, ib[0], ib[1], p->cs.info.explicit_imageblock_bytes);
+      if (cs->info.shared_size > d->props.limits.maxComputeSharedMemorySize) {
+         say(why, why_size, "%s: an imageblock of %ux%u x %u bytes needs %u bytes of threadgroup memory, %u there are",
+             p->cs.info.entry_point ? p->cs.info.entry_point : "the kernel", ib[0], ib[1], p->cs.info.explicit_imageblock_bytes,
+             cs->info.shared_size, d->props.limits.maxComputeSharedMemorySize);
+         ralloc_free(cs);
+         pthread_mutex_unlock(&p->lock);
+         return VK_NULL_HANDLE;
+      }
+   }
    VkPipelineShaderStageNirCreateInfoMESA nci = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA, NULL, cs };
    VkComputePipelineCreateInfo ci = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
                                       { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &nci, 0, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -2298,6 +2327,8 @@ compute_variant(struct chl_compute_pipeline *p, const unsigned threads[3], unsig
       d->vk.vkDestroyPipeline(d->dev, p->variant[slot].vk, NULL);   /* XXX: may be in flight; 8 sizes per kernel is plenty */
    memcpy(p->variant[slot].threads, threads, sizeof(p->variant[slot].threads));
    p->variant[slot].shared = dyn_shared;
+   p->variant[slot].ib[0] = ib[0];
+   p->variant[slot].ib[1] = ib[1];
    p->variant[slot].vk = v;
    pthread_mutex_unlock(&p->lock);
    return v;
@@ -2761,6 +2792,13 @@ chl_set_compute_pipeline(struct chl_cmdbuf *cb, struct chl_compute_pipeline *p)
 }
 
 void
+chl_set_imageblock_size(struct chl_cmdbuf *cb, unsigned width, unsigned height)
+{
+   cb->ib_size[0] = width;
+   cb->ib_size[1] = height;
+}
+
+void
 chl_set_threadgroup_memory(struct chl_cmdbuf *cb, unsigned index, size_t length)
 {
    if (index < AIR_VK_BUFFER_SLOTS)
@@ -2783,7 +2821,7 @@ chl_dispatch(struct chl_cmdbuf *cb, const unsigned groups[3], const unsigned thr
       for (unsigned i = 0; i < AIR_VK_BUFFER_SLOTS; i++)
          dyn += (cb->tg_len[i] + 15) & ~15u;
    TRACE("dispatch %s %ux%ux%u: compiling variant", p->cs.info.entry_point, threads[0], threads[1], threads[2]);
-   VkPipeline v = compute_variant(p, threads, dyn, why, why_size);
+   VkPipeline v = compute_variant(p, threads, dyn, cb->ib_size, why, why_size);
    if (!v)
       return -1;
    TRACE("variant ready, binding");

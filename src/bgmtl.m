@@ -586,6 +586,7 @@ struct bg_passdump;
    BOOL _surfCopy;       // an IOSurface the GPU could not import: own memory, refreshed from the surface at each use
    BOOL _xr2p;           // ... a two-plane RGB10A8_2P_XR10 one ('b3a8': XR10 RGB + A8 alpha), decoded into BGRA8 at each refresh
    BOOL _yuv420;         // ... a two-plane YCbCr 4:2:0 one ('420f', '420v'), its samples unpacked into RGBA8 at each refresh
+   BOOL _rgb420;         // ... and drawn into as RGB (MTLPixelFormatRGB8_420_2P 540, RGB10_420_2P 543): encoded back (bgRGB420WriteBack)
    uint32_t _surfSeed;   // the surface's seed at the last refresh (an unchanged surface is not copied again)
    BOOL _surfFresh;      // _surfSeed is valid: the surface was decoded or written back at least once (a seed may be 0)
    uint32_t _xrUses;     // uses since the last XR10 decode (bgmtl.xr10log)
@@ -612,6 +613,7 @@ struct bg_passdump;
 - (void)bgLinearPending:(int)delta;
 - (void)bgLinearWriteBack;
 - (BOOL)bgXR10WriteBack;
+- (BOOL)bgRGB420WriteBack;
 - (void)bgCopyWriteBack;
 - (void)bgCopyPending:(int)delta;
 - (void)bgRotFill;
@@ -765,7 +767,8 @@ bg_passdump_bpp(NSUInteger fmt)
    switch (fmt) {
    case 1: case 10: return 1;
    case 25: case 30: return 2;
-   case 65: case 70: case 71: case 80: case 81: case 90: case 92: case 94: case 550: return 4;
+   case 65: case 70: case 71: case 80: case 81: case 90: case 92: case 94: case 540: case 541: case 542: case 543: case 544: case 545:
+   case 550: return 4;
    case 115: return 8;
    case 125: return 16;
    default: return 0;
@@ -1746,6 +1749,7 @@ bg_pipeline_queue(void)
 - (NSUInteger)maxTotalThreadsPerThreadgroup { return _info.max_threads_per_group; }
 - (NSUInteger)threadExecutionWidth { return _info.thread_execution_width; }
 - (NSUInteger)staticThreadgroupMemoryLength { return _info.static_threadgroup_bytes; }
+- (NSUInteger)imageblockMemoryLengthForDimensions:(MTLSize)d { return (NSUInteger)_info.imageblock_bytes * d.width * d.height; }
 @end
 
 // ---- command queue / buffer / encoders -------------------------------------------------------------------------------
@@ -2297,6 +2301,7 @@ bg_idle_trim_schedule(void)
                          root->_xr2p ? "two-plane" : root->_surfCopy ? "copied" : "imported");
          if (root->_rot) continue;   // its own memory; its surface was written through its _rotPhys, also in _written
          if (root->_xr2p) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }
+         if (root->_rgb420) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }   // bgXR10WriteBack passes it on
          if (root->_surfCopy) { if (!copied) copied = [NSMutableSet set]; [copied addObject:root]; continue; }
          chl_texture_flush_surface([t chlTexture]);
          if ([t iosurface]) { if (!surfaces) surfaces = [NSMutableSet set]; [surfaces addObject:(id)[t iosurface]]; }
@@ -2393,10 +2398,18 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    self = [super initWithCommandBuffer:cb];
    if (!self) return nil;
    _cb = cb;
-   if ([cb bgChl]) chl_compute_begin(cb->_ccb);
+   if ([cb bgChl]) {
+      chl_compute_begin(cb->_ccb);
+      chl_set_imageblock_size(cb->_ccb, 0, 0);   // a new encoder: the threadgroup's size again
+   }
    return self;
 }
 - (id)device { return [_cb device]; }
+// an explicit imageblock's size for the dispatches that follow (the camera's still processing, NRF and CMImaging)
+- (void)setImageblockWidth:(NSUInteger)width height:(NSUInteger)height
+{
+   if (_cb->_ccb) chl_set_imageblock_size(_cb->_ccb, (unsigned)width, (unsigned)height);
+}
 - (void)setComputePipelineState:(id)state
 {
    _pipeline = state;
@@ -2618,13 +2631,13 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
          char why2[256];
          _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
          if (_tex) { _surfCopy = YES; _xr2p = YES; }
-      } else if (!_tex && [d pixelFormat] == 500 && IOSurfaceGetPlaneCount(sf) == 2) {
+      } else if (!_tex && ([d pixelFormat] == 500 || ([d pixelFormat] >= 540 && [d pixelFormat] <= 545)) && IOSurfaceGetPlaneCount(sf) == 2) {
          /* A picture CoreAnimation shows as it is (a decoded JPEG or HEIC, a video frame): luma in plane 0, Cb and Cr at half size in
           * plane 1. The texture gets its own RGBA8 memory and the samples are unpacked into it when the surface changes; the shader
           * does the colour conversion. */
          char why2[256];
          _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
-         if (_tex) { _surfCopy = YES; _yuv420 = YES; }
+         if (_tex) { _surfCopy = YES; _yuv420 = YES; _rgb420 = [d pixelFormat] != 500; }
          else snprintf(why, sizeof(why), "%s", why2);
       } else if (!_tex) {
          char why2[256];
@@ -2774,7 +2787,49 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
          unsigned w = MIN(_desc.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0)), h = MIN(_desc.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
          uint8_t *out = (p0 && p1 && w && h) ? malloc((size_t)w * h * 4) : NULL;
          uint64_t t0 = mach_absolute_time();
-         if (out) bg_yuv420_to_rgba(out, w, h, p0, r0, p1, r1, bg_surface_is_709(sf), IOSurfaceGetPixelFormat(sf) == '420v');
+         uint32_t sfmt = IOSurfaceGetPixelFormat(sf);
+         uint8_t *n0 = NULL, *n1 = NULL;
+         if (out && IOSurfaceGetBytesPerElementOfPlane(sf, 0) == 2) {
+            // Chlorophyll: 10 bits in 16-bit samples ('x420', 'xf20': the camera's): their high bytes, as 8-bit planes
+            unsigned cw = (w + 1) / 2 * 2, ch = (h + 1) / 2;
+            n0 = malloc((size_t)w * h);
+            n1 = malloc((size_t)cw * ch);
+            for (unsigned y = 0; n0 && y < h; y++)
+               for (unsigned x = 0; x < w; x++) n0[(size_t)y * w + x] = p0[y * r0 + 2 * x + 1];
+            for (unsigned y = 0; n1 && y < ch; y++)
+               for (unsigned x = 0; x < cw; x++) n1[(size_t)y * cw + x] = p1[y * r1 + 2 * x + 1];
+            if (n0 && n1) { p0 = n0; r0 = w; p1 = n1; r1 = cw; }
+         }
+         size_t cw1 = IOSurfaceGetWidthOfPlane(sf, 1), ch1 = IOSurfaceGetHeightOfPlane(sf, 1);
+         unsigned sx = cw1 && cw1 * 2 <= IOSurfaceGetWidthOfPlane(sf, 0) + 1 ? 2 : 1, sy = ch1 && ch1 * 2 <= IOSurfaceGetHeightOfPlane(sf, 0) + 1 ? 2 : 1;
+         BOOL video = sfmt == '420v' || sfmt == 'x420' || sfmt == '422v' || sfmt == 'x422' || sfmt == '444v' || sfmt == 'x444';
+         if (out && sx == 2 && sy == 2) {
+            bg_yuv420_to_rgba(out, w, h, p0, r0, p1, r1, bg_surface_is_709(sf), video);
+         } else if (out) {
+            // Chlorophyll: 4:2:2 / 4:4:4 (the camera's RGB8/RGB10_422/444_2P surfaces), texel by texel
+            BOOL is709 = bg_surface_is_709(sf);
+            const float kr = is709 ? 0.2126f : 0.299f, kb = is709 ? 0.0722f : 0.114f, kg = 1.f - kr - kb;
+            if (n0 && n1) { /* already 8-bit (the conversion above, made for 4:2:0 sizes, is redone here) */ }
+            BOOL wide = IOSurfaceGetBytesPerElementOfPlane(sf, 0) == 2;
+            const uint8_t *q0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *q1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
+            size_t s0 = IOSurfaceGetBytesPerRowOfPlane(sf, 0), s1 = IOSurfaceGetBytesPerRowOfPlane(sf, 1);
+            for (unsigned y = 0; y < h; y++)
+               for (unsigned x = 0; x < w; x++) {
+                  float Y = wide ? q0[y * s0 + 2 * x + 1] : q0[y * s0 + x];
+                  size_t ci = (y / sy) * s1 + (size_t)(x / sx) * 2 * (wide ? 2 : 1);
+                  float Cb = wide ? q1[ci + 1] : q1[ci], Cr = wide ? q1[ci + 3] : q1[ci + 1];
+                  if (video) { Y = (Y - 16.f) * 255.f / 219.f; Cb = (Cb - 128.f) * 255.f / 224.f; Cr = (Cr - 128.f) * 255.f / 224.f; }
+                  else { Cb -= 128.f; Cr -= 128.f; }
+                  float R = Y + 2.f * (1.f - kr) * Cr, B = Y + 2.f * (1.f - kb) * Cb, G = (Y - kr * R - kb * B) / kg;
+                  uint8_t *o = out + ((size_t)y * w + x) * 4;
+                  o[0] = (uint8_t)(R < 0 ? 0 : R > 255 ? 255 : R);
+                  o[1] = (uint8_t)(G < 0 ? 0 : G > 255 ? 255 : G);
+                  o[2] = (uint8_t)(B < 0 ? 0 : B > 255 ? 255 : B);
+                  o[3] = 255;
+               }
+         }
+         free(n0);
+         free(n1);
          uint64_t t1 = mach_absolute_time();
          BG_TRACE("YCbCr surface %u %ux%u rows %zu %zu seed %u: %llu ticks\n", IOSurfaceGetID(sf), w, h, r0, r1, seed, (unsigned long long)(t1 - t0));
          IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
@@ -2892,6 +2947,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 - (BOOL)bgXR10WriteBack
 {
    if (_parent) return [(BGMTLTexture *)_parent bgXR10WriteBack];
+   if (_rgb420) return [self bgRGB420WriteBack];
    if (!_xr2p || !_tex || !_surface) return NO;
    IOSurfaceRef sf = (IOSurfaceRef)_surface;
    unsigned w = MIN(_desc.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0)), h = MIN(_desc.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
@@ -2918,6 +2974,70 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
       if (bg_xr10log())
          bg_xr10_note("xr10 write-back surface %u tex %p %ux%u seed %u alpha %u", IOSurfaceGetID(sf), (void *)self, w, h, _surfSeed,
                       bg_alpha_count(px, (size_t)w * h));
+   }
+   free(px);
+   return YES;
+}
+
+// Chlorophyll: an RGB8_420_2P / RGB10_420_2P texture (the camera's FigColorCube draws into these) back into its two-plane 4:2:0
+// surface after a command buffer drew into it: luma per texel, chroma per two by two texels (their mean), the surface's matrix
+// (601 or 709) and range (video for '420v' and 'x420'); 8-bit samples, or 10 bits at the top of 16-bit ones.
+- (BOOL)bgRGB420WriteBack
+{
+   if (!_rgb420 || !_tex || !_surface) return NO;
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   unsigned w = MIN(_desc.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0)), h = MIN(_desc.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
+   uint8_t *px = (w && h) ? malloc((size_t)w * h * 4) : NULL;
+   if (!px) return YES;
+   char why[256] = { 0 };
+   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+   if (chl_texture_get(_tex, 0, 0, o, sz, px, w * 4, 0, why, sizeof(why)) != 0) { BG_LOG("RGB 4:2:0 write-back: %s\n", why); free(px); return YES; }
+   uint32_t fmt = IOSurfaceGetPixelFormat(sf);
+   BOOL video = fmt == '420v' || fmt == 'x420' || fmt == '422v' || fmt == 'x422' || fmt == '444v' || fmt == 'x444', is709 = bg_surface_is_709(sf),
+        wide = IOSurfaceGetBytesPerElementOfPlane(sf, 0) == 2;
+   size_t cw1 = IOSurfaceGetWidthOfPlane(sf, 1), ch1 = IOSurfaceGetHeightOfPlane(sf, 1);
+   const unsigned sx = cw1 && cw1 * 2 <= IOSurfaceGetWidthOfPlane(sf, 0) + 1 ? 2 : 1, sy = ch1 && ch1 * 2 <= IOSurfaceGetHeightOfPlane(sf, 0) + 1 ? 2 : 1;
+   const float kr = is709 ? 0.2126f : 0.299f, kb = is709 ? 0.0722f : 0.114f, kg = 1.f - kr - kb;
+   const float ys = video ? 219.f / 255.f : 1.f, yo = video ? 16.f : 0.f, cs = video ? 224.f / 255.f : 1.f;
+   if (IOSurfaceLock(sf, 0, NULL) == 0) {
+      uint8_t *p0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
+      size_t r0 = IOSurfaceGetBytesPerRowOfPlane(sf, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(sf, 1);
+      for (unsigned y = 0; p0 && p1 && y < h; y += sy) {
+         for (unsigned x = 0; x < w; x += sx) {
+            float sr = 0, sg = 0, sb = 0;
+            unsigned n = 0;
+            for (unsigned dy = 0; dy < sy && y + dy < h; dy++)
+               for (unsigned dx = 0; dx < sx && x + dx < w; dx++) {
+                  const uint8_t *s = px + ((size_t)(y + dy) * w + x + dx) * 4;
+                  float l = kr * s[0] + kg * s[1] + kb * s[2], v = yo + ys * l;
+                  int iv = (int)(v + 0.5f);
+                  iv = iv < 0 ? 0 : iv > 255 ? 255 : iv;
+                  if (wide) {
+                     uint16_t w16 = (uint16_t)(((iv * 1023 + 127) / 255) << 6);
+                     memcpy(p0 + (y + dy) * r0 + 2 * (x + dx), &w16, 2);
+                  } else {
+                     p0[(y + dy) * r0 + x + dx] = (uint8_t)iv;
+                  }
+                  sr += s[0]; sg += s[1]; sb += s[2]; n++;
+               }
+            sr /= n; sg /= n; sb /= n;
+            float l = kr * sr + kg * sg + kb * sb;
+            float cb = 128.f + cs * (sb - l) / (2.f * (1.f - kb)), cr = 128.f + cs * (sr - l) / (2.f * (1.f - kr));
+            int icb = (int)(cb + 0.5f), icr = (int)(cr + 0.5f);
+            icb = icb < 0 ? 0 : icb > 255 ? 255 : icb;
+            icr = icr < 0 ? 0 : icr > 255 ? 255 : icr;
+            if (wide) {
+               uint16_t c2[2] = { (uint16_t)(((icb * 1023 + 127) / 255) << 6), (uint16_t)(((icr * 1023 + 127) / 255) << 6) };
+               memcpy(p1 + (y / sy) * r1 + (size_t)(x / sx) * 4, c2, 4);
+            } else {
+               p1[(y / sy) * r1 + (size_t)(x / sx) * 2] = (uint8_t)icb;
+               p1[(y / sy) * r1 + (size_t)(x / sx) * 2 + 1] = (uint8_t)icr;
+            }
+         }
+      }
+      IOSurfaceUnlock(sf, 0, NULL);
+      _surfSeed = IOSurfaceGetSeed(sf);   // the surface now holds the texture: no decode back at the next use
+      _surfFresh = YES;
    }
    free(px);
    return YES;

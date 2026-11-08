@@ -137,6 +137,7 @@ struct chl_pipeline_info {
    uint32_t textures_used[2];
    uint32_t samplers_used[2];
    uint32_t argbufs[2];         /* [[buffer(n)]] that are argument buffers */
+   unsigned imageblock_bytes;   /* bytes an element of the kernel's explicit imageblock, 0 without one */
 };
 
 struct chl_compute_pipeline *chl_compute_pipeline_create(struct chl_device *dev, const struct chl_function *fn,
@@ -232,6 +233,8 @@ void chl_render_end(struct chl_cmdbuf *cb);
 void chl_compute_begin(struct chl_cmdbuf *cb);
 void chl_set_compute_pipeline(struct chl_cmdbuf *cb, struct chl_compute_pipeline *p);
 void chl_set_threadgroup_memory(struct chl_cmdbuf *cb, unsigned index, size_t length);
+/* the compute encoder's imageblock size for kernels with an explicit imageblock; 0, 0 = the threadgroup's (Metal's default) */
+void chl_set_imageblock_size(struct chl_cmdbuf *cb, unsigned width, unsigned height);
 int chl_dispatch(struct chl_cmdbuf *cb, const unsigned groups[3], const unsigned threads[3], char *why, size_t why_size);
 void chl_compute_end(struct chl_cmdbuf *cb);
 

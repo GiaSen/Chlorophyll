@@ -364,6 +364,14 @@ struct air_shader_info {
     * `image_index` (named "imageblock.rtN") that the runtime binds to that attachment. A function that declares an imageblock is translated as a
     * compute shader that runs once per tile: one workgroup per tile of the pass, workgroup size = threadsPerTile.
     */
+   /* Chlorophyll: an EXPLICIT imageblock of a compute kernel (`imageblock<T, layout_explicit>`: the camera's still processing,
+    * NRFV1 and CMImaging): per-threadgroup tile memory of imageblock width x height elements of `explicit_imageblock_bytes`
+    * each (air.imageblock_data_size). It becomes workgroup shared memory placed after all other threadgroup memory. Its width,
+    * height and byte base are known only when a dispatch gives the threadgroup and imageblock sizes, so the shader reads them
+    * from nir_load_ray_launch_size (x = width, y = height, z = byte base), which the runtime replaces with constants when it
+    * makes the dispatch's variant (air_lower_explicit_imageblock), growing shared_size by width * height * bytes. */
+   unsigned explicit_imageblock_bytes;
+
    unsigned num_imageblock;
    struct air_imageblock_member {
       unsigned render_target;   /* the attachment this member is `[[color(n)]]` of */
@@ -376,6 +384,11 @@ struct air_shader_info {
  * this; `air_resource.sampler` is what it returns.
  */
 struct air_sampler_state air_decode_sampler_state(uint64_t word);
+
+/* Chlorophyll: the explicit imageblock of a compute kernel (air_shader_info.explicit_imageblock_bytes) made concrete for one
+ * dispatch: its placeholder becomes (width, height, base) and shared_size grows to base + width * height * bytes. base is
+ * shared_size rounded up to 16. Returns false when the shader has no such placeholder left to replace (nothing done). */
+bool air_lower_explicit_imageblock(nir_shader *s, unsigned width, unsigned height, unsigned bytes);
 
 /* -- the translator --------------------------------------------------------- */
 

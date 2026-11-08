@@ -183,6 +183,7 @@ struct air_ctx {
    /* function-constant folding (Bergamota): see sc_eval in air_to_nir.c */
    struct hash_table *sc_memo;   /* air_value -> struct sc_val */
    bool has_imageblock;          /* the entry point takes an air.imageblock (tile function): see air_shader_info.imageblock */
+   bool has_explicit_imageblock; /* Chlorophyll: an explicit-layout imageblock of a compute kernel (air_shader_info.explicit_imageblock_bytes) */
    struct hash_table *sc_known;  /* program-scope global -> struct sc_val, after the static initializers ran */
    bool sc_known_ok;
    unsigned pk_used[2];   /* varying packing: components used in the last slot, [0] fragment inputs, [1] vertex outputs */
@@ -210,6 +211,10 @@ struct air_ctx {
     * emit_return tells the two apart.
     */
    struct hash_table *fns;
+   /* Chlorophyll: pointers stored into private memory (scratch) at a constant byte offset, by offset + 1: a later load of a
+    * pointer from there is answered with the stored one (air_scratch_ptr_store/air_scratch_ptr_load). NRF's kernels pack
+    * their textures and imageblock into structs on the stack before using them. */
+   struct hash_table *scratch_ptrs;
    nir_deref_instr *ret_deref;
 
    /* ... and, for a callee whose return type is a STRUCT, one out-parameter per
@@ -306,6 +311,9 @@ nir_def *air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_ty
                       unsigned align);
 bool air_store_ptr(struct air_ctx *c, struct air_ptr ptr, nir_def *value, unsigned align);
 struct air_resource *air_add_imageblock_resource(struct air_ctx *c, unsigned index, unsigned render_target);
+bool air_scratch_const_offset(const struct air_ptr *p, uint32_t *off);
+void air_scratch_ptr_store(struct air_ctx *c, uint32_t off, struct air_val *v);
+struct air_val *air_scratch_ptr_load(struct air_ctx *c, uint32_t off);
 struct air_ptr air_ptr_add(struct air_ctx *c, struct air_ptr ptr, nir_def *bytes);
 
 /* air.* and llvm.* calls; the result is set on the instruction by the callee */

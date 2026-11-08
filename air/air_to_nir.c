@@ -144,6 +144,13 @@ is_texture_choice(const struct air_val *a, const struct air_val *b)
    return is_texture_val(a, img) && is_texture_val(b, img);
 }
 
+/* Chlorophyll: a null texture (air.get_null_texture_*), which a texture choice may hold: it reads as zero */
+static bool
+null_ptr_val(const struct air_val *v)
+{
+   return v && v->kind == AIR_VAL_PTR && v->ptr.class == AIR_PTR_NONE;
+}
+
 /* one value, for a phi: the same resolution, or the very same chosen pointer */
 static bool
 same_val(const struct air_val *a, const struct air_val *b)
@@ -151,10 +158,13 @@ same_val(const struct air_val *a, const struct air_val *b)
    return a == b || (a->kind == AIR_VAL_PTR && b->kind == AIR_VAL_PTR && same_ptr(&a->ptr, &b->ptr));
 }
 
-/* ... and the register that says which one came in, true for `first` */
+/* ... and the register that says which one came in: Chlorophyll, the index of the candidate (up to 8; NRF's BlinkDetection
+ * chooses among four bands), 32 bits */
 struct air_texture_phi {
    nir_def *reg;
    struct air_val *first;
+   struct air_val *cand[8];
+   unsigned n;
 };
 
 /* Chlorophyll: a phi of pointers into ONE buffer at offsets that differ -- a loop walking a buffer (`p = phi [base], [p +
@@ -604,6 +614,87 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
 }
 
 /* -- memory ------------------------------------------------------------- */
+
+/* Chlorophyll: pointers kept in private memory at translation time (air_ctx.scratch_ptrs). Sound for what the camera's
+ * kernels do -- a struct of pointers filled at the top of the kernel and read below -- and NOT for a slot written on two
+ * paths with different pointers: the last store translated wins. */
+/* a scalar integer def made of constants by adds, multiplies, shifts and conversions (a GEP's offset before folding) */
+static bool
+const_int_of(nir_def *d, uint64_t *out, unsigned depth)
+{
+   if (depth > 16 || d->num_components != 1)
+      return false;
+   if (nir_src_is_const(nir_src_for_ssa(d))) {
+      *out = nir_src_as_uint(nir_src_for_ssa(d));
+      return true;
+   }
+   nir_instr *in = nir_def_instr(d);
+   if (in->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(in);
+   uint64_t a = 0, b = 0;
+   unsigned n = nir_op_infos[alu->op].num_inputs;
+   for (unsigned i = 0; i < n; i++) {
+      if (alu->src[i].src.ssa->num_components != 1 || alu->src[i].swizzle[0] != 0)
+         return false;
+      if (!const_int_of(alu->src[i].src.ssa, i ? &b : &a, depth + 1))
+         return false;
+   }
+   switch (alu->op) {
+   case nir_op_mov: case nir_op_u2u32: case nir_op_u2u64: case nir_op_i2i32: case nir_op_i2i64: *out = a; break;
+   case nir_op_iadd: *out = a + b; break;
+   case nir_op_imul: *out = a * b; break;
+   case nir_op_ishl: *out = a << (b & 63); break;
+   default: return false;
+   }
+   *out &= d->bit_size == 64 ? ~0ull : (1ull << d->bit_size) - 1;
+   return true;
+}
+
+bool
+air_scratch_const_offset(const struct air_ptr *p, uint32_t *off)
+{
+   if (p->class != AIR_PTR_SCRATCH)
+      return false;
+   if (!p->offset) {
+      *off = 0;
+      return true;
+   }
+   uint64_t v;
+   if (!const_int_of(p->offset, &v, 0))
+      return false;
+   *off = (uint32_t)v;
+   return true;
+}
+
+void
+air_scratch_ptr_store(struct air_ctx *c, uint32_t off, struct air_val *v)
+{
+   if (!c->scratch_ptrs)
+      c->scratch_ptrs = _mesa_pointer_hash_table_create(c->mem_ctx);
+   _mesa_hash_table_insert(c->scratch_ptrs, (void *)(uintptr_t)(off + 1), v);
+}
+
+struct air_val *
+air_scratch_ptr_load(struct air_ctx *c, uint32_t off)
+{
+   struct hash_entry *e = c->scratch_ptrs ? _mesa_hash_table_search(c->scratch_ptrs, (void *)(uintptr_t)(off + 1)) : NULL;
+   struct air_val *v = e ? e->data : NULL;
+   /* a pointer at a constant offset is made again where it is loaded (perhaps a callee: a def of another function cannot be
+    * used); one at a computed offset only in the function that stored it */
+   uint64_t k;
+   if (v && v->kind == AIR_VAL_PTR && v->ptr.offset) {
+      if (const_int_of(v->ptr.offset, &k, 0)) {
+         struct air_val *pv = rzalloc(c->mem_ctx, struct air_val);
+         *pv = *v;
+         pv->ptr.offset = nir_imm_int(&c->b, (uint32_t)k);
+         return pv;
+      }
+      if (nir_cf_node_get_function(&nir_def_block(v->ptr.offset)->cf_node) != c->b.impl)
+         return NULL;
+   }
+   return v;
+}
 
 struct air_ptr
 air_ptr_add(struct air_ctx *c, struct air_ptr ptr, nir_def *bytes)
@@ -1920,8 +2011,26 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          return air_error(c, "interface: air.imageblock in a %s shader", mesa_shader_stage_name(c->nir->info.stage));
       int ik = md_key(node, "air.imageblock");
       const char *layout = md_str(node, ik + 1);
+      if (layout && !strcmp(layout, "explicit")) {
+         /* Chlorophyll: a compute kernel's own tile memory (air_shader_info.explicit_imageblock_bytes); its accesses are the
+          * intrinsics air.imageblock_data, air.get_imageblock_width/height and air.write_imageblock_slice_to_texture_* */
+         uint64_t bytes = 0;
+         if (!md_key_int(node, "air.imageblock_data_size", &bytes) || !bytes || bytes > 256)
+            return air_error(c, "interface: an explicit imageblock of %u bytes an element", (unsigned)bytes);
+         if (c->has_explicit_imageblock)
+            return air_error(c, "interface: a second explicit imageblock");
+         c->info->explicit_imageblock_bytes = (unsigned)bytes;
+         c->has_explicit_imageblock = true;
+         /* the argument is metal::_imageblock_base, { ptr addrspace(4) }: some kernels copy it into a struct of their own
+          * (NRF's kernelRec709Downsample*); its pointer is the imageblock's first element. Its accesses are intrinsics. */
+         struct air_val *agg = air_val_agg(c, 1);
+         struct air_ptr none = { .class = AIR_PTR_NONE };   /* a handle: nothing is read through it */
+         agg->elems[0] = air_val_ptr(c, none);
+         c->params[param] = agg;
+         return true;
+      }
       if (!layout || strcmp(layout, "implicit"))
-         return air_error(c, "interface: an imageblock with layout %s (only implicit)", layout ? layout : "?");
+         return air_error(c, "interface: an imageblock with layout %s (only implicit and explicit)", layout ? layout : "?");
       int sk = md_key(node, "air.struct_type_info");
       const struct air_md *si = sk >= 0 && sk + 1 < (int)node->num_ops && node->ops[sk + 1] && node->ops[sk + 1]->kind == AIR_MD_NODE ? node->ops[sk + 1] : NULL;
       if (!si)
@@ -1966,6 +2075,29 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          .binding = index,
          .is_image = write,
       };
+      /* Chlorophyll: `array<texture2d<...>, N>` (location_index, first slot, N): the argument is a private array of N texture
+       * handles (NRF's kernelFuse* and kernelHighlightRecovery). Element k is the texture at slot first + k; the handles sit in
+       * the translation-time pointer table (air_ctx.scratch_ptrs) at offsets no real private memory has, so that a load of
+       * element k at a constant index resolves to it. */
+      uint64_t count = 1;
+      int lk = md_key(node, "air.location_index");
+      if (lk >= 0)
+         md_int(node, lk + 2, &count);
+      if (count > 1 && t->kind == AIR_TYPE_POINTER && t->addrspace == 0) {
+         if (count > 16 || index + count > 32)
+            return air_error(c, "interface: an array of %u textures from slot %u", (unsigned)count, (unsigned)index);
+         uint32_t base = 0x10000000u + param * 0x100u;
+         for (unsigned k = 0; k < count; k++) {
+            struct air_ptr e = p;
+            e.binding = (unsigned)index + k;
+            add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, (unsigned)index + k, 0, sample || read, write, param,
+                         node);
+            air_scratch_ptr_store(c, base + 8 * k, air_val_ptr(c, e));
+         }
+         struct air_ptr a = { .class = AIR_PTR_SCRATCH, .offset = nir_imm_int(&c->b, (int)base) };
+         c->params[param] = air_val_ptr(c, a);
+         return true;
+      }
       add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
                    sample || read, write, param, node);
       c->params[param] = air_val_ptr(c, p);
@@ -2535,6 +2667,17 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
       return true;
    }
 
+   /* Chlorophyll: ptrtoint of a resolved pointer, and inttoptr of one, keep the pointer as it is: NRF's Yuv420Sampler holds
+    * its texture as an i64 (ptrtoint, stored, loaded, inttoptr back). Arithmetic on such a value still stops at "a pointer
+    * where a number belongs". */
+   if (in->sub == AIR_CAST_PTRTOINT || in->sub == AIR_CAST_INTTOPTR) {
+      struct air_val *v = air_get(c, in->operands[0]);
+      if (v && (v->kind == AIR_VAL_PTR || v->kind == AIR_VAL_PTR_SELECT)) {
+         air_set(c, &in->base, v);
+         return true;
+      }
+   }
+
    nir_def *x = air_get_ssa(c, in->operands[0]);
    if (!x)
       return false;
@@ -3059,6 +3202,42 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
          air_set(c, &in->base, res);
          return true;
       }
+      /* Chlorophyll: a pointer read back from private memory where one was stored (air_ctx.scratch_ptrs) */
+      if (in->base.type && (in->base.type->kind == AIR_TYPE_POINTER ||
+                            (in->base.type->kind == AIR_TYPE_INT && in->base.type->bits == 64)) &&
+          p->ptr.class == AIR_PTR_SCRATCH) {
+         uint32_t off;
+         struct air_val *kept = air_scratch_const_offset(&p->ptr, &off) ? air_scratch_ptr_load(c, off) : NULL;
+         if (kept) {
+            air_set(c, &in->base, kept);
+            return true;
+         }
+         /* Chlorophyll: a texture handle at an offset known only at run time (NRF's fusion shaders index their texture arrays
+          * by a loop variable, inside a callee): a choice among every texture handle kept, by the offset (the texture operation
+          * is then made on each, texture_op_chosen) */
+         if (p->ptr.offset && !air_scratch_const_offset(&p->ptr, &off) && c->scratch_ptrs && in->base.type->kind == AIR_TYPE_POINTER) {
+            uint32_t keys[64];
+            struct air_val *vals[64];
+            unsigned nk = 0;
+            hash_table_foreach(c->scratch_ptrs, e) {
+               struct air_val *v = e->data;
+               if (!v || v->kind != AIR_VAL_PTR || (v->ptr.class != AIR_PTR_TEXTURE && v->ptr.class != AIR_PTR_NONE))
+                  continue;
+               if (nk == 64)
+                  return air_error(c, "instruction: a texture chosen at run time among more than 64");
+               keys[nk] = (uint32_t)((uintptr_t)e->key - 1);
+               vals[nk++] = v;
+            }
+            if (nk) {
+               nir_def *o = air_u2u32(&c->b, p->ptr.offset);
+               struct air_val *chain = vals[nk - 1];
+               for (int q = (int)nk - 2; q >= 0; q--)
+                  chain = air_val_ptr_select(c, nir_ieq_imm(&c->b, o, keys[q]), vals[q], chain);
+               air_set(c, &in->base, chain);
+               return true;
+            }
+         }
+      }
       nir_def *res = air_load_ptr(c, p->ptr, in->base.type, in->align);
       if (!res)
          return false;
@@ -3091,8 +3270,12 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
           * custom_fn copies its texture into a struct and never reads that member), and
           * the one way to need the value back, loading the pointer, air_load_ptr refuses.
           */
-         if (p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_SCRATCH)
+         if (p->kind == AIR_VAL_PTR && p->ptr.class == AIR_PTR_SCRATCH) {
+            uint32_t off;
+            if (air_scratch_const_offset(&p->ptr, &off))
+               air_scratch_ptr_store(c, off, sv);   /* kept for a load of it (air_ctx.scratch_ptrs) */
             return true;
+         }
          return air_error(c, "instruction: a store of a pointer into memory, which this "
                              "frontend has no address to write");
       }
@@ -3828,7 +4011,10 @@ agg_rebuild(struct air_ctx *c, const struct air_val *v, unsigned *pidx)
 static bool
 ptr_offset_arg(struct air_val **argv, unsigned i)
 {
-   return argv && argv[i] && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset;
+   /* Chlorophyll: a constant offset is not passed but made again inside the callee (translate_callee), so that loads of
+    * pointers kept in private memory (air_ctx.scratch_ptrs) still see a constant there */
+   return argv && argv[i] && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset &&
+          !nir_src_is_const(nir_src_for_ssa(argv[i]->ptr.offset));
 }
 
 /* Chlorophyll: the body of a function the stage only declares, from a module the pipeline links in. The stage's
@@ -4157,6 +4343,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          }
          if (agg_arg(argv, i)) {
             air_set(c, &f->args[i], agg_rebuild(c, argv[i], &aidx));   /* the leaves are this function's own parameters */
+            continue;
+         }
+         if (argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
+            /* a constant offset (ptr_offset_arg): the same constant, made in this function */
+            struct air_val *pv = clone_val(c, argv[i]);
+            pv->ptr.offset = nir_imm_int(&c->b, (uint32_t)nir_src_as_uint(nir_src_for_ssa(argv[i]->ptr.offset)));
+            air_set(c, &f->args[i], pv);
             continue;
          }
          air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
@@ -4536,6 +4729,8 @@ static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable, const int *fold, unsigned phi_block)
 {
    struct air_val *first = NULL, *second = NULL;
+   struct air_val *cand[8];
+   unsigned ncand = 0;
    bool loop_edge = false, offsets_differ = false;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
@@ -4557,13 +4752,20 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
                              "%s", v && v->kind == AIR_VAL_PTR_SELECT
                                       ? "itself a pointer chosen at run time"
                                       : "not a resolved pointer");
-      if (!first)
+      bool seen = false;
+      for (unsigned q = 0; q < ncand; q++)
+         seen |= same_val(cand[q], v);
+      if (!first) {
          first = v;
-      else if (same_val(first, v) || (second && same_val(second, v)))
+         cand[ncand++] = v;
+      } else if (seen)
          continue;
-      else if (!second && is_texture_choice(first, v))
-         second = v;
-      else if (same_resource(first, v) && offset_is_a_value(first->ptr.class))
+      else if ((is_texture_choice(first, v) || (null_ptr_val(first) && is_texture_val(v, texture_val_is_image(v))) ||
+                (null_ptr_val(v) && is_texture_val(first, texture_val_is_image(first)))) && ncand < 8 && !offsets_differ) {
+         if (!second)
+            second = v;
+         cand[ncand++] = v;
+      } else if (same_resource(first, v) && offset_is_a_value(first->ptr.class))
          offsets_differ = true;   /* Chlorophyll: one buffer, two offsets: the offset is carried */
       else
          return air_error(c, "instruction: a phi between pointers that name different "
@@ -4596,10 +4798,17 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
        */
       nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
       struct air_texture_phi *tp = rzalloc(c->mem_ctx, struct air_texture_phi);
-      tp->reg = nir_decl_reg(&entry, 1, 1, 0);
+      tp->reg = nir_decl_reg(&entry, 1, 32, 0);
       tp->first = first;
+      tp->n = ncand;
+      memcpy(tp->cand, cand, ncand * sizeof(cand[0]));
       _mesa_hash_table_insert(c->phi_regs, (void *)((uintptr_t)in | 2), tp);
-      air_set(c, &in->base, air_val_ptr_select(c, nir_load_reg(&c->b, tp->reg), first, second));
+      /* the choice as a chain: index 0 ? cand0 : (index 1 ? cand1 : ...); each texture operation is made on every one */
+      nir_def *idx = nir_load_reg(&c->b, tp->reg);
+      struct air_val *chain = cand[ncand - 1];
+      for (int q = (int)ncand - 2; q >= 0; q--)
+         chain = air_val_ptr_select(c, nir_ieq_imm(&c->b, idx, q), cand[q], chain);
+      air_set(c, &in->base, chain);
       return true;
    }
    air_set(c, &in->base, first);
@@ -4864,8 +5073,14 @@ translate_body(struct air_ctx *c)
                struct air_val *av = air_get(c, in->operands[k]);
                if (!av || !val_is_pointerish(av))
                   return air_error(c, "instruction: a phi of two textures with an operand that is not one");
+               unsigned which = tp->n;
+               for (unsigned q = 0; q < tp->n && which == tp->n; q++)
+                  if (same_val(tp->cand[q], av))
+                     which = q;
+               if (which == tp->n)
+                  return air_error(c, "instruction: a phi of textures with an operand that is none of them");
                c->b.cursor = *(nir_cursor *)ce->data;
-               nir_store_reg(&c->b, nir_imm_bool(&c->b, same_val(tp->first, av)), tp->reg);
+               nir_store_reg(&c->b, nir_imm_int(&c->b, (int)which), tp->reg);
                *(nir_cursor *)ce->data = c->b.cursor;
             }
             continue;
@@ -5538,4 +5753,32 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    if (error)
       *error = NULL;
    return c.nir;
+}
+
+/* Chlorophyll: see air_shader_info.explicit_imageblock_bytes */
+struct explicit_ib {
+   unsigned w, h, base;
+   bool any;
+};
+
+static bool
+lower_explicit_ib(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_ray_launch_size)
+      return false;
+   struct explicit_ib *l = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_ivec3(b, (int)l->w, (int)l->h, (int)l->base));
+   l->any = true;
+   return true;
+}
+
+bool
+air_lower_explicit_imageblock(nir_shader *s, unsigned width, unsigned height, unsigned bytes)
+{
+   struct explicit_ib l = { width, height, (s->info.shared_size + 15) & ~15u, false };
+   nir_shader_intrinsics_pass(s, lower_explicit_ib, nir_metadata_control_flow, &l);
+   if (l.any)
+      s->info.shared_size = l.base + width * height * bytes;
+   return l.any;
 }
