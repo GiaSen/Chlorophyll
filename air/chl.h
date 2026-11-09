@@ -56,6 +56,10 @@ const char *chl_device_name(const struct chl_device *dev);
 
 /* ---- buffers: host-visible, coherent, mapped for their whole life ---- */
 struct chl_buffer *chl_buffer_create(struct chl_device *dev, size_t size, char *why, size_t why_size);
+/* Chlorophyll: an IOSurface's memory as a buffer, no copy (not mapped here: the processor uses the surface's own mapping);
+ * flush_surface moves the processor's cache lines out (before the GPU reads) and in (after it wrote) */
+struct chl_buffer *chl_buffer_from_iosurface(struct chl_device *dev, int surface_id, size_t length, char *why, size_t why_size);
+int chl_buffer_flush_surface(struct chl_buffer *buf);
 void *chl_buffer_contents(struct chl_buffer *buf);
 size_t chl_buffer_length(const struct chl_buffer *buf);
 uint64_t chl_buffer_gpu_address(const struct chl_buffer *buf);

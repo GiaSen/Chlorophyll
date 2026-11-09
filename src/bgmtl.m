@@ -190,6 +190,15 @@ bg_trace(void)
 }
 #define BG_TRACE(...) do { if (bg_trace()) bg_log(__VA_ARGS__); } while (0)
 
+// the mean of 16-bit samples, every 61st (the trace's look at the camera's 10-bit planes: all zero or a picture)
+static unsigned
+bg_mean16(const uint16_t *p, size_t n)
+{
+   uint64_t sum = 0, k = 0;
+   for (size_t i = 0; p && i < n; i += 61, k++) sum += p[i];
+   return k ? (unsigned)(sum / k) : 0;
+}
+
 // /private/var/tmp/bgmtl.xr10log: into bgmtl.log, one line per two-plane XR10 surface wrapped, written back and decoded (surface
 // ID, texture, seed, texels with alpha), and per IOSurface texture refused. Its own switch: the trace's can be hidden by the
 // kernel's sweetdenypath (and traces a lot more).
@@ -491,8 +500,12 @@ bg_install_fallback(Class c)
    NSUInteger _length;
    void *_mapped;                               // the GPU memory when _contents is a caller's (newBufferWithBytesNoCopy)
    void (^_deallocator)(void *, NSUInteger);
+   CFTypeRef _surface;                          // newBufferWithIOSurface: the surface (retained), whose memory this is
+   BOOL _surfImported;                          // ... imported as it is (else _mapped is a copy, as for bytesNoCopy)
 }
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device length:(NSUInteger)length;
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device iosurface:(IOSurfaceRef)surface;
+- (void)bgAfterGPU;  // a command buffer that bound it completed: what the GPU wrote, visible to the processor
 - (instancetype)initWithBGDevice:(BGMTLDevice *)device bytesNoCopy:(void *)p length:(NSUInteger)length deallocator:(void (^)(void *, NSUInteger))dealloc;
 - (struct chl_buffer *)chlBuffer;
 - (void)bgRefresh;   // a no-copy buffer: the caller's bytes into the GPU memory (at commit)
@@ -505,6 +518,7 @@ bg_install_fallback(Class c)
    BGMTLDevice *_owner;
    struct chl_compute_pipeline *_p;
    struct chl_pipeline_info _info;
+   char _name[64];                                     // the kernel's name (the trace's dispatch lines)
 }
 @end
 
@@ -575,6 +589,7 @@ struct bg_passdump;
    CFTypeRef _surface;   // retained IOSurface, when the memory is one
    NSUInteger _plane;
    @public
+   unsigned _askedUsage; // the usage the client asked for (_desc.usage gains RenderTarget | ShaderRead on an IOSurface)
    BOOL _memoryless;     // made with MTLStorageModeMemoryless (see bg_ml_mode)
    id _linSrc;           // newLinearTextureWithDescriptor: the buffer whose bytes this texture shows (retained)
    NSUInteger _linOff, _linBpr;
@@ -586,6 +601,9 @@ struct bg_passdump;
    BOOL _surfCopy;       // an IOSurface the GPU could not import: own memory, refreshed from the surface at each use
    BOOL _xr2p;           // ... a two-plane RGB10A8_2P_XR10 one ('b3a8': XR10 RGB + A8 alpha), decoded into BGRA8 at each refresh
    BOOL _yuv420;         // ... a two-plane YCbCr 4:2:0 one ('420f', '420v'), its samples unpacked into RGBA8 at each refresh
+   unsigned char _pk10;  // ... one plane of a packed 10-bit surface ('pf20') as R10Unorm_PACKED (1) or RG10Unorm_PACKED (2): unpacked
+                         //     into R16Unorm / RG16Unorm at each refresh, packed back after a command buffer wrote it; or (3) the
+                         //     whole surface as YCBCR10_420_2P_PACKED(_XR), into RGBA16Unorm holding Y, Cb, Cr, 1
    BOOL _rgb420;         // ... and drawn into as RGB (MTLPixelFormatRGB8_420_2P 540, RGB10_420_2P 543): encoded back (bgRGB420WriteBack)
    BGMTLTexture *_yccY, *_yccC;   // ... its surface's luma and chroma planes as GPU images (bgYccTwins): encoded on the GPU at commit
    BOOL _yccGPU;         // ... and this command buffer's encode was made on the GPU (no CPU write-back after it)
@@ -615,6 +633,10 @@ struct bg_passdump;
 - (void)bgLinearPending:(int)delta;
 - (void)bgLinearWriteBack;
 - (BOOL)bgXR10WriteBack;
+- (const uint8_t *)bgPk10Plane:(unsigned *)w rows:(unsigned *)h samples:(unsigned *)n;
+- (BOOL)bgPk10WriteBack;
+- (BOOL)bgYcc10Geometry:(unsigned *)w rows:(unsigned *)h chromaRows:(unsigned *)ch luma:(const uint8_t **)py row:(size_t *)ry
+                 chroma:(const uint8_t **)pc row:(size_t *)rc;
 - (BOOL)bgRGB420WriteBack;
 - (BOOL)bgYccTwins;
 - (void)bgCopyWriteBack;
@@ -1252,6 +1274,14 @@ bg_air_slice(NSData *d)
    return [[BGMTLBuffer alloc] initWithBGDevice:self length:length];
 }
 
+// Chlorophyll: a buffer over an IOSurface's memory (MTLDeviceSPI). The camera's noise reduction (NRFV1) asks for it when a photo is
+// taken: as an unrecognised selector, CMImaging's CMMTLDevice threw and cameracaptured aborted (2026-11-09).
+- (id)newBufferWithIOSurface:(IOSurfaceRef)surface
+{
+   if (!surface) return nil;
+   return [[BGMTLBuffer alloc] initWithBGDevice:self iosurface:surface];
+}
+
 - (id)newBufferWithBytesNoCopy:(void *)p length:(NSUInteger)length options:(NSUInteger)options deallocator:(void (^)(void *, NSUInteger))dealloc
 {
    (void)options;
@@ -1502,6 +1532,7 @@ bg_deny_list(void)
    p->_owner = self;
    p->_p = c;
    p->_info = info;
+   snprintf(p->_name, sizeof(p->_name), "%s", [[function name] UTF8String] ?: "?");
    BG_LOG("pipeline %s: buffers %#x textures %#x samplers %#x\n", [[function name] UTF8String], info.buffers_used[0], info.textures_used[0],
           info.samplers_used[0]);
    return p;
@@ -1715,6 +1746,36 @@ bg_pipeline_queue(void)
    memcpy(_mapped, p, length);
    return self;
 }
+// newBufferWithIOSurface: the surface's memory imported as it is; contents is the surface's own mapping. When the import is
+// refused (another process's read-only client memory), a copy refreshed at each commit, as for bytesNoCopy.
+- (instancetype)initWithBGDevice:(BGMTLDevice *)device iosurface:(IOSurfaceRef)sf
+{
+   size_t len = IOSurfaceGetAllocSize(sf);
+   char why[256] = { 0 };
+   struct chl_buffer *b = [device chl] && len ? chl_buffer_from_iosurface([device chl], (int)IOSurfaceGetID(sf), len, why, sizeof(why)) : NULL;
+   if (!b) {
+      BG_LOG("buffer over IOSurface %u (%zu bytes) copied: %s\n", IOSurfaceGetID(sf), len, why);
+      self = [self initWithBGDevice:device length:len];
+      if (!self) return nil;
+      _mapped = _contents;
+      _contents = IOSurfaceGetBaseAddress(sf);
+      _surface = CFRetain(sf);
+      if (_contents) memcpy(_mapped, _contents, len);
+      return self;
+   }
+   self = [super init];
+   if (!self) { chl_buffer_release(b); return nil; }
+   _buf = b;
+   _owner = device;
+   _length = len;
+   _contents = IOSurfaceGetBaseAddress(sf);
+   _surface = CFRetain(sf);
+   _surfImported = YES;
+   __atomic_add_fetch(&g_bg_buf_n, 1, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&g_bg_buf_bytes, (long)len, __ATOMIC_RELAXED);
+   BG_TRACE("buffer over IOSurface %u: %zu bytes, imported\n", IOSurfaceGetID(sf), len);
+   return self;
+}
 - (void)dealloc
 {
    if (_buf) {
@@ -1723,11 +1784,23 @@ bg_pipeline_queue(void)
       __atomic_sub_fetch(&g_bg_buf_bytes, (long)_length, __ATOMIC_RELAXED);
    }
    if (_deallocator) { _deallocator(_contents, _length); Block_release(_deallocator); }
+   if (_surface) CFRelease(_surface);
    [super dealloc];
 }
 - (struct chl_buffer *)chlBuffer { return _buf; }
-- (BOOL)bgIsNoCopy { return _mapped != NULL; }
-- (void)bgRefresh { if (_mapped && _contents) memcpy(_mapped, _contents, _length); }
+- (BOOL)bgIsNoCopy { return _mapped != NULL || _surfImported; }
+- (void)bgRefresh
+{
+   if (_surfImported) { chl_buffer_flush_surface(_buf); return; }   // the processor's writes out of its caches
+   if (_mapped && _contents) memcpy(_mapped, _contents, _length);
+}
+- (void)bgAfterGPU
+{
+   if (!_surfImported) return;
+   chl_buffer_flush_surface(_buf);   // stale lines out, so the processor reads what the GPU wrote
+   IOSurfaceLock((IOSurfaceRef)_surface, 0, NULL);   // a write lock moves the seed: consumers cache by it
+   IOSurfaceUnlock((IOSurfaceRef)_surface, 0, NULL);
+}
 - (void *)contents { return _contents; }
 - (NSUInteger)length { return _length; }
 - (id)device { return _owner; }
@@ -2416,6 +2489,7 @@ bg_idle_trim_schedule(void)
       [t bgLinearPending:-1];
    }
    [_linWritten removeAllObjects];
+   if (_status == 4) for (BGMTLBuffer *b in _noCopy) [b bgAfterGPU];   // buffers over IOSurfaces: the GPU's writes to the processor
    // What the GPU wrote into an IOSurface becomes visible to the processor (and to a compositor reading it) before the drawable
    // is presented. In the compositor (BGMTL_BB) the surfaces drawn into are its own framebuffers, which the CPU never reads: no
    // cache clean there. A GPU write does not move an IOSurface's seed but consumers cache by it, so a write lock/unlock bumps it.
@@ -2429,7 +2503,7 @@ bg_idle_trim_schedule(void)
                          IOSurfaceGetWidth((IOSurfaceRef)[t iosurface]), IOSurfaceGetHeight((IOSurfaceRef)[t iosurface]), (unsigned long)[root pixelFormat],
                          root->_xr2p ? "two-plane" : root->_surfCopy ? "copied" : "imported");
          if (root->_rot) continue;   // its own memory; its surface was written through its _rotPhys, also in _written
-         if (root->_xr2p) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }
+         if (root->_xr2p || root->_pk10) { if (!xr) xr = [NSMutableSet set]; [xr addObject:root]; continue; }
          if (root->_rgb420 && root->_yccGPU) {
             // encoded on the GPU at commit (bgYccWriteBacks): its planes' lines out of the caches, the seed moved
             root->_yccGPU = NO;
@@ -2563,7 +2637,21 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 }
 - (void)setBuffers:(const id *)b offsets:(const NSUInteger *)o withRange:(NSRange)r
 { for (NSUInteger k = 0; k < r.length; k++) [self setBuffer:b[k] offset:o[k] atIndex:r.location + k]; }
-- (void)setTexture:(id)t atIndex:(NSUInteger)i { bg_bind_texture(_cb, CHL_STAGE_COMPUTE, i, t); if (t) [_cb bgWrote:(BGMTLTexture *)t]; }
+- (void)setTexture:(id)t atIndex:(NSUInteger)i
+{
+   if (t && bg_trace()) {
+      id s = [t respondsToSelector:@selector(iosurface)] ? [(BGMTLTexture *)t iosurface] : nil;
+      BG_LOG("setComputeTexture %lu: %lux%lu fmt %lu surface %u\n", (unsigned long)i, (unsigned long)[(id<MTLTexture>)t width],
+             (unsigned long)[(id<MTLTexture>)t height], (unsigned long)[(id<MTLTexture>)t pixelFormat], s ? (unsigned)IOSurfaceGetID((IOSurfaceRef)s) : 0);
+   }
+   bg_bind_texture(_cb, CHL_STAGE_COMPUTE, i, t);
+   // a texture made for reading only (usage ShaderRead, no ShaderWrite or RenderTarget) is not written: no write-back at the commit
+   // and not its surface's last writer. VideoToolbox's Metal transfer reads each camera frame as RGB over YCbCr (format 540) this
+   // way, and writing that frame back took two full-size passes a frame and ran the preview at 6 frames a second.
+   NSUInteger u = t ? ((BGMTLTexture *)t)->_askedUsage : 0;
+   if (t && (u == MTLTextureUsageUnknown || (u & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))))
+      [_cb bgWrote:(BGMTLTexture *)t];
+}
 - (void)setTextures:(const id *)t withRange:(NSRange)r { for (NSUInteger k = 0; k < r.length; k++) [self setTexture:t[k] atIndex:r.location + k]; }
 - (void)setSamplerState:(id)s atIndex:(NSUInteger)i { bg_bind_sampler(_cb, CHL_STAGE_COMPUTE, i, s); }
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
@@ -2580,6 +2668,16 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    unsigned g[3] = { (unsigned)groups.width, (unsigned)groups.height, (unsigned)groups.depth };
    unsigned t[3] = { (unsigned)size.width, (unsigned)size.height, (unsigned)size.depth };
    char why[512] = { 0 };
+   BG_TRACE("dispatch %s: %ux%ux%u groups of %ux%ux%u\n", ((BGMTLComputePipeline *)_pipeline)->_name, g[0], g[1], g[2], t[0], t[1], t[2]);
+   // more threads a threadgroup than the pipeline takes (VideoToolbox's VTMTSComputeFunction1x1 asks for 2048, past the 1024 this GPU
+   // and Apple's have): Metal's validation would refuse it, and given to the GPU it wrote nothing. Skipped, and said.
+   const uint64_t tpg = (uint64_t)t[0] * t[1] * t[2], cap = ((BGMTLComputePipeline *)_pipeline)->_info.max_threads_per_group;
+   if (cap && tpg > cap) {
+      snprintf(why, sizeof(why), "%s: %llu threads a threadgroup (%ux%ux%u), the pipeline takes %llu", ((BGMTLComputePipeline *)_pipeline)->_name,
+               (unsigned long long)tpg, t[0], t[1], t[2], (unsigned long long)cap);
+      [_cb bgSkip:"dispatch" why:why];
+      return;
+   }
    if (chl_dispatch(_cb->_ccb, g, t, why, sizeof(why)) != 0) [_cb bgSkip:"dispatch" why:why];
 }
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)size
@@ -2709,6 +2807,15 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    BG_TRACE("texture %lux%lu fmt %lu type %lu usage %lu storage %lu rotation %u %s\n", (unsigned long)d.width, (unsigned long)d.height,
             (unsigned long)d.pixelFormat, (unsigned long)d.textureType, (unsigned long)d.usage, (unsigned long)d.storageMode,
             bg_desc_rotation(d), surface ? "iosurface" : "own memory");
+   if (surface && bg_trace()) {
+      IOSurfaceRef ts = (IOSurfaceRef)surface;
+      uint32_t f = IOSurfaceGetPixelFormat(ts);
+      BG_LOG("  surface %u '%c%c%c%c' %zux%zu plane %lu of %zu: %zux%zu, %zu bytes a row, %zu bytes an element, alloc %zu\n",
+             (unsigned)IOSurfaceGetID(ts), (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, IOSurfaceGetWidth(ts),
+             IOSurfaceGetHeight(ts), (unsigned long)plane, IOSurfaceGetPlaneCount(ts), IOSurfaceGetWidthOfPlane(ts, plane),
+             IOSurfaceGetHeightOfPlane(ts, plane), IOSurfaceGetBytesPerRowOfPlane(ts, plane), IOSurfaceGetBytesPerElementOfPlane(ts, plane),
+             IOSurfaceGetAllocSize(ts));
+   }
    self = [super init];
    if (!self) return nil;
    if (![device chl] || !d) { [self release]; return nil; }
@@ -2722,6 +2829,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    _desc.mip_levels = (unsigned)[d mipmapLevelCount];
    _desc.sample_count = (unsigned)[d sampleCount];
    _desc.usage = (unsigned)[d usage];
+   _askedUsage = _desc.usage;
    // MTLTextureDescriptor.swizzle (QuartzCore 26 forces alpha to one for opaque content this way)
    _swizzle = [d swizzle];
    _desc.swizzle[0] = (unsigned char)_swizzle.red; _desc.swizzle[1] = (unsigned char)_swizzle.green;
@@ -2750,8 +2858,14 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
             }
          }
       }
-      /* Chlorophyll: one plane of a multi-plane surface, imported on its own (bgYccTwins) */
-      if (!_tex && g_plane_twin && plane < IOSurfaceGetPlaneCount(sf)) {
+      /* Chlorophyll: one plane of a multi-plane surface, imported on its own: bgYccTwins', or a client's texture over one plane
+       * (VideoToolbox's Metal transfer writes each 420f preview frame through R32Uint textures over its two planes; as copies they
+       * were filled from the wrong place and never written back, the preview stayed green). Not the formats that stand for
+       * the whole surface (YCbCr, RGB over YCbCr, XR10 two-plane), which have their own paths below. */
+      const NSUInteger pf_asked = [d pixelFormat];
+      const BOOL whole_surface_fmt = pf_asked == 500 || (pf_asked >= 540 && pf_asked <= 548) || pf_asked == 550 || pf_asked == 588 ||
+                                     pf_asked == 589 || pf_asked == 508 || pf_asked == 594;
+      if (!_tex && plane < IOSurfaceGetPlaneCount(sf) && (g_plane_twin || (IOSurfaceGetPlaneCount(sf) >= 2 && !whole_surface_fmt))) {
          uintptr_t b0 = (uintptr_t)IOSurfaceGetBaseAddress(sf), bp = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(sf, plane);
          if (b0 && bp >= b0)
             _tex = chl_texture_from_iosurface_plane([device chl], &_desc, (int)IOSurfaceGetID(sf), (uint32_t)(bp - b0),
@@ -2763,8 +2877,10 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
                snprintf(line, sizeof(line), "IOSurface %u plane %lu not imported: %s", IOSurfaceGetID(sf), (unsigned long)plane, why);
                bgmtl_note_line(line);
             }
-            [self release];
-            return nil;
+            if (g_plane_twin) {
+               [self release];
+               return nil;
+            }
          }
       }
       /* a CAMetalLayer drawable: CoreAnimation made the IOSurface and sends the device this one message; the texture IS that memory */
@@ -2787,6 +2903,21 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
          char why2[256];
          _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
          if (_tex) { _surfCopy = YES; _xr2p = YES; }
+      } else if (!_tex && ([d pixelFormat] == 508 || [d pixelFormat] == 594) && IOSurfaceGetPlaneCount(sf) == 2) {
+         /* Chlorophyll: the whole packed 10-bit 4:2:0 surface as one YCbCr image (NRF's "inputYCbCr"): its own RGBA16Unorm memory
+          * holding Y, Cb, Cr, 1 (how Apple's GPUs sample it: NRF's kernels take r as luma and g, b as chroma), from both planes */
+         char why2[256];
+         _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
+         if (_tex) { _surfCopy = YES; _pk10 = 3; }
+         else snprintf(why, sizeof(why), "%s", why2);
+      } else if (!_tex && ([d pixelFormat] == 588 || [d pixelFormat] == 589) && plane < IOSurfaceGetPlaneCount(sf)) {
+         /* Chlorophyll: a plane of the camera's packed 10-bit surfaces ('pf20': three samples to a 32-bit word) as Apple's GPUs
+          * read and write it (the noise reduction's input and output, NRFV1): its own R16Unorm / RG16Unorm memory, the plane
+          * unpacked into it when the surface changes and packed back after a command buffer wrote it */
+         char why2[256];
+         _tex = chl_texture_create([device chl], &_desc, why2, sizeof(why2));
+         if (_tex) { _surfCopy = YES; _pk10 = [d pixelFormat] == 588 ? 1 : 2; }
+         else snprintf(why, sizeof(why), "%s", why2);
       } else if (!_tex && ([d pixelFormat] == 500 || ([d pixelFormat] >= 540 && [d pixelFormat] <= 545)) && IOSurfaceGetPlaneCount(sf) == 2) {
          /* A picture CoreAnimation shows as it is (a decoded JPEG or HEIC, a video frame): luma in plane 0, Cb and Cr at half size in
           * plane 1. The texture gets its own RGBA8 memory and the samples are unpacked into it when the surface changes; the shader
@@ -2847,6 +2978,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
    t->_parentSlice = sl.location;
    t->_swizzle = sw;
    t->_desc = _desc;
+   t->_askedUsage = _askedUsage;
    t->_desc.pixel_format = (unsigned)pf;
    t->_desc.type = (unsigned)tt;
    t->_desc.width = MAX(1u, _desc.width >> lv.location);
@@ -3044,13 +3176,75 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
          }
       }
       BG_TEX_MARK(BG_TEX_XR);
+   } else if (_pk10 && _surface) {
+      IOSurfaceRef sf = (IOSurfaceRef)_surface;
+      uint32_t seed = IOSurfaceGetSeed(sf);
+      if (_pk10 == 3 && (!_surfFresh || seed != _surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
+         unsigned w = 0, h = 0, ch = 0;
+         const uint8_t *py = NULL, *pc = NULL;
+         size_t ry = 0, rc = 0;
+         uint16_t *out = [self bgYcc10Geometry:&w rows:&h chromaRows:&ch luma:&py row:&ry chroma:&pc row:&rc] && h ? malloc((size_t)w * h * 8) : NULL;
+         uint64_t t0 = mach_absolute_time();
+         for (unsigned y = 0; out && y < h; y++) {
+            const uint32_t *ly = (const uint32_t *)(py + (size_t)y * ry);
+            const uint32_t *lc = (const uint32_t *)(pc + (size_t)MIN(y / 2, ch ? ch - 1 : 0) * rc);
+            uint16_t *o = out + (size_t)y * w * 4;
+            for (unsigned x = 0; x < w; x++) {
+               uint32_t Y = (ly[x / 3] >> (10 * (x % 3))) & 0x3ff;
+               unsigned s0 = (x / 2) * 2, s1 = s0 + 1;   // Cb, Cr of the pair x / 2: samples 2k and 2k + 1 of the chroma row
+               uint32_t Cb = (lc[s0 / 3] >> (10 * (s0 % 3))) & 0x3ff, Cr = (lc[s1 / 3] >> (10 * (s1 % 3))) & 0x3ff;
+               o[4 * x] = (uint16_t)(Y << 6 | Y >> 4);
+               o[4 * x + 1] = (uint16_t)(Cb << 6 | Cb >> 4);
+               o[4 * x + 2] = (uint16_t)(Cr << 6 | Cr >> 4);
+               o[4 * x + 3] = 0xffff;
+            }
+         }
+         IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+         if (out) {
+            const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+            if (chl_texture_replace(_tex, 0, 0, o, sz, out, (size_t)w * 8, 0, why, sizeof(why)) != 0) BG_LOG("packed 10-bit YCbCr refresh: %s\n", why);
+            BG_TRACE("packed 10-bit YCbCr surface %u %ux%u (%u rows) seed %u unpacked: %llu ticks, mean %u\n", IOSurfaceGetID(sf), w, _desc.height, h,
+                     seed, (unsigned long long)(mach_absolute_time() - t0), bg_mean16(out, (size_t)w * h * 4));
+            free(out);
+         }
+         _surfSeed = seed;
+         _surfFresh = YES;
+      } else if (_pk10 != 3 && (!_surfFresh || seed != _surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
+         unsigned w = 0, h = 0, n = 0;
+         const uint8_t *p = [self bgPk10Plane:&w rows:&h samples:&n];
+         size_t bpr = IOSurfaceGetBytesPerRowOfPlane(sf, _plane), words = bpr / 4;
+         uint16_t *out = p && h ? malloc((size_t)n * h * 2) : NULL;
+         uint64_t t0 = mach_absolute_time();
+         for (unsigned y = 0; out && y < h; y++) {
+            const uint32_t *src = (const uint32_t *)(p + (size_t)y * bpr);
+            uint16_t *o = out + (size_t)y * n;
+            for (unsigned i = 0; i < n; i++) {
+               uint32_t v = i / 3 < words ? (src[i / 3] >> (10 * (i % 3))) & 0x3ff : 0;
+               o[i] = (uint16_t)(v << 6 | v >> 4);
+            }
+         }
+         IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
+         if (out) {
+            const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+            if (chl_texture_replace(_tex, 0, 0, o, sz, out, (size_t)n * 2, 0, why, sizeof(why)) != 0) BG_LOG("packed 10-bit refresh: %s\n", why);
+            BG_TRACE("packed 10-bit surface %u plane %lu %ux%u (%u rows) seed %u unpacked: %llu ticks, mean %u\n", IOSurfaceGetID(sf),
+                     (unsigned long)_plane, w, _desc.height, h, seed, (unsigned long long)(mach_absolute_time() - t0), bg_mean16(out, (size_t)n * h));
+            free(out);
+         }
+         _surfSeed = seed;
+         _surfFresh = YES;
+      }
+      BG_TEX_MARK(BG_TEX_COPY);
    } else if (_surfCopy && _surface) {
       IOSurfaceRef sf = (IOSurfaceRef)_surface;
       bg_surfwb_wait(IOSurfaceGetID(sf));
       uint32_t seed = IOSurfaceGetSeed(sf);
       if ((!_surfFresh || seed != _surfSeed) && IOSurfaceLock(sf, kIOSurfaceLockReadOnly, NULL) == 0) {
          const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
-         if (chl_texture_replace(_tex, 0, 0, o, sz, IOSurfaceGetBaseAddress(sf), IOSurfaceGetBytesPerRow(sf), 0, why, sizeof(why)) != 0)
+         const BOOL planar = IOSurfaceGetPlaneCount(sf) > 1;   // a texture over one plane: that plane's bytes
+         const void *src = planar ? IOSurfaceGetBaseAddressOfPlane(sf, _plane) : IOSurfaceGetBaseAddress(sf);
+         const size_t bpr = planar ? IOSurfaceGetBytesPerRowOfPlane(sf, _plane) : IOSurfaceGetBytesPerRow(sf);
+         if (src && chl_texture_replace(_tex, 0, 0, o, sz, src, bpr, 0, why, sizeof(why)) != 0)
             BG_LOG("surface copy refresh: %s\n", why);
          IOSurfaceUnlock(sf, kIOSurfaceLockReadOnly, NULL);
          _surfSeed = seed;
@@ -3102,10 +3296,129 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 
 // Chlorophyll: the texture's pixels back into its two-plane RGB10A8_2P_XR10 surface (the encoding chlTextureFor: decodes: XR10
 // 384 + 2c per 8-bit channel, exact both ways; alpha into plane 1), after a command buffer drew into it.
+// Chlorophyll: a packed 10-bit texture's plane (its base, the texture's width, the rows of the plane's memory the texture covers:
+// the extended rows below the plane included when the surface has room for them, and the samples a row: width x 1 or 2)
+- (const uint8_t *)bgPk10Plane:(unsigned *)w rows:(unsigned *)h samples:(unsigned *)n
+{
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   const uint8_t *p = IOSurfaceGetBaseAddressOfPlane(sf, _plane), *base = IOSurfaceGetBaseAddress(sf);
+   size_t bpr = IOSurfaceGetBytesPerRowOfPlane(sf, _plane);
+   if (!p || !base || !bpr) return NULL;
+   const uint8_t *end = _plane + 1 < IOSurfaceGetPlaneCount(sf) ? (const uint8_t *)IOSurfaceGetBaseAddressOfPlane(sf, _plane + 1) : base + IOSurfaceGetAllocSize(sf);
+   size_t rows = end > p ? (size_t)(end - p) / bpr : 0;
+   *w = _desc.width;
+   *h = (unsigned)MIN((size_t)_desc.height, rows);
+   *n = _desc.width * (_pk10 == 2 ? 2 : 1);
+   return p;
+}
+
+// the two planes of a packed 10-bit 4:2:0 surface for the whole-surface YCbCr texture: the texture's width, the luma rows it covers,
+// the chroma rows there are, each plane's base and row size
+- (BOOL)bgYcc10Geometry:(unsigned *)w rows:(unsigned *)h chromaRows:(unsigned *)ch luma:(const uint8_t **)py row:(size_t *)ry
+                 chroma:(const uint8_t **)pc row:(size_t *)rc
+{
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   if (IOSurfaceGetPlaneCount(sf) != 2) return NO;
+   const uint8_t *base = IOSurfaceGetBaseAddress(sf), *p0 = IOSurfaceGetBaseAddressOfPlane(sf, 0), *p1 = IOSurfaceGetBaseAddressOfPlane(sf, 1);
+   size_t r0 = IOSurfaceGetBytesPerRowOfPlane(sf, 0), r1 = IOSurfaceGetBytesPerRowOfPlane(sf, 1);
+   if (!base || !p0 || !p1 || !r0 || !r1 || p1 <= p0) return NO;
+   const uint8_t *end = base + IOSurfaceGetAllocSize(sf);
+   size_t rows0 = (size_t)(p1 - p0) / r0, rows1 = end > p1 ? (size_t)(end - p1) / r1 : 0;
+   unsigned tw = MIN(_desc.width, (unsigned)(r0 / 4 * 3));
+   if (r1 / 4 * 3 < (size_t)((tw + 1) / 2) * 2) tw = (unsigned)(r1 / 4 * 3 / 2 * 2);   // the chroma row holds the pairs
+   *w = tw;
+   *h = (unsigned)MIN((size_t)_desc.height, MIN(rows0, rows1 * 2));
+   *ch = (unsigned)rows1;
+   *py = p0; *ry = r0; *pc = p1; *rc = r1;
+   return YES;
+}
+
+// ... and the texture back into the plane, packed (after a command buffer wrote it); the whole-surface YCbCr texture into both
+// planes, chroma averaged over each two by two block
+- (BOOL)bgPk10WriteBack
+{
+   IOSurfaceRef sf = (IOSurfaceRef)_surface;
+   if (_pk10 == 3) {
+      unsigned w = 0, h = 0, ch = 0;
+      const uint8_t *py = NULL, *pc = NULL;
+      size_t ry = 0, rc = 0;
+      if (!_tex || !sf || ![self bgYcc10Geometry:&w rows:&h chromaRows:&ch luma:&py row:&ry chroma:&pc row:&rc] || !h) return YES;
+      uint16_t *px = malloc((size_t)w * h * 8);
+      if (!px) return YES;
+      char why[256] = { 0 };
+      const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+      if (chl_texture_get(_tex, 0, 0, o, sz, px, (size_t)w * 8, 0, why, sizeof(why)) != 0) { BG_LOG("packed YCbCr write-back: %s\n", why); free(px); return YES; }
+      BG_TRACE("packed 10-bit YCbCr surface %u %ux%u write-back, mean %u\n", IOSurfaceGetID(sf), w, h, bg_mean16(px, (size_t)w * h * 4));
+      if (IOSurfaceLock(sf, 0, NULL) == 0) {
+         for (unsigned y = 0; y < h; y++) {
+            uint32_t *d = (uint32_t *)(py + (size_t)y * ry);
+            const uint16_t *s = px + (size_t)y * w * 4;
+            for (unsigned x = 0, j = 0; x < w; x += 3, j++) {
+               uint32_t v = s[4 * x] >> 6;
+               if (x + 1 < w) v |= (uint32_t)(s[4 * (x + 1)] >> 6) << 10;
+               if (x + 2 < w) v |= (uint32_t)(s[4 * (x + 2)] >> 6) << 20;
+               d[j] = v;
+            }
+         }
+         unsigned cw = w / 2, n = cw * 2;   // chroma samples a row: Cb Cr per pair
+         uint16_t *cs = malloc((size_t)n * 2);
+         for (unsigned cy = 0; cs && cy < ch && cy * 2 < h; cy++) {
+            const uint16_t *a = px + (size_t)(cy * 2) * w * 4, *b = cy * 2 + 1 < h ? a + (size_t)w * 4 : a;
+            for (unsigned k = 0; k < cw; k++) {
+               unsigned x = 2 * k;
+               cs[2 * k] = (uint16_t)(((uint32_t)a[4 * x + 1] + a[4 * x + 5] + b[4 * x + 1] + b[4 * x + 5]) / 4);
+               cs[2 * k + 1] = (uint16_t)(((uint32_t)a[4 * x + 2] + a[4 * x + 6] + b[4 * x + 2] + b[4 * x + 6]) / 4);
+            }
+            uint32_t *d = (uint32_t *)(pc + (size_t)cy * rc);
+            for (unsigned i = 0, j = 0; i < n; i += 3, j++) {
+               uint32_t v = cs[i] >> 6;
+               if (i + 1 < n) v |= (uint32_t)(cs[i + 1] >> 6) << 10;
+               if (i + 2 < n) v |= (uint32_t)(cs[i + 2] >> 6) << 20;
+               d[j] = v;
+            }
+         }
+         free(cs);
+         IOSurfaceUnlock(sf, 0, NULL);
+         _surfSeed = IOSurfaceGetSeed(sf);
+         _surfFresh = YES;
+      }
+      free(px);
+      return YES;
+   }
+   unsigned w = 0, h = 0, n = 0;
+   if (!_tex || !sf || ![self bgPk10Plane:&w rows:&h samples:&n] || !h) return YES;
+   uint16_t *px = malloc((size_t)n * h * 2);
+   if (!px) return YES;
+   char why[256] = { 0 };
+   const unsigned o[3] = { 0, 0, 0 }, sz[3] = { w, h, 1 };
+   if (chl_texture_get(_tex, 0, 0, o, sz, px, (size_t)n * 2, 0, why, sizeof(why)) != 0) { BG_LOG("packed 10-bit write-back: %s\n", why); free(px); return YES; }
+   BG_TRACE("packed 10-bit surface %u plane %lu %ux%u write-back, mean %u\n", IOSurfaceGetID(sf), (unsigned long)_plane, w, h, bg_mean16(px, (size_t)n * h));
+   if (IOSurfaceLock(sf, 0, NULL) == 0) {
+      uint8_t *p = (uint8_t *)IOSurfaceGetBaseAddressOfPlane(sf, _plane);
+      size_t bpr = IOSurfaceGetBytesPerRowOfPlane(sf, _plane), words = bpr / 4;
+      for (unsigned y = 0; p && y < h; y++) {
+         uint32_t *d = (uint32_t *)(p + (size_t)y * bpr);
+         const uint16_t *s = px + (size_t)y * n;
+         for (unsigned i = 0, j = 0; i < n && j < words; i += 3, j++) {
+            uint32_t v = s[i] >> 6;
+            if (i + 1 < n) v |= (uint32_t)(s[i + 1] >> 6) << 10;
+            if (i + 2 < n) v |= (uint32_t)(s[i + 2] >> 6) << 20;
+            d[j] = v;
+         }
+      }
+      IOSurfaceUnlock(sf, 0, NULL);
+      _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture
+      _surfFresh = YES;
+   }
+   free(px);
+   return YES;
+}
+
 - (BOOL)bgXR10WriteBack
 {
    if (_parent) return [(BGMTLTexture *)_parent bgXR10WriteBack];
    if (_rgb420) return [self bgRGB420WriteBack];
+   if (_pk10) return [self bgPk10WriteBack];
    if (!_xr2p || !_tex || !_surface) return NO;
    IOSurfaceRef sf = (IOSurfaceRef)_surface;
    unsigned w = MIN(_desc.width, (unsigned)IOSurfaceGetWidthOfPlane(sf, 0)), h = MIN(_desc.height, (unsigned)IOSurfaceGetHeightOfPlane(sf, 0));
@@ -3261,11 +3574,17 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 {
    if (!_surfCopy || _xr2p || !_tex || !_surface) return;
    IOSurfaceRef sf = (IOSurfaceRef)_surface;
-   if (IOSurfaceGetPlaneCount(sf) > 1 || _plane || IOSurfaceGetWidth(sf) < _desc.width || IOSurfaceGetHeight(sf) < _desc.height) return;
+   const BOOL planar = IOSurfaceGetPlaneCount(sf) > 1;   // a texture over one plane: back into that plane
+   if (planar ? (_plane >= IOSurfaceGetPlaneCount(sf) || IOSurfaceGetHeightOfPlane(sf, _plane) < _desc.height ||
+                 IOSurfaceGetBytesPerRowOfPlane(sf, _plane) < chl_format_tight_row((unsigned)[self pixelFormat], _desc.width))
+              : (_plane || IOSurfaceGetWidth(sf) < _desc.width || IOSurfaceGetHeight(sf) < _desc.height))
+      return;
    if (IOSurfaceLock(sf, 0, NULL) != 0) return;
    char why[256] = { 0 };
    const unsigned o[3] = { 0, 0, 0 }, sz[3] = { _desc.width, _desc.height, 1 };
-   if (chl_texture_get(_tex, 0, 0, o, sz, IOSurfaceGetBaseAddress(sf), IOSurfaceGetBytesPerRow(sf), 0, why, sizeof(why)) != 0)
+   void *dst = planar ? IOSurfaceGetBaseAddressOfPlane(sf, _plane) : IOSurfaceGetBaseAddress(sf);
+   const size_t bpr = planar ? IOSurfaceGetBytesPerRowOfPlane(sf, _plane) : IOSurfaceGetBytesPerRow(sf);
+   if (chl_texture_get(_tex, 0, 0, o, sz, dst, bpr, 0, why, sizeof(why)) != 0)
       BG_LOG("copied surface write-back: %s\n", why);
    IOSurfaceUnlock(sf, 0, NULL);
    _surfSeed = IOSurfaceGetSeed(sf);   // what the surface holds now IS the texture
@@ -3366,7 +3685,7 @@ bg_bind_sampler(BGMTLCommandBuffer *cb, unsigned stage, NSUInteger index, id sam
 }
 - (void)bgCopyPending:(int)delta
 {
-   if (_surfCopy && !_xr2p && _surface) bg_surfwb_note(IOSurfaceGetID((IOSurfaceRef)_surface), delta);
+   if (_surfCopy && !_xr2p && !_pk10 && _surface) bg_surfwb_note(IOSurfaceGetID((IOSurfaceRef)_surface), delta);
 }
 
 - (void)bgLinearPending:(int)delta { __atomic_add_fetch(&_linPending, delta, __ATOMIC_ACQ_REL); }

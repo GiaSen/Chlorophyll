@@ -206,6 +206,13 @@ static const struct chl_format chl_formats[] = {
    C(553, "MTLPixelFormatBGRA10_XR_sRGB (as RGBA16Float)", VK_FORMAT_R16G16B16A16_SFLOAT, 8),
    C(554, "MTLPixelFormatBGR10_XR (as BGRA8)", VK_FORMAT_B8G8R8A8_UNORM, 4),
    C(555, "MTLPixelFormatBGR10_XR_sRGB (as BGRA8 sRGB)", VK_FORMAT_B8G8R8A8_SRGB, 4),
+   /* the camera's packed 10-bit planes ('pf20': three samples to a 32-bit word), as the noise reduction (NRF) reads and writes
+    * them: bgmtl unpacks the plane into the 16-bit stand-in and packs it back after a command buffer wrote it */
+   C(588, "MTLPixelFormatR10Unorm_PACKED (as R16Unorm)", VK_FORMAT_R16_UNORM, 2),
+   C(589, "MTLPixelFormatRG10Unorm_PACKED (as RG16Unorm)", VK_FORMAT_R16G16_UNORM, 4),
+   /* ... and both planes as one YCbCr image (NRF's LumaChromaImage input): Y, Cb, Cr in r, g, b, as Apple's GPUs sample it */
+   C(508, "MTLPixelFormatYCBCR10_420_2P_PACKED (as RGBA16Unorm: Y Cb Cr 1)", VK_FORMAT_R16G16B16A16_UNORM, 8),
+   C(594, "MTLPixelFormatYCBCR10_420_2P_PACKED_XR (as RGBA16Unorm: Y Cb Cr 1)", VK_FORMAT_R16G16B16A16_UNORM, 8),
 };
 #undef C
 #undef CP
@@ -260,6 +267,7 @@ struct chl_buffer {
    size_t size;
    uint64_t addr;
    bool ring;            /* an upload-ring slab, owned by the device's slab list */
+   uint32_t surface_handle; /* Chlorophyll: over an IOSurface's memory (chl_buffer_from_iosurface): its BO, for cache syncs */
 };
 
 struct chl_view_cache { unsigned level, slice; VkImageView view; };
@@ -1556,6 +1564,89 @@ chl_texture_flush_surface(struct chl_texture *t)
    return sweet_drm_bo_sync(-1, root->surface_handle, 0, 0);
 }
 
+/* Chlorophyll: an IOSurface's memory as a buffer (Metal's newBufferWithIOSurface:; the camera's noise reduction, NRFV1, reads
+ * and writes its frames this way). The surface's BO imported as it is, no copy: the processor's view is the surface's own
+ * mapping (contents is the caller's IOSurfaceGetBaseAddress), so this buffer is not mapped here. */
+struct chl_buffer *
+chl_buffer_from_iosurface(struct chl_device *d, int surface_id, size_t length, char *why, size_t why_size)
+{
+   struct chl_sbo sb;
+   int pfd = sweet_drm_surface_prime(surface_id, &sb);
+   if (pfd < 0) {
+      say(why, why_size, "the kernel would not describe IOSurface %d", surface_id);
+      return NULL;
+   }
+   if (sb.flags & CHL_SBO_WRAPPED) {
+      say(why, why_size, "IOSurface %d is another process's client memory (read-only): copied, not mapped", surface_id);
+      sbo_give_back(pfd, &sb);
+      return NULL;
+   }
+   if (!length || length > sb.size)
+      length = sb.size;
+   struct chl_buffer *b = calloc(1, sizeof(*b));
+   if (!b) {
+      sbo_give_back(pfd, &sb);
+      return NULL;
+   }
+   obj_init(&b->o, d, K_BUFFER);
+   b->size = length;
+   VkExternalMemoryBufferCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL,
+                                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+   VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &ext, 0, length,
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                              VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+   if (d->vk.vkCreateBuffer(d->dev, &bci, NULL, &b->vk) != VK_SUCCESS) {
+      say(why, why_size, "%s would not make a buffer of %zu bytes over IOSurface %d", d->name, length, surface_id);
+      sbo_give_back(pfd, &sb);
+      free(b);
+      return NULL;
+   }
+   VkMemoryRequirements req;
+   d->vk.vkGetBufferMemoryRequirements(d->dev, b->vk, &req);
+   if (sb.offset % (req.alignment ? req.alignment : 1)) {
+      say(why, why_size, "IOSurface %d starts %u bytes into its BO, not on a %llu-byte boundary", surface_id, sb.offset,
+          (unsigned long long)req.alignment);
+      d->vk.vkDestroyBuffer(d->dev, b->vk, NULL);
+      sbo_give_back(pfd, &sb);
+      free(b);
+      return NULL;
+   }
+   VkMemoryAllocateFlagsInfo fl = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, NULL, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0 };
+   VkImportMemoryFdInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, &fl, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, pfd };
+   uint32_t mt = d->mt_host;
+   if (!(req.memoryTypeBits & (1u << mt)))
+      for (mt = 0; mt < d->memprops.memoryTypeCount && !(req.memoryTypeBits & (1u << mt)); mt++)
+         ;
+   uint64_t bo_size = (uint64_t)sb.offset + sb.size;
+   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, bo_size > req.size ? bo_size : req.size, mt };
+   VkResult r = d->vk.vkAllocateMemory(d->dev, &ai, NULL, &b->mem);   /* takes the fd */
+   if (r != VK_SUCCESS || d->vk.vkBindBufferMemory(d->dev, b->vk, b->mem, sb.offset) != VK_SUCCESS) {
+      say(why, why_size, "%s would not import IOSurface %d's memory as a buffer (%llu bytes): VkResult %d", d->name, surface_id,
+          (unsigned long long)sb.size, r);
+      if (r != VK_SUCCESS)
+         sbo_give_back(pfd, &sb);
+      if (b->mem)
+         d->vk.vkFreeMemory(d->dev, b->mem, NULL);
+      d->vk.vkDestroyBuffer(d->dev, b->vk, NULL);
+      free(b);
+      return NULL;
+   }
+   VkBufferDeviceAddressInfo dai = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, b->vk };
+   b->addr = d->vk.vkGetBufferDeviceAddress(d->dev, &dai);
+   b->surface_handle = sb.handle;
+   sweet_drm_bo_sync(-1, sb.handle, 0, 0);
+   return b;
+}
+
+int
+chl_buffer_flush_surface(struct chl_buffer *b)
+{
+   return b && b->surface_handle ? sweet_drm_bo_sync(-1, b->surface_handle, 0, 0) : 0;
+}
+
 struct chl_texture *
 chl_texture_view(struct chl_texture *parent, unsigned pixel_format, unsigned type, unsigned base_level, unsigned level_count,
                  unsigned base_slice, unsigned slice_count, const unsigned char swizzle[4], char *why, size_t why_size)
@@ -2328,6 +2419,9 @@ fill_info(struct chl_device *d, struct chl_pipeline_info *info, const struct chl
  * Compute pipelines
  */
 /* ---- the render pipeline cache (chl_render_pipeline_create) ---- */
+/* inline, as Mesa uses it: no library on the phone exports XXH64_digest (a plain include left it undefined and the driver did not
+ * load), and an earlier include through Mesa's headers left the streaming state (XXH64_state_t) out */
+#define XXH_INLINE_ALL
 #include "util/xxhash.h"
 #define RP_CACHE_MAX 512
 static struct { uint64_t key[2]; struct chl_render_pipeline *p; struct chl_device *d; } rp_cache[RP_CACHE_MAX];
